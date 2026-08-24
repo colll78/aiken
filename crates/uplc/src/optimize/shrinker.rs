@@ -2140,11 +2140,11 @@ impl Term<Name> {
                             *tipo = Type::Integer;
 
                             for item in items {
-                                let Constant::Data(PlutusData::BigInt(i)) = item else {
+                                let Constant::Data(PlutusData::BigInt(i)) = item.as_ref() else {
                                     unreachable!("unexpected item in integer list arg: {item:#?}");
                                 };
 
-                                *item = Constant::Integer(from_pallas_bigint(i));
+                                *item = Rc::new(Constant::Integer(from_pallas_bigint(i)));
                             }
                         }
                         arg => {
@@ -2594,7 +2594,7 @@ impl Term<Name> {
                             context.inlined_apply_ids.push(arg_id);
                             *self = Term::data(Data::list(
                                 l.iter()
-                                    .map(|item| match item {
+                                    .map(|item| match item.as_ref() {
                                         Constant::Data(d) => d.clone(),
                                         _ => unreachable!(),
                                     })
@@ -2606,7 +2606,7 @@ impl Term<Name> {
                             context.inlined_apply_ids.push(arg_id);
                             *self = Term::data(Data::map(
                                 m.iter()
-                                    .map(|m| match m {
+                                    .map(|m| match m.as_ref() {
                                         Constant::ProtoPair(_, _, f, s) => {
                                             match (f.as_ref(), s.as_ref()) {
                                                 (Constant::Data(d), Constant::Data(d2)) => {

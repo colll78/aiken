@@ -687,10 +687,9 @@ pub fn convert_constants_to_data(constants: Vec<Rc<UplcConstant>>) -> Vec<UplcCo
                 if matches!(list_type, UplcType::Pair(_, _)) {
                     let inner_constants = constants
                         .iter()
-                        .cloned()
-                        .map(|pair| match pair {
+                        .map(|pair| match pair.as_ref() {
                             UplcConstant::ProtoPair(_, _, left, right) => {
-                                let inner_constants = vec![left, right];
+                                let inner_constants = vec![Rc::clone(left), Rc::clone(right)];
                                 let inner_constants = convert_constants_to_data(inner_constants)
                                     .into_iter()
                                     .map(|constant| match constant {
@@ -706,14 +705,13 @@ pub fn convert_constants_to_data(constants: Vec<Rc<UplcConstant>>) -> Vec<UplcCo
 
                     UplcConstant::Data(PlutusData::Map(KeyValuePairs::Def(inner_constants)))
                 } else {
-                    let inner_constants =
-                        convert_constants_to_data(constants.iter().cloned().map(Rc::new).collect())
-                            .into_iter()
-                            .map(|constant| match constant {
-                                UplcConstant::Data(d) => d,
-                                _ => todo!(),
-                            })
-                            .collect_vec();
+                    let inner_constants = convert_constants_to_data(constants.clone())
+                        .into_iter()
+                        .map(|constant| match constant {
+                            UplcConstant::Data(d) => d,
+                            _ => todo!(),
+                        })
+                        .collect_vec();
 
                     UplcConstant::Data(Data::list(inner_constants))
                 }

@@ -405,7 +405,10 @@ pub enum Constant {
     // tag: 4
     Bool(bool),
     // tag: 5
-    ProtoList(Type, Vec<Constant>),
+    // Elements are `Rc`-shared so list builtins (mkCons, tailList) can build
+    // derived lists without deep-cloning every element; see `deep_clone` for
+    // the thread-isolation caveat.
+    ProtoList(Type, Vec<Rc<Constant>>),
     // tag: 6
     ProtoPair(Type, Type, Rc<Constant>, Rc<Constant>),
     // tag: 7
@@ -504,7 +507,10 @@ impl Constant {
         match self {
             Constant::ProtoList(tipo, items) => Constant::ProtoList(
                 tipo.deep_clone(),
-                items.iter().map(|item| item.deep_clone()).collect(),
+                items
+                    .iter()
+                    .map(|item| Rc::new(item.deep_clone()))
+                    .collect(),
             ),
             Constant::ProtoPair(fst_tipo, snd_tipo, fst, snd) => Constant::ProtoPair(
                 fst_tipo.deep_clone(),

@@ -4182,12 +4182,12 @@ impl<'a> CodeGenerator<'a> {
                                     .into_iter()
                                     .zip(convert_values)
                                     .map(|(key, value)| {
-                                        UplcConstant::ProtoPair(
+                                        Rc::new(UplcConstant::ProtoPair(
                                             UplcType::Data,
                                             UplcType::Data,
                                             key.into(),
                                             value.into(),
-                                        )
+                                        ))
                                     })
                                     .collect_vec(),
                             )
@@ -4197,7 +4197,10 @@ impl<'a> CodeGenerator<'a> {
                         Term::Constant(
                             UplcConstant::ProtoList(
                                 UplcType::Data,
-                                builder::convert_constants_to_data(constants),
+                                builder::convert_constants_to_data(constants)
+                                    .into_iter()
+                                    .map(Rc::new)
+                                    .collect(),
                             )
                             .into(),
                         )
@@ -5058,7 +5061,10 @@ impl<'a> CodeGenerator<'a> {
                 }
 
                 if constants.len() == args.len() {
-                    let data_constants = builder::convert_constants_to_data(constants);
+                    let data_constants = builder::convert_constants_to_data(constants)
+                        .into_iter()
+                        .map(Rc::new)
+                        .collect();
 
                     let term = Term::Constant(
                         UplcConstant::ProtoList(UplcType::Data, data_constants).into(),
