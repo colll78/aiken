@@ -140,7 +140,13 @@ impl CodeGenSpecialFuncs {
     }
 
     pub fn get_function(&self, func_name: &String) -> Term<Name> {
-        self.key_to_func[func_name].0.clone()
+        // A deep copy, not an Rc clone: these bodies are applied into test
+        // programs which cross thread boundaries for the parallel test runs,
+        // and cloned generators (property tests) would otherwise embed the
+        // same Rc allocations into several tests' programs — Rc's non-atomic
+        // reference counts forbid that. The bodies are small, so copying is
+        // negligible next to the rest of code generation.
+        self.key_to_func[func_name].0.deep_clone()
     }
 
     pub fn apply_used_functions(&self, mut term: Term<Name>) -> Term<Name> {

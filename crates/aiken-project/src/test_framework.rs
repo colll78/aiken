@@ -24,7 +24,7 @@ mod test {
         collections::{BTreeMap, HashMap},
         path::PathBuf,
     };
-    use uplc::PlutusData;
+    use uplc::{PlutusData, optimize::aiken_optimize_and_intern};
 
     const TEST_KIND: ModuleKind = ModuleKind::Lib;
 
@@ -117,7 +117,21 @@ mod test {
         })
     }
 
+    /// Like [`property_raw`], but with the test and fuzzer programs already
+    /// optimized, for tests that drive `run_n_times`/`eval` directly instead
+    /// of going through `PropertyTest::run` (which optimizes on its own —
+    /// never call it on the result, the shrinker cannot re-run on its own
+    /// output).
     fn property(src: &str) -> (PropertyTest, impl Fn(PlutusData) -> String) {
+        let (mut test, reify) = property_raw(src);
+
+        test.program = aiken_optimize_and_intern(test.program);
+        test.fuzzer.program = aiken_optimize_and_intern(test.fuzzer.program);
+
+        (test, reify)
+    }
+
+    fn property_raw(src: &str) -> (PropertyTest, impl Fn(PlutusData) -> String) {
         let prelude = indoc! { r#"
             use aiken/builtin
 
@@ -318,7 +332,7 @@ mod test {
 
     #[test]
     fn test_prop_basic() {
-        let (prop, _) = property(indoc! { r#"
+        let (prop, _) = property_raw(indoc! { r#"
             test foo(n: Int via int()) {
                 n >= 0
             }
@@ -336,7 +350,7 @@ mod test {
 
     #[test]
     fn test_prop_labels() {
-        let (prop, _) = property(indoc! { r#"
+        let (prop, _) = property_raw(indoc! { r#"
             fn label(str: String) -> Void {
               str
                 |> builtin.append_string(@"\0", _)
