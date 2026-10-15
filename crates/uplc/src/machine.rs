@@ -648,8 +648,8 @@ impl Machine {
             self.unbudgeted_steps[i] = 0;
 
             if let Some(counter) = &mut self.spend_counter {
-                counter[i * 2] += unspent_step_budget.mem;
-                counter[i * 2 + 1] += unspent_step_budget.cpu;
+                counter[i * 2] = counter[i * 2].saturating_add(unspent_step_budget.mem);
+                counter[i * 2 + 1] = counter[i * 2 + 1].saturating_add(unspent_step_budget.cpu);
             }
         }
 
@@ -659,8 +659,10 @@ impl Machine {
     }
 
     fn spend_budget(&mut self, spend_budget: ExBudget) -> Result<(), Error> {
-        self.ex_budget.mem -= spend_budget.mem;
-        self.ex_budget.cpu -= spend_budget.cpu;
+        // Saturate like the reference `SatInt` budgeting: a builtin costed at
+        // `maxBound` must exhaust the budget rather than overflow it.
+        self.ex_budget.mem = self.ex_budget.mem.saturating_sub(spend_budget.mem);
+        self.ex_budget.cpu = self.ex_budget.cpu.saturating_sub(spend_budget.cpu);
 
         if self.ex_budget.mem < 0 || self.ex_budget.cpu < 0 {
             Err(Error::OutOfExError(self.ex_budget))
@@ -890,6 +892,66 @@ mod tests {
                     .result();
                 assert!(result.is_ok(), "{language:?}: {result:?}");
             }
+        }
+    }
+
+    #[test]
+    fn exp_mod_integer_modulus_bound_matches_plutus() {
+        let modulus = |m: BigInt| {
+            let program = crate::parser::program(&format!(
+                "(program 1.1.0 [(builtin expModInteger) (con integer 2) (con integer 3) (con integer {m})])"
+            ))
+            .unwrap();
+
+            Program::<NamedDeBruijn>::try_from(program)
+                .unwrap()
+                .eval_version_with_protocol(
+                    ExBudget::max(),
+                    &Language::PlutusV3,
+                    super::VAN_ROSSEM_PROTOCOL_VERSION,
+                )
+        };
+        let two = BigInt::from(2);
+
+        // Expected results and costs from the reference evaluator (plutus
+        // 1b03c165, semantics variant E). A modulus beyond 2^8191 - 1 fails, but
+        // only after being charged for: the cost comes before the denotation.
+        let largest = modulus(two.pow(8191) - 1);
+        assert_eq!(
+            largest.result().unwrap(),
+            Term::Constant(Constant::Integer(8.into()).into())
+        );
+        assert_eq!(
+            largest.cost(),
+            ExBudget {
+                mem: 928,
+                cpu: 901_087_765
+            }
+        );
+
+        for (m, cost) in [
+            (
+                two.pow(8191),
+                ExBudget {
+                    mem: 228,
+                    cpu: 900_975_765,
+                },
+            ),
+            (
+                two.pow(8192),
+                ExBudget {
+                    mem: 229,
+                    cpu: 914_865_470,
+                },
+            ),
+        ] {
+            let result = modulus(m);
+            assert!(
+                matches!(result.result(), Err(Error::OutsideNaturalBounds(..))),
+                "{:?}",
+                result.result()
+            );
+            assert_eq!(result.cost(), cost);
         }
     }
 

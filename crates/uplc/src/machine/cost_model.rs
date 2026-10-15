@@ -1,4 +1,3 @@
-use super::value::integer_log2_ref;
 use super::{Error, Value, runtime::BuiltinSemantics};
 use crate::builtins::DefaultFunction;
 use num_bigint::BigInt;
@@ -38,8 +37,8 @@ impl ExBudget {
     }
 
     pub fn occurrences(&mut self, n: i64) {
-        self.mem *= n;
-        self.cpu *= n;
+        self.mem = self.mem.saturating_mul(n);
+        self.cpu = self.cpu.saturating_mul(n);
     }
 
     pub fn max() -> Self {
@@ -64,8 +63,8 @@ impl std::ops::Sub for ExBudget {
 
     fn sub(self, rhs: Self) -> Self::Output {
         ExBudget {
-            mem: self.mem - rhs.mem,
-            cpu: self.cpu - rhs.cpu,
+            mem: self.mem.saturating_sub(rhs.mem),
+            cpu: self.cpu.saturating_sub(rhs.cpu),
         }
     }
 }
@@ -2724,11 +2723,6 @@ impl BuiltinCosts {
                 }
             }
             DefaultFunction::ExpModInteger => {
-                let modulus = args[2].unwrap_integer()?;
-                if modulus <= &0.into() || integer_log2_ref(modulus) >= 8191 {
-                    return Err(Error::OutsideNaturalBounds(modulus.clone()));
-                }
-
                 let x = args[0].to_ex_mem();
                 let y = args[1].to_ex_mem();
                 let z = args[2].to_ex_mem();
@@ -3886,11 +3880,15 @@ impl OneArgument {
     }
 
     pub fn cost(&self, x: i64) -> i64 {
-        match self {
-            OneArgument::ConstantCost(c) => *c,
-            OneArgument::LinearCost(m) => m.slope * x + m.intercept,
-            OneArgument::QuadraticCost(q) => q.coeff_0 + (q.coeff_1 * x) + (q.coeff_2 * x * x),
-        }
+        let x = Sat(x);
+
+        let cost = match self {
+            OneArgument::ConstantCost(c) => Sat(*c),
+            OneArgument::LinearCost(m) => m.cost(x),
+            OneArgument::QuadraticCost(q) => q.cost(x),
+        };
+
+        cost.0
     }
 }
 
@@ -3938,73 +3936,58 @@ impl TwoArguments {
     }
 
     pub fn cost(&self, x: i64, y: i64) -> i64 {
+        self.sat_cost(Sat(x), Sat(y)).0
+    }
+
+    fn sat_cost(&self, x: Sat, y: Sat) -> Sat {
         match self {
-            TwoArguments::ConstantCost(c) => *c,
-            // Saturating arithmetic mirrors Plutus' `SatInt` costing integers, so
-            // that a literally-costed argument (e.g. `dropList`'s count) whose
-            // value approaches `i64::MAX` clamps instead of overflowing.
-            TwoArguments::LinearInX(l) => l.slope.saturating_mul(x).saturating_add(l.intercept),
-            TwoArguments::LinearInY(l) => l.slope.saturating_mul(y).saturating_add(l.intercept),
-            TwoArguments::LinearInY2(l) => l.slope.saturating_mul(y).saturating_add(l.intercept),
-            TwoArguments::LinearInXAndY(l) => l.slope1 * x + l.slope2 * y + l.intercept,
+            TwoArguments::ConstantCost(c) => Sat(*c),
+            TwoArguments::LinearInX(l) => l.cost(x),
+            TwoArguments::LinearInY(l) => l.cost(y),
+            TwoArguments::LinearInY2(l) => Sat(l.slope) * y + Sat(l.intercept),
+            TwoArguments::LinearInXAndY(l) => l.cost(x, y),
             TwoArguments::WithInteractionInXAndY(l) => {
-                l.coeff_00 + l.coeff_10 * x + l.coeff_01 * y + l.coeff_11 * x * y
+                Sat(l.coeff_00)
+                    + Sat(l.coeff_10) * x
+                    + Sat(l.coeff_01) * y
+                    + Sat(l.coeff_11) * x * y
             }
-            TwoArguments::AddedSizes(s) => s.slope * (x + y) + s.intercept,
-            TwoArguments::SubtractedSizes(s) => s.slope * s.minimum.max(x - y) + s.intercept,
-            TwoArguments::MultipliedSizes(s) => s.slope * (x * y) + s.intercept,
-            TwoArguments::MinSize(s) => s.slope * x.min(y) + s.intercept,
-            TwoArguments::MaxSize(s) => s.slope * x.max(y) + s.intercept,
+            TwoArguments::AddedSizes(s) => Sat(s.slope) * (x + y) + Sat(s.intercept),
+            TwoArguments::SubtractedSizes(s) => {
+                Sat(s.slope) * Sat(s.minimum).max(x - y) + Sat(s.intercept)
+            }
+            TwoArguments::MultipliedSizes(s) => Sat(s.slope) * (x * y) + Sat(s.intercept),
+            TwoArguments::MinSize(s) => Sat(s.slope) * x.min(y) + Sat(s.intercept),
+            TwoArguments::MaxSize(s) => Sat(s.slope) * x.max(y) + Sat(s.intercept),
             TwoArguments::LinearOnDiagonal(l) => {
                 if x == y {
-                    x * l.slope + l.intercept
+                    x * Sat(l.slope) + Sat(l.intercept)
                 } else {
-                    l.constant
+                    Sat(l.constant)
                 }
             }
             TwoArguments::ConstAboveDiagonal(l) => {
                 if x < y {
-                    l.constant
+                    Sat(l.constant)
                 } else {
-                    let p = *l.model.clone();
-                    p.cost(x, y)
+                    l.model.sat_cost(x, y)
                 }
             }
-            TwoArguments::AboveAndBelowDiagonal(l) => {
-                let p = *l.model.clone();
-                p.cost(x.max(y), x.min(y))
-            }
+            TwoArguments::AboveAndBelowDiagonal(l) => l.model.sat_cost(x.max(y), x.min(y)),
             TwoArguments::ConstBelowDiagonal(l) => {
                 if x > y {
-                    l.constant
+                    Sat(l.constant)
                 } else {
-                    let p = *l.model.clone();
-                    p.cost(x, y)
+                    l.model.sat_cost(x, y)
                 }
             }
-            TwoArguments::QuadraticInY(q) => q.coeff_0 + (q.coeff_1 * y) + (q.coeff_2 * y * y),
-            TwoArguments::QuadraticInXAndY(q) => std::cmp::max(
-                q.minimum,
-                q.coeff_00
-                    + q.coeff_10 * x
-                    + q.coeff_01 * y
-                    + q.coeff_20 * x * x
-                    + q.coeff_11 * x * y
-                    + q.coeff_02 * y * y,
-            ),
+            TwoArguments::QuadraticInY(q) => q.cost(y),
+            TwoArguments::QuadraticInXAndY(q) => q.cost(x, y),
             TwoArguments::ConstAboveDiagonalIntoQuadraticXAndY(constant, q) => {
                 if x < y {
-                    *constant
+                    Sat(*constant)
                 } else {
-                    std::cmp::max(
-                        q.minimum,
-                        q.coeff_00
-                            + q.coeff_10 * x
-                            + q.coeff_01 * y
-                            + q.coeff_20 * x * x
-                            + q.coeff_11 * x * y
-                            + q.coeff_02 * y * y,
-                    )
+                    q.cost(x, y)
                 }
             }
         }
@@ -4039,29 +4022,34 @@ impl ThreeArguments {
     }
 
     pub fn cost(&self, x: i64, y: i64, z: i64) -> i64 {
-        match self {
-            ThreeArguments::ConstantCost(c) => *c,
-            ThreeArguments::AddedSizes(s) => (x + y + z) * s.slope + s.intercept,
-            ThreeArguments::LinearInX(l) => x * l.slope + l.intercept,
-            ThreeArguments::LinearInY(l) => y * l.slope + l.intercept,
-            ThreeArguments::LinearInZ(l) => z * l.slope + l.intercept,
-            ThreeArguments::QuadraticInZ(q) => q.coeff_0 + (q.coeff_1 * z) + (q.coeff_2 * z * z),
+        let (x, y, z) = (Sat(x), Sat(y), Sat(z));
+
+        let cost = match self {
+            ThreeArguments::ConstantCost(c) => Sat(*c),
+            ThreeArguments::AddedSizes(s) => (x + y + z) * Sat(s.slope) + Sat(s.intercept),
+            ThreeArguments::LinearInX(l) => l.cost(x),
+            ThreeArguments::LinearInY(l) => l.cost(y),
+            ThreeArguments::LinearInZ(l) => l.cost(z),
+            ThreeArguments::QuadraticInZ(q) => q.cost(z),
             ThreeArguments::ExpModCost(e) => {
-                let cost =
-                    e.coefficient_00 + e.coefficient_11 * y * z + e.coefficient_12 * y * z * z;
+                let cost = Sat(e.coefficient_00)
+                    + Sat(e.coefficient_11) * y * z
+                    + Sat(e.coefficient_12) * y * z * z;
 
                 if x <= z { cost } else { cost + cost / 2 }
             }
             ThreeArguments::LiteralInYorLinearInZ(l) => {
-                if y == 0 {
-                    l.slope * z + l.intercept
+                if y == Sat(0) {
+                    l.cost(z)
                 } else {
                     y
                 }
             }
-            ThreeArguments::LinearInMaxYZ(l) => y.max(z) * l.slope + l.intercept,
-            ThreeArguments::LinearInYandZ(l) => y * l.slope1 + z * l.slope2 + l.intercept,
-        }
+            ThreeArguments::LinearInMaxYZ(l) => l.cost(y.max(z)),
+            ThreeArguments::LinearInYandZ(l) => l.cost(y, z),
+        };
+
+        cost.0
     }
 }
 
@@ -4081,7 +4069,7 @@ impl FourArguments {
     pub fn cost(&self, _: i64, _: i64, _: i64, u: i64) -> i64 {
         match self {
             FourArguments::ConstantCost(c) => *c,
-            FourArguments::LinearInU(l) => l.slope * u + l.intercept,
+            FourArguments::LinearInU(l) => l.cost(Sat(u)).0,
         }
     }
 }
@@ -4102,6 +4090,75 @@ impl SixArguments {
         match self {
             SixArguments::ConstantCost(c) => *c,
         }
+    }
+}
+
+/// A costing integer that saturates at the bounds of `i64` instead of
+/// overflowing, like Plutus' `SatInt`: a cost that does not fit is the maximum
+/// cost, and so exhausts any budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Sat(i64);
+
+impl std::ops::Add for Sat {
+    type Output = Sat;
+
+    fn add(self, other: Sat) -> Sat {
+        Sat(self.0.saturating_add(other.0))
+    }
+}
+
+impl std::ops::Sub for Sat {
+    type Output = Sat;
+
+    fn sub(self, other: Sat) -> Sat {
+        Sat(self.0.saturating_sub(other.0))
+    }
+}
+
+impl std::ops::Mul for Sat {
+    type Output = Sat;
+
+    fn mul(self, other: Sat) -> Sat {
+        Sat(self.0.saturating_mul(other.0))
+    }
+}
+
+impl std::ops::Div<i64> for Sat {
+    type Output = Sat;
+
+    fn div(self, divisor: i64) -> Sat {
+        Sat(self.0 / divisor)
+    }
+}
+
+impl LinearSize {
+    fn cost(&self, x: Sat) -> Sat {
+        Sat(self.slope) * x + Sat(self.intercept)
+    }
+}
+
+impl TwoVariableLinearSize {
+    fn cost(&self, x: Sat, y: Sat) -> Sat {
+        Sat(self.slope1) * x + Sat(self.slope2) * y + Sat(self.intercept)
+    }
+}
+
+impl QuadraticFunction {
+    fn cost(&self, x: Sat) -> Sat {
+        Sat(self.coeff_0) + Sat(self.coeff_1) * x + Sat(self.coeff_2) * x * x
+    }
+}
+
+impl TwoArgumentsQuadraticFunction {
+    fn cost(&self, x: Sat, y: Sat) -> Sat {
+        Sat(self.minimum).max(
+            Sat(self.coeff_00)
+                + Sat(self.coeff_10) * x
+                + Sat(self.coeff_01) * y
+                + Sat(self.coeff_20) * x * x
+                + Sat(self.coeff_11) * x * y
+                + Sat(self.coeff_02) * y * y,
+        )
     }
 }
 
@@ -4240,6 +4297,35 @@ mod tests {
     };
     use pretty_assertions::assert_eq;
     use std::rc::Rc;
+
+    #[test]
+    fn costs_saturate_instead_of_overflowing() {
+        let exp_mod = ThreeArguments::ExpModCost(ExpModCostingFunction {
+            coefficient_00: 607153,
+            coefficient_11: 231697,
+            coefficient_12: 53144,
+        });
+
+        // Sizes in words of operands that fit in memory, but whose cost does not
+        // fit in 64 bits.
+        let size = 1 << 22;
+        assert_eq!(exp_mod.cost(1, size, size), i64::MAX);
+        assert_eq!(exp_mod.cost(size + 1, size, size), i64::MAX);
+        assert_eq!(exp_mod.cost(1, 1, 1), 607153 + 231697 + 53144);
+        assert_eq!(exp_mod.cost(2, 1, 1), (607153 + 231697 + 53144) * 3 / 2);
+
+        let negative_slope = TwoArguments::MultipliedSizes(MultipliedSizes {
+            intercept: 0,
+            slope: -2,
+        });
+        assert_eq!(negative_slope.cost(i64::MAX, i64::MAX), i64::MIN);
+
+        let linear = OneArgument::LinearCost(LinearSize {
+            intercept: 1,
+            slope: i64::MAX,
+        });
+        assert_eq!(linear.cost(2), i64::MAX);
+    }
 
     #[test]
     fn plutus_v3_divide_integer_always_uses_semantic_e_shape() {
