@@ -640,16 +640,12 @@ impl DefaultFunction {
                 let arg2 = args[1].unwrap_integer()?;
                 let arg3 = args[2].unwrap_byte_string()?;
 
-                let skip: usize = if arg1.lt(&0.into()) {
-                    0
-                } else {
-                    arg1.try_into().unwrap()
-                };
-                let take: usize = if arg2.lt(&0.into()) {
-                    0
-                } else {
-                    arg2.try_into().unwrap()
-                };
+                // Plutus takes both operands as an `Int`: anything outside the
+                // signed 64-bit range fails, and negatives behave like zero.
+                let skip = int64_operand(*self, arg1)?;
+                let take = int64_operand(*self, arg2)?;
+                let skip = usize::try_from(skip.max(0)).unwrap_or(usize::MAX);
+                let take = usize::try_from(take.max(0)).unwrap_or(usize::MAX);
 
                 let ret: Vec<u8> = arg3.iter().skip(skip).take(take).cloned().collect();
 
@@ -668,16 +664,11 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_byte_string()?;
                 let arg2 = args[1].unwrap_integer()?;
 
-                let index: i128 = arg2.try_into().unwrap();
+                let index = int64_operand(*self, arg2)?;
 
-                if 0 <= index && index < arg1.len() as i128 {
-                    let ret = arg1[index as usize];
-
-                    let value = Value::integer(ret.into());
-
-                    Ok(value)
-                } else {
-                    Err(Error::ByteStringOutOfBounds(arg2.clone(), arg1.to_vec()))
+                match usize::try_from(index).ok().and_then(|i| arg1.get(i)) {
+                    Some(byte) => Ok(Value::integer((*byte).into())),
+                    None => Err(Error::ByteStringOutOfBounds(arg2.clone(), arg1.to_vec())),
                 }
             }
             DefaultFunction::EqualsByteString => {
@@ -2070,6 +2061,12 @@ impl DefaultFunction {
     }
 }
 
+/// Unlift an `Int` operand the way Plutus does: integers outside the signed
+/// 64-bit range make the builtin fail.
+fn int64_operand(builtin: DefaultFunction, integer: &BigInt) -> Result<i64, Error> {
+    i64::try_from(integer).map_err(|_| Error::IntegerOutOfInt64Range(builtin, integer.clone()))
+}
+
 fn exp_mod_integer(base: &BigInt, exponent: &BigInt, modulus: &BigInt) -> Result<BigInt, Error> {
     if modulus <= &BigInt::zero() || modulus > &EXP_MOD_INTEGER_UB {
         return Err(Error::OutsideNaturalBounds(modulus.clone()));
@@ -2322,6 +2319,67 @@ mod tests {
     use crate::{builtins::DefaultFunction, machine::value::Value};
     use num_bigint::BigInt;
     use pallas_primitives::conway::Language;
+
+    #[test]
+    fn bytestring_builtins_reject_operands_outside_int64() {
+        let bytes = || Value::byte_string(vec![1, 2, 3]);
+        let int = |i: BigInt| Value::integer(i);
+        let huge: BigInt = BigInt::from(1) << 64;
+        let enormous: BigInt = BigInt::from(1) << 200;
+        let slice = |skip: BigInt, take: BigInt| {
+            DefaultFunction::SliceByteString.call(
+                BuiltinSemantics::E,
+                &[int(skip), int(take), bytes()],
+                &mut vec![],
+            )
+        };
+
+        // In range, including negative and oversized-but-Int64 operands.
+        assert_eq!(
+            slice(1.into(), 5.into()).unwrap(),
+            Value::byte_string(vec![2, 3])
+        );
+        assert_eq!(
+            slice((-5).into(), 2.into()).unwrap(),
+            Value::byte_string(vec![1, 2])
+        );
+        assert_eq!(
+            slice(1.into(), (-1).into()).unwrap(),
+            Value::byte_string(vec![])
+        );
+        assert_eq!(
+            slice(i64::MAX.into(), i64::MAX.into()).unwrap(),
+            Value::byte_string(vec![])
+        );
+
+        // Outside Int64 in either direction fails instead of clamping or panicking.
+        for operand in [huge.clone(), -huge.clone(), enormous.clone()] {
+            assert!(matches!(
+                slice(operand.clone(), 1.into()),
+                Err(Error::IntegerOutOfInt64Range(_, _))
+            ));
+            assert!(matches!(
+                slice(0.into(), operand.clone()),
+                Err(Error::IntegerOutOfInt64Range(_, _))
+            ));
+        }
+
+        let index = |i: BigInt| {
+            DefaultFunction::IndexByteString.call(
+                BuiltinSemantics::E,
+                &[bytes(), int(i)],
+                &mut vec![],
+            )
+        };
+
+        assert_eq!(index(2.into()).unwrap(), Value::integer(3.into()));
+        for i in [BigInt::from(3), BigInt::from(-1), BigInt::from(i64::MAX)] {
+            assert!(matches!(index(i), Err(Error::ByteStringOutOfBounds(_, _))));
+        }
+        for i in [huge.clone(), -enormous.clone(), enormous] {
+            assert!(matches!(index(i), Err(Error::IntegerOutOfInt64Range(_, _))));
+        }
+    }
 
     #[test]
     fn exp_mod_integer_handles_positive_and_negative_exponents() {

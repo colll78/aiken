@@ -78,6 +78,11 @@ pub enum Error {
     MachineNeverReachedDone,
     #[error("integerToByteString encountered negative size\n{:>13} {0}", "Size")]
     IntegerToByteStringNegativeSize(BigInt),
+    #[error(
+        "{0} expects an integer in the signed 64-bit range\n{:>13} {1}",
+        "Integer"
+    )]
+    IntegerOutOfInt64Range(DefaultFunction, BigInt),
     #[error("replicateByte encountered negative size\n{:>13} {0}", "Size")]
     ReplicateByteNegativeSize(BigInt),
     #[error("integerToByteString encountered negative input\n{:>13} {0}", "Input")]

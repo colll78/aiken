@@ -22,6 +22,7 @@
 - **uplc**: Reject `constr` and `case` in programs of a UPLC version before 1.1.0, when parsing and when decoding flat. @colll78
 - **uplc**: Parse string constants with Haskell character escapes, as the Plutus parser does (`\83`, `\o143`, `\x7f`, `\^A`, `\DEL`, `\&`, …), instead of keeping numeric escapes literally. @colll78
 - **uplc**: Print the `bls12_381_G2_element` type as such in the textual syntax instead of as `bls12_381_G1_element`. @colll78
+- **uplc**: Fail `sliceByteString` and `indexByteString` cleanly when an integer operand is outside the signed 64-bit range, as Plutus does when unlifting an `Int`, instead of clamping or panicking. @colll78
 
 ## v1.1.24 - 2026-09-26
 
