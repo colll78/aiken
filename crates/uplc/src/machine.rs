@@ -1023,10 +1023,11 @@ mod tests {
             "(con (array integer) [1, 2])",
             "(con value [(#aa, [(#aa, 1)])])",
         ] {
-            for (language, protocol_major_version) in [
-                (Language::PlutusV1, ALONZO_PROTOCOL_VERSION),
-                (Language::PlutusV2, VASIL_PROTOCOL_VERSION),
-                (Language::PlutusV3, CHANG_PROTOCOL_VERSION),
+            // Steps cost more in semantics variant A than in C.
+            for (language, protocol_major_version, cpu) in [
+                (Language::PlutusV1, ALONZO_PROTOCOL_VERSION, 23100),
+                (Language::PlutusV2, VASIL_PROTOCOL_VERSION, 23100),
+                (Language::PlutusV3, CHANG_PROTOCOL_VERSION, 16100),
             ] {
                 let program =
                     crate::parser::program(&format!("(program 1.0.0 {constant})")).unwrap();
@@ -1039,13 +1040,7 @@ mod tests {
                     );
 
                 assert!(result.result().is_ok(), "{constant} in {language:?}");
-                assert_eq!(
-                    result.cost(),
-                    ExBudget {
-                        mem: 200,
-                        cpu: 16100
-                    }
-                );
+                assert_eq!(result.cost(), ExBudget { mem: 200, cpu });
             }
         }
     }

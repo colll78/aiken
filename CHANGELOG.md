@@ -46,6 +46,7 @@
 - **uplc**: Fail a Plutus V3 script that returns anything other than unit in phase-two evaluation, with the new `tx::Error::InvalidReturnValue`, as the ledger does; Plutus V1 and V2 scripts may still return any value. @colll78
 - **uplc**: Verify Ed25519 signatures as Plutus (libsodium) does: `verifyEd25519Signature` returns false for a public key or signature point `R` of small order and for a public key not encoded canonically, where it used to return true. @colll78
 - **uplc**: Cost a parameter missing from a cost model at the maximum, as Plutus does, instead of at 30,000,000,000, so that a builtin the cost model does not cover can never be afforded. @colll78
+- **uplc**: Use Plutus' default cost models for the semantics variant of each language and protocol version in `CostModel::default_for_language_and_protocol`: before protocol version 11, the defaults matched none of Plutus' for Plutus V1 and V2, and Plutus V3 got the costs of protocol version 11. @colll78
 
 ## v1.1.24 - 2026-09-26
 

@@ -98,21 +98,33 @@ impl CostModel {
         }
     }
 
-    /// Local hard-coded default cost model with builtin semantics selected for
-    /// the requested protocol version. This is not ledger-supplied protocol
-    /// params; callers with explicit params should use
+    /// Plutus' default cost model for the semantics the ledger evaluates a
+    /// ledger language's scripts with at a protocol version
+    /// (`cekCostModelForVariant`). These are not the ledger's protocol
+    /// parameters; callers with those should use
     /// `initialize_cost_model_with_protocol` instead.
     pub fn default_for_language_and_protocol(
         version: &Language,
         protocol_major_version: u16,
     ) -> Self {
-        let costs = match version {
-            Language::PlutusV1 => &BuiltinCosts::DEFAULT_V1[..],
-            Language::PlutusV2 => &BuiltinCosts::DEFAULT_V2[..],
-            Language::PlutusV3 => &BuiltinCosts::DEFAULT_V3[..],
+        let semantics =
+            BuiltinSemantics::for_language_and_protocol(version, protocol_major_version);
+
+        // Variants A, B and D (F) cost the parameters of PlutusV1 and
+        // PlutusV2, C and E (G) those of PlutusV3.
+        let (names, costs) = match semantics {
+            BuiltinSemantics::A => (&Language::PlutusV1, &BuiltinCosts::DEFAULT_A[..]),
+            BuiltinSemantics::B => (&Language::PlutusV1, &BuiltinCosts::DEFAULT_B[..]),
+            BuiltinSemantics::D | BuiltinSemantics::F => {
+                (&Language::PlutusV1, &BuiltinCosts::DEFAULT_V1[..])
+            }
+            BuiltinSemantics::C => (&Language::PlutusV3, &BuiltinCosts::DEFAULT_C[..]),
+            BuiltinSemantics::E | BuiltinSemantics::G => {
+                (&Language::PlutusV3, &BuiltinCosts::DEFAULT_V3[..])
+            }
         };
 
-        initialize_cost_model_with_protocol(version, protocol_major_version, costs)
+        initialize_cost_model_with_semantics(names, semantics, costs)
     }
 }
 
@@ -1713,11 +1725,89 @@ pub struct BuiltinCosts {
 }
 
 /// The default cost-model parameters, in the order of each language's
-/// `ParamName` in plutus-ledger-api. `DEFAULT_V3` is plutus 1b03c165's
-/// `builtinCostModelE.json` and `cekMachineCostsE.json`; the `Value`
-/// builtins' parameters, which end every array, take the same values in
-/// `DEFAULT_V1` and `DEFAULT_V2`.
+/// `ParamName` in plutus-ledger-api, from plutus 1b03c165's
+/// `builtinCostModel*.json` and `cekMachineCosts*.json`. `DEFAULT_V1` and
+/// `DEFAULT_V2` are those of semantics variant D, `DEFAULT_V3` those of E.
 impl BuiltinCosts {
+    /// Plutus' default parameters for semantics variant A (`builtinCostModelA.json`
+    /// and `cekMachineCostsA.json`), in the order of `ParamName::V1`.
+    const DEFAULT_A: [i64; 332] = [
+        205665, 812, 1, 1, 1000, 571, 0, 1, 1000, 24177, 4, 1, 1000, 32, 117366, 10475, 4, 23000,
+        100, 23000, 100, 23000, 100, 23000, 100, 23000, 100, 23000, 100, 100, 100, 23000, 100,
+        19537, 32, 175354, 32, 46417, 4, 221973, 511, 0, 1, 89141, 32, 497525, 14068, 4, 2, 196500,
+        453240, 220, 0, 1, 1, 1000, 28662, 4, 2, 245000, 216773, 62, 1, 1060367, 12586, 1, 208512,
+        421, 1, 187000, 1000, 52998, 1, 80436, 32, 43249, 32, 1000, 32, 80556, 1, 57667, 4, 1000,
+        10, 197145, 156, 1, 197145, 156, 1, 204924, 473, 1, 208896, 511, 1, 52467, 32, 64832, 32,
+        65493, 32, 22558, 32, 16563, 32, 76511, 32, 196500, 453240, 220, 0, 1, 1, 69522, 11687, 0,
+        1, 60091, 32, 196500, 453240, 220, 0, 1, 1, 196500, 453240, 220, 0, 1, 1, 806990, 30482, 4,
+        1927926, 82523, 4, 265318, 0, 4, 0, 85931, 32, 205665, 812, 1, 1, 41182, 32, 212342, 32,
+        31220, 32, 32696, 32, 43357, 32, 32247, 32, 38314, 32, 57996947, 18975, 10, 1159724,
+        392670, 0, 2, 35190005, 10, 39121781, 32260, 10, 23000, 100, 23000, 100, 962335, 18,
+        2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868, 18, 52948122, 18,
+        1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36, 158221314, 26549, 36,
+        74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4, 207616, 8310, 4,
+        1293828, 28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181, 726, 719, 0, 1, 100181, 726,
+        719, 0, 1, 100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1,
+        180194, 159, 1, 1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1,
+        1964219, 24520, 3, 607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838,
+        7, 1, 232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 390841, 30257, 47, 27,
+        219951, 9444, 1, 1000, 284948, 143815, 4, 26, 29, 213283, 618401, 1998, 28258, 1, 1000,
+        38159, 2, 22, 1000, 128595, 1, 14, 18, 1000, 383231, 14, 29,
+    ];
+
+    /// Plutus' default parameters for semantics variant B, in the order of
+    /// `ParamName::V1`.
+    const DEFAULT_B: [i64; 332] = [
+        100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000,
+        100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100,
+        94375, 32, 132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848,
+        228465, 122, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1, 898148, 27279, 1, 51775, 558,
+        1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32, 76049, 1, 13169, 4, 22100, 10,
+        28999, 74, 1, 28999, 74, 1, 43285, 552, 1, 44749, 541, 1, 33852, 32, 68246, 32, 72362, 32,
+        7243, 32, 7391, 32, 11546, 32, 85848, 228465, 122, 0, 1, 1, 90434, 519, 0, 1, 74433, 32,
+        85848, 228465, 122, 0, 1, 1, 85848, 228465, 122, 0, 1, 1, 270652, 22588, 4, 1457325, 64566,
+        4, 20467, 1, 4, 0, 141992, 32, 100788, 420, 1, 1, 81663, 32, 59498, 32, 20142, 32, 24588,
+        32, 20744, 32, 25933, 32, 24623, 32, 53384111, 14333, 10, 955506, 213312, 0, 2, 43053543,
+        10, 43574283, 26308, 10, 16000, 100, 16000, 100, 962335, 18, 2780678, 6, 442008, 1,
+        52538055, 3756, 18, 267929, 18, 76433006, 8868, 18, 52948122, 18, 1995836, 36, 3227919, 12,
+        901022, 1, 166917843, 4307, 36, 284546, 36, 158221314, 26549, 36, 74698472, 36, 333849714,
+        1, 254006273, 72, 2174038, 72, 2261318, 64571, 4, 207616, 8310, 4, 1293828, 28716, 63, 0,
+        1, 1006041, 43623, 251, 0, 1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1, 100181, 726,
+        719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1, 1, 158519,
+        8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1, 1964219, 24520, 3, 607153,
+        231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7, 1, 232010, 32, 321837444,
+        25087669, 18, 617887431, 67302824, 36, 390841, 30257, 47, 27, 219951, 9444, 1, 1000,
+        284948, 143815, 4, 26, 29, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22, 1000,
+        128595, 1, 14, 18, 1000, 383231, 14, 29,
+    ];
+
+    /// Plutus' default parameters for semantics variant C, in the order of
+    /// `ParamName::V3`.
+    const DEFAULT_C: [i64; 350] = [
+        100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000,
+        100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100,
+        94375, 32, 132994, 32, 61462, 4, 72010, 178, 0, 1, 22151, 32, 91189, 769, 4, 2, 85848,
+        123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 1, 1000, 42921, 4, 2, 24548, 29498, 38, 1,
+        898148, 27279, 1, 51775, 558, 1, 39184, 1000, 60594, 1, 141895, 32, 83150, 32, 15299, 32,
+        76049, 1, 13169, 4, 22100, 10, 28999, 74, 1, 28999, 74, 1, 43285, 552, 1, 44749, 541, 1,
+        33852, 32, 68246, 32, 72362, 32, 7243, 32, 7391, 32, 11546, 32, 85848, 123203, 7305, -900,
+        1716, 549, 57, 85848, 0, 1, 90434, 519, 0, 1, 74433, 32, 85848, 123203, 7305, -900, 1716,
+        549, 57, 85848, 0, 1, 1, 85848, 123203, 7305, -900, 1716, 549, 57, 85848, 0, 1, 955506,
+        213312, 0, 2, 270652, 22588, 4, 1457325, 64566, 4, 20467, 1, 4, 0, 141992, 32, 100788, 420,
+        1, 1, 81663, 32, 59498, 32, 20142, 32, 24588, 32, 20744, 32, 25933, 32, 24623, 32,
+        43053543, 10, 53384111, 14333, 10, 43574283, 26308, 10, 16000, 100, 16000, 100, 962335, 18,
+        2780678, 6, 442008, 1, 52538055, 3756, 18, 267929, 18, 76433006, 8868, 18, 52948122, 18,
+        1995836, 36, 3227919, 12, 901022, 1, 166917843, 4307, 36, 284546, 36, 158221314, 26549, 36,
+        74698472, 36, 333849714, 1, 254006273, 72, 2174038, 72, 2261318, 64571, 4, 207616, 8310, 4,
+        1293828, 28716, 63, 0, 1, 1006041, 43623, 251, 0, 1, 100181, 726, 719, 0, 1, 100181, 726,
+        719, 0, 1, 100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1,
+        180194, 159, 1, 1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1,
+        1964219, 24520, 3, 607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838,
+        7, 1, 232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 390841, 30257, 47, 27,
+        219951, 9444, 1, 1000, 284948, 143815, 4, 26, 29, 213283, 618401, 1998, 28258, 1, 1000,
+        38159, 2, 22, 1000, 128595, 1, 14, 18, 1000, 383231, 14, 29,
+    ];
+
     pub const DEFAULT_V1: [i64; 332] = [
         100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000,
         100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100,
@@ -4406,15 +4496,43 @@ mod tests {
     }
 
     #[test]
+    fn missing_parameters_cost_max_bound() {
+        // A PlutusV3 cost model that stops right before `dropList`'s parameters.
+        let costs = &BuiltinCosts::DEFAULT_V3[..302];
+        let cost_model = initialize_cost_model(&Language::PlutusV3, costs);
+
+        assert_eq!(
+            cost_model.builtin_costs.drop_list.cpu,
+            TwoArguments::LinearInX(LinearSize {
+                intercept: i64::MAX,
+                slope: i64::MAX,
+            })
+        );
+
+        // No budget affords a builtin costed at Plutus' `maxBound`.
+        let program: Program<NamedDeBruijn> = crate::parser::program(
+            "(program 1.1.0 [(force (builtin dropList)) (con integer 1) (con (list integer) [1])])",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let result = program.eval_as(&Language::PlutusV3, costs, Some(&ExBudget::max()));
+
+        assert!(matches!(result.error(), Some(Error::OutOfExError(_))));
+    }
+
+    #[test]
     fn default_for_language_and_protocol_selects_pre_chang_costing_for_v1_and_v2() {
         for language in [Language::PlutusV1, Language::PlutusV2] {
             let before_chang = CostModel::default_for_language_and_protocol(&language, 8);
             let after_chang = CostModel::default_for_language_and_protocol(&language, 9);
 
+            // Plutus' builtinCostModelA.json and builtinCostModelB.json.
             assert_eq!(
                 TwoArguments::AddedSizes(AddedSizes {
-                    intercept: 90434,
-                    slope: 519,
+                    intercept: 69522,
+                    slope: 11687,
                 }),
                 before_chang.builtin_costs.multiply_integer.cpu
             );
@@ -4500,33 +4618,6 @@ mod tests {
             130 + 132 * 7,
             builtin_costs.remainder_integer.mem.cost(3, 7)
         );
-    }
-
-    #[test]
-    fn missing_parameters_cost_max_bound() {
-        // A PlutusV3 cost model that stops right before `dropList`'s parameters.
-        let costs = &BuiltinCosts::DEFAULT_V3[..302];
-        let cost_model = initialize_cost_model(&Language::PlutusV3, costs);
-
-        assert_eq!(
-            cost_model.builtin_costs.drop_list.cpu,
-            TwoArguments::LinearInX(LinearSize {
-                intercept: i64::MAX,
-                slope: i64::MAX,
-            })
-        );
-
-        // No budget affords a builtin costed at Plutus' `maxBound`.
-        let program: Program<NamedDeBruijn> = crate::parser::program(
-            "(program 1.1.0 [(force (builtin dropList)) (con integer 1) (con (list integer) [1])])",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
-
-        let result = program.eval_as(&Language::PlutusV3, costs, Some(&ExBudget::max()));
-
-        assert!(matches!(result.error(), Some(Error::OutOfExError(_))));
     }
 
     #[test]
