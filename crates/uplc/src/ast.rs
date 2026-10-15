@@ -724,8 +724,7 @@ impl std::fmt::Debug for ListSpine {
 }
 
 impl Constant {
-    /// Whether this constant contains a native `Value`, which is only
-    /// available from Plutus V3 / protocol version 11 (Van Rossem) onwards.
+    /// Whether this constant contains a native `Value`.
     pub fn contains_value(constant: impl AsRef<Constant>) -> bool {
         match constant.as_ref() {
             Constant::Value(_) => true,
@@ -737,24 +736,6 @@ impl Constant {
                     || snd.contains_value()
                     || Constant::contains_value(left)
                     || Constant::contains_value(right)
-            }
-            _ => false,
-        }
-    }
-
-    /// Whether this constant contains a builtin array, which is only
-    /// available from protocol version 11 (Van Rossem) onwards.
-    pub fn contains_array(constant: impl AsRef<Constant>) -> bool {
-        match constant.as_ref() {
-            Constant::ProtoArray(..) => true,
-            Constant::ProtoList(r#type, elements) => {
-                r#type.contains_array() || elements.iter().any(Constant::contains_array)
-            }
-            Constant::ProtoPair(fst, snd, left, right) => {
-                fst.contains_array()
-                    || snd.contains_array()
-                    || Constant::contains_array(left)
-                    || Constant::contains_array(right)
             }
             _ => false,
         }
@@ -1277,24 +1258,12 @@ pub enum Type {
 }
 
 impl Type {
-    /// Whether this type mentions the native `Value` type, which is only
-    /// available from Plutus V3 / protocol version 11 (Van Rossem) onwards.
+    /// Whether this type mentions the native `Value` type.
     pub fn contains_value(&self) -> bool {
         match self {
             Type::Value => true,
             Type::List(r#type) | Type::Array(r#type) => r#type.contains_value(),
             Type::Pair(fst, snd) => fst.contains_value() || snd.contains_value(),
-            _ => false,
-        }
-    }
-
-    /// Whether this type mentions the builtin array type, which is only
-    /// available from protocol version 11 (Van Rossem) onwards.
-    pub fn contains_array(&self) -> bool {
-        match self {
-            Type::Array(_) => true,
-            Type::List(r#type) => r#type.contains_array(),
-            Type::Pair(fst, snd) => fst.contains_array() || snd.contains_array(),
             _ => false,
         }
     }
@@ -1747,7 +1716,7 @@ impl Program<NamedDeBruijn> {
             200,
         );
 
-        let term = machine.run(self.term);
+        let term = machine.run_program(self);
 
         EvalResult::new(
             term,
@@ -1762,7 +1731,7 @@ impl Program<NamedDeBruijn> {
     pub fn eval_version(self, initial_budget: ExBudget, version: &Language) -> EvalResult {
         let mut machine = Machine::new(version.clone(), CostModel::default(), initial_budget, 200);
 
-        let term = machine.run(self.term);
+        let term = machine.run_program(self);
 
         EvalResult::new(
             term,
@@ -1790,7 +1759,7 @@ impl Program<NamedDeBruijn> {
             200,
         );
 
-        let term = machine.run(self.term);
+        let term = machine.run_program(self);
 
         EvalResult::new(
             term,
@@ -1816,7 +1785,7 @@ impl Program<NamedDeBruijn> {
             200, //slippage
         );
 
-        let term = machine.run(self.term);
+        let term = machine.run_program(self);
 
         EvalResult::new(
             term,
@@ -1846,7 +1815,7 @@ impl Program<NamedDeBruijn> {
             200, //slippage
         );
 
-        let term = machine.run(self.term);
+        let term = machine.run_program(self);
 
         EvalResult::new(
             term,
@@ -1865,7 +1834,7 @@ impl Program<NamedDeBruijn> {
             200, //slippage
         );
 
-        let term = machine.run(self.term);
+        let term = machine.run_program(self);
 
         EvalResult::new(
             term,

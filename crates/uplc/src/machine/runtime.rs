@@ -8,12 +8,13 @@ use crate::{
     builtins::DefaultFunction,
     data::{Array, Constr, Map},
     machine::value::integer_log2_ref,
+    protocol::{CHANG_PROTOCOL_VERSION, DIJKSTRA_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION},
 };
 use bitvec::{order::Msb0, vec::BitVec};
 use itertools::Itertools;
 use num_bigint::BigInt;
 use num_integer::Integer;
-use num_traits::{FromPrimitive, Signed, Zero};
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 use once_cell::sync::Lazy;
 use pallas_primitives::conway::Language;
 use std::{mem::size_of, rc::Rc};
@@ -30,7 +31,7 @@ static SCALAR_PERIOD: Lazy<BigInt> = Lazy::new(|| {
 });
 
 // The maximum size of a scalar for the BLS12-381 multiScalarMul functions (and,
-// in semantics variants D and E, the scalarMul functions) is 512 bytes = 4096
+// in semantics variants D to G, the scalarMul functions) is 512 bytes = 4096
 // bits, so valid scalars lie in [-(2^4095), 2^4095 - 1].
 // See PlutusCore.Crypto.BLS12_381.Bounds.
 static MSM_SCALAR_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 4095u32) - 1);
@@ -47,11 +48,11 @@ static BOUNDED_INTEGER_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 26214
 
 static BOUNDED_INTEGER_LB: Lazy<BigInt> = Lazy::new(|| -(BigInt::from(1) << 262143u32));
 
-/// The bound of Plutus' `CByteString`, through which semantics variants D and
-/// E unlift most bytestring arguments.
+/// The bound of Plutus' `CByteString`, through which semantics variants D to G
+/// unlift most bytestring arguments.
 const BOUNDED_BYTE_STRING_MAXIMUM_LENGTH: usize = 65536;
 
-/// The longest input `writeBits` accepts in semantics variants D and E
+/// The longest input `writeBits` accepts in semantics variants D to G
 /// (Plutus' `Bitwise.maximumInputLength`).
 const WRITE_BITS_MAXIMUM_INPUT_LENGTH: usize = 4096;
 
@@ -61,15 +62,7 @@ const BLST_P2_COMPRESSED_SIZE: usize = 96;
 
 pub const INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH: i64 = 8192;
 
-pub const ALONZO_PROTOCOL_VERSION: u16 = 5;
-pub const VASIL_PROTOCOL_VERSION: u16 = 7;
-pub const VALENTINE_PROTOCOL_VERSION: u16 = 8;
-pub const CHANG_PROTOCOL_VERSION: u16 = 9;
-pub const PLOMIN_PROTOCOL_VERSION: u16 = 10;
-pub const VAN_ROSSEM_PROTOCOL_VERSION: u16 = 11;
-pub const DIJKSTRA_PROTOCOL_VERSION: u16 = 12;
-
-/// Ledger builtin semantics variants.
+/// Ledger builtin semantics variants (Plutus' `BuiltinSemanticsVariant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinSemantics {
     A,
@@ -77,60 +70,65 @@ pub enum BuiltinSemantics {
     C,
     D,
     E,
+    F,
+    G,
 }
 
 impl BuiltinSemantics {
+    /// The semantics of a ledger language under the latest supported protocol
+    /// version.
     pub fn for_language(language: &Language) -> Self {
-        match language {
-            Language::PlutusV1 | Language::PlutusV2 => BuiltinSemantics::D,
-            Language::PlutusV3 => BuiltinSemantics::E,
-        }
+        Self::for_language_and_protocol(language, VAN_ROSSEM_PROTOCOL_VERSION)
     }
 
+    /// The semantics the ledger evaluates a ledger language's scripts with at a
+    /// protocol version (plutus-ledger-api's `mkEvaluationContext`).
     pub fn for_language_and_protocol(language: &Language, protocol_major_version: u16) -> Self {
         match language {
-            Language::PlutusV1 | Language::PlutusV2
-                if protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION =>
-            {
-                BuiltinSemantics::D
-            }
-            Language::PlutusV1 | Language::PlutusV2
-                if protocol_major_version >= CHANG_PROTOCOL_VERSION =>
-            {
-                BuiltinSemantics::B
-            }
-            Language::PlutusV1 | Language::PlutusV2 => BuiltinSemantics::A,
-            Language::PlutusV3 if protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION => {
-                BuiltinSemantics::E
-            }
-            Language::PlutusV3 => BuiltinSemantics::C,
+            Language::PlutusV1 | Language::PlutusV2 => match protocol_major_version {
+                ..CHANG_PROTOCOL_VERSION => BuiltinSemantics::A,
+                CHANG_PROTOCOL_VERSION..VAN_ROSSEM_PROTOCOL_VERSION => BuiltinSemantics::B,
+                VAN_ROSSEM_PROTOCOL_VERSION..DIJKSTRA_PROTOCOL_VERSION => BuiltinSemantics::D,
+                DIJKSTRA_PROTOCOL_VERSION.. => BuiltinSemantics::F,
+            },
+            Language::PlutusV3 => match protocol_major_version {
+                ..VAN_ROSSEM_PROTOCOL_VERSION => BuiltinSemantics::C,
+                VAN_ROSSEM_PROTOCOL_VERSION..DIJKSTRA_PROTOCOL_VERSION => BuiltinSemantics::E,
+                DIJKSTRA_PROTOCOL_VERSION.. => BuiltinSemantics::G,
+            },
         }
     }
 
     pub fn costs_strings_by_utf8_bytes(self) -> bool {
-        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
+        matches!(
+            self,
+            BuiltinSemantics::D | BuiltinSemantics::E | BuiltinSemantics::F | BuiltinSemantics::G
+        )
     }
 
     fn cons_byte_string_range_checks(self) -> bool {
-        matches!(self, BuiltinSemantics::C | BuiltinSemantics::E)
+        matches!(
+            self,
+            BuiltinSemantics::C | BuiltinSemantics::E | BuiltinSemantics::G
+        )
     }
 
-    /// Whether builtins bound their integer and bytestring arguments, as
-    /// Plutus' `CInteger` and `CByteString` do (`ensurableInteger` and
-    /// `ensurableByteString`, which agree on variants A to E). Over these
-    /// semantics, `writeBits` also limits the length of its input, scalar
-    /// multiplication the size of its scalar, and `constrData`, the shifts and
-    /// the rotations take machine-word operands.
-    fn bounds_arguments(self) -> bool {
+    /// Whether integer arithmetic and comparisons bound their operands, as
+    /// Plutus' `CInteger` does (`ensurableInteger`).
+    fn bounds_integers(self) -> bool {
         matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
     }
 
-    /// Whether these are the semantics of protocol version 11 (Van Rossem)
-    /// onwards, which brought batch 6 builtins (including the CIP-0153 value
-    /// builtins and arrays), `Value` and array constants, and `case` on
-    /// builtin values to every ledger language.
-    pub fn is_van_rossem(self) -> bool {
-        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
+    /// Whether builtins bound their bytestring arguments, as Plutus'
+    /// `CByteString` does (`ensurableByteString`). Under these semantics,
+    /// `writeBits` also limits the length of its input, scalar multiplication
+    /// the size of its scalar, and `constrData`, the shifts and the rotations
+    /// take machine-word operands.
+    fn bounds_byte_strings(self) -> bool {
+        matches!(
+            self,
+            BuiltinSemantics::D | BuiltinSemantics::E | BuiltinSemantics::F | BuiltinSemantics::G
+        )
     }
 }
 
@@ -310,24 +308,40 @@ impl Unlift {
             Unlift::Bls12_381G1Element => arg.unwrap_bls12_381_g1_element().map(|_| ()),
             Unlift::Bls12_381G2Element => arg.unwrap_bls12_381_g2_element().map(|_| ()),
             Unlift::Bls12_381MlResult => arg.unwrap_bls12_381_ml_result().map(|_| ()),
-            Unlift::ListOfIntegers => unlift_list(arg, Type::Integer),
-            Unlift::ListOfData => unlift_list(arg, Type::Data),
-            Unlift::ListOfPairsOfData => {
-                unlift_list(arg, Type::Pair(Type::Data.into(), Type::Data.into()))
-            }
-            Unlift::ListOfBls12_381G1Elements => unlift_list(arg, Type::Bls12_381G1Element),
-            Unlift::ListOfBls12_381G2Elements => unlift_list(arg, Type::Bls12_381G2Element),
+            Unlift::ListOfIntegers => unlift_list(arg, |t| *t == Type::Integer, || Type::Integer),
+            Unlift::ListOfData => unlift_list(arg, |t| *t == Type::Data, || Type::Data),
+            Unlift::ListOfPairsOfData => unlift_list(
+                arg,
+                |t| matches!(t, Type::Pair(k, v) if **k == Type::Data && **v == Type::Data),
+                || Type::Pair(Type::Data.into(), Type::Data.into()),
+            ),
+            Unlift::ListOfBls12_381G1Elements => unlift_list(
+                arg,
+                |t| *t == Type::Bls12_381G1Element,
+                || Type::Bls12_381G1Element,
+            ),
+            Unlift::ListOfBls12_381G2Elements => unlift_list(
+                arg,
+                |t| *t == Type::Bls12_381G2Element,
+                || Type::Bls12_381G2Element,
+            ),
         }
     }
 }
 
-fn unlift_list(arg: &Value, element_type: Type) -> Result<(), Error> {
+/// `element_type` only builds the expected type for the error, so that a
+/// successful unlift allocates nothing.
+fn unlift_list(
+    arg: &Value,
+    is_element_type: fn(&Type) -> bool,
+    element_type: fn() -> Type,
+) -> Result<(), Error> {
     let constant = arg.unwrap_constant()?;
 
     match constant {
-        Constant::ProtoList(r#type, _) if *r#type == element_type => Ok(()),
+        Constant::ProtoList(r#type, _) if is_element_type(r#type) => Ok(()),
         _ => Err(Error::TypeMismatch(
-            Type::List(element_type.into()),
+            Type::List(element_type().into()),
             constant.into(),
         )),
     }
@@ -656,10 +670,15 @@ impl DefaultFunction {
     /// How the builtin unlifts its `index`-th argument under the given
     /// semantics; see `Unlift`.
     fn argument_unlifting(&self, semantics: BuiltinSemantics, index: usize) -> Unlift {
-        let (integer, byte_string) = if semantics.bounds_arguments() {
-            (Unlift::BoundedInteger, Unlift::BoundedByteString)
+        let integer = if semantics.bounds_integers() {
+            Unlift::BoundedInteger
         } else {
-            (Unlift::Integer, Unlift::ByteString)
+            Unlift::Integer
+        };
+        let byte_string = if semantics.bounds_byte_strings() {
+            Unlift::BoundedByteString
+        } else {
+            Unlift::ByteString
         };
 
         match (self, index) {
@@ -748,7 +767,7 @@ impl DefaultFunction {
                 _,
             ) => Unlift::Constant,
             (DefaultFunction::ConstrData, 0) => {
-                if semantics.bounds_arguments() {
+                if semantics.bounds_byte_strings() {
                     Unlift::Word64
                 } else {
                     Unlift::Integer
@@ -843,7 +862,7 @@ impl DefaultFunction {
                 Unlift::ByteString
             }
             (DefaultFunction::ShiftByteString | DefaultFunction::RotateByteString, _) => {
-                if semantics.bounds_arguments() {
+                if semantics.bounds_byte_strings() {
                     Unlift::Int
                 } else {
                     Unlift::Integer
@@ -877,10 +896,6 @@ impl DefaultFunction {
         args: &[Value],
         traces: &mut Vec<Trace>,
     ) -> Result<Value, Error> {
-        if self.is_van_rossem_builtin() && !semantics.is_van_rossem() {
-            return Err(Error::BuiltinNotAvailable(*self));
-        }
-
         match self {
             DefaultFunction::AddInteger => {
                 let arg1 = args[0].unwrap_integer()?;
@@ -1574,7 +1589,7 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_integer()?;
                 let arg2 = args[1].unwrap_bls12_381_g1_element()?;
 
-                if semantics.bounds_arguments() && msm_scalar_out_of_bounds(arg1) {
+                if semantics.bounds_byte_strings() && msm_scalar_out_of_bounds(arg1) {
                     return Err(Error::MsmScalarOutOfBounds);
                 }
 
@@ -1709,7 +1724,7 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_integer()?;
                 let arg2 = args[1].unwrap_bls12_381_g2_element()?;
 
-                if semantics.bounds_arguments() && msm_scalar_out_of_bounds(arg1) {
+                if semantics.bounds_byte_strings() && msm_scalar_out_of_bounds(arg1) {
                     return Err(Error::MsmScalarOutOfBounds);
                 }
 
@@ -2130,7 +2145,8 @@ impl DefaultFunction {
                 let indices = args[1].unwrap_int_list()?;
                 let set_bit = args[2].unwrap_bool()?;
 
-                if semantics.bounds_arguments() && bytes.len() > WRITE_BITS_MAXIMUM_INPUT_LENGTH {
+                if semantics.bounds_byte_strings() && bytes.len() > WRITE_BITS_MAXIMUM_INPUT_LENGTH
+                {
                     return Err(Error::ByteStringTooLong {
                         builtin: *self,
                         maximum: WRITE_BITS_MAXIMUM_INPUT_LENGTH,
@@ -2476,19 +2492,18 @@ impl DefaultFunction {
 fn check_output_length(builtin: DefaultFunction, size: &BigInt) -> Result<usize, Error> {
     let maximum = INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH;
 
-    match builtin {
-        _ if !size.is_negative() && size <= &BigInt::from(maximum) => {
-            Ok(usize::try_from(size).expect("size is within the output length"))
-        }
-        DefaultFunction::ReplicateByte if size.is_negative() => {
-            Err(Error::ReplicateByteNegativeSize(size.clone()))
-        }
-        DefaultFunction::ReplicateByte => {
-            Err(Error::ReplicateByteSizeTooBig(size.clone(), maximum))
-        }
-        _ if size.is_negative() => Err(Error::IntegerToByteStringNegativeSize(size.clone())),
-        _ => Err(Error::IntegerToByteStringSizeTooBig(size.clone(), maximum)),
+    if let Some(size) = size.to_usize().filter(|size| *size as i64 <= maximum) {
+        return Ok(size);
     }
+
+    Err(match builtin {
+        DefaultFunction::ReplicateByte if size.is_negative() => {
+            Error::ReplicateByteNegativeSize(size.clone())
+        }
+        DefaultFunction::ReplicateByte => Error::ReplicateByteSizeTooBig(size.clone(), maximum),
+        _ if size.is_negative() => Error::IntegerToByteStringNegativeSize(size.clone()),
+        _ => Error::IntegerToByteStringSizeTooBig(size.clone(), maximum),
+    })
 }
 
 /// Unlift an `Int` operand the way Plutus does: integers outside the signed
@@ -2686,7 +2701,7 @@ fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<V
     expect_length(builtin, "signature", signature, 64)?;
     expect_length(builtin, "message hash", message, 32)?;
 
-    let valid = secp256k1::verify_ecdsa(public_key, message, signature)?;
+    let valid = backend::verify_ecdsa(public_key, message, signature)?;
 
     Ok(Value::Con(Constant::Bool(valid).into()))
 }
@@ -2700,7 +2715,7 @@ fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result
     expect_length(builtin, "public key", public_key, 32)?;
     expect_length(builtin, "signature", signature, 64)?;
 
-    let valid = secp256k1::verify_schnorr(public_key, message, signature)?;
+    let valid = backend::verify_schnorr(public_key, message, signature)?;
 
     Ok(Value::Con(Constant::Bool(valid).into()))
 }
@@ -2726,7 +2741,7 @@ fn expect_length(
 /// libsecp256k1, which Plutus itself uses. The callers have already checked
 /// the argument lengths.
 #[cfg(not(target_family = "wasm"))]
-mod secp256k1 {
+mod backend {
     use super::Error;
     use ::secp256k1::{
         Message, PublicKey, Secp256k1, XOnlyPublicKey, ecdsa,
@@ -2783,7 +2798,7 @@ mod secp256k1 {
 /// back to the `False` that libsecp256k1 gives. The callers have already
 /// checked the argument lengths, which k256 would otherwise panic on.
 #[cfg(target_family = "wasm")]
-mod secp256k1 {
+mod backend {
     use super::Error;
     use k256::{
         FieldBytes, Scalar,
@@ -2847,13 +2862,12 @@ mod tests {
     #[test]
     fn bytestring_builtins_reject_operands_outside_int64() {
         let bytes = || Value::byte_string(vec![1, 2, 3]);
-        let int = |i: BigInt| Value::integer(i);
         let huge: BigInt = BigInt::from(1) << 64;
         let enormous: BigInt = BigInt::from(1) << 200;
         let slice = |skip: BigInt, take: BigInt| {
             DefaultFunction::SliceByteString.call(
                 BuiltinSemantics::E,
-                &[int(skip), int(take), bytes()],
+                &[Value::integer(skip), Value::integer(take), bytes()],
                 &mut vec![],
             )
         };
@@ -2891,7 +2905,7 @@ mod tests {
         let index = |i: BigInt| {
             DefaultFunction::IndexByteString.call(
                 BuiltinSemantics::E,
-                &[bytes(), int(i)],
+                &[bytes(), Value::integer(i)],
                 &mut vec![],
             )
         };
@@ -2943,39 +2957,49 @@ mod tests {
                 signature,
             )
         };
-        let bool = |b: bool| Value::bool(b);
 
-        assert_eq!(verify(KEY, HASH, &format!("{R}{S}")).unwrap(), bool(true));
+        assert_eq!(
+            verify(KEY, HASH, &format!("{R}{S}")).unwrap(),
+            Value::bool(true)
+        );
 
         // Well-formed, but not a valid signature.
         assert_eq!(
             verify(KEY, HASH, &format!("{R}{HIGH_S}")).unwrap(),
-            bool(false)
+            Value::bool(false)
         );
         assert_eq!(
             verify(KEY, HASH, &format!("{ZERO}{S}")).unwrap(),
-            bool(false)
+            Value::bool(false)
         );
         assert_eq!(
             verify(KEY, HASH, &format!("{R}{ZERO}")).unwrap(),
-            bool(false)
+            Value::bool(false)
         );
 
-        // Malformed: a scalar not below the group order, an uncompressed or
-        // invalid key, or a wrong length.
-        for (key, hash, signature) in [
-            (KEY, HASH, format!("{ORDER}{S}")),
-            (KEY, HASH, format!("{R}{ORDER}")),
-            (UNCOMPRESSED_KEY, HASH, format!("{R}{S}")),
-            (&format!("02{ZERO}"), HASH, format!("{R}{S}")),
-            (&KEY[2..], HASH, format!("{R}{S}")),
-            (KEY, &HASH[2..], format!("{R}{S}")),
-            (KEY, &format!("{HASH}00"), format!("{R}{S}")),
-            (KEY, HASH, format!("{R}{}", &S[2..])),
-            (KEY, HASH, String::new()),
+        // Malformed: a scalar not below the group order, or an invalid key.
+        for (key, signature) in [
+            (KEY, format!("{ORDER}{S}")),
+            (KEY, format!("{R}{ORDER}")),
+            (&format!("02{ZERO}"), format!("{R}{S}")),
+        ] {
+            assert!(verify(key, HASH, &signature).is_err(), "{key} {signature}");
+        }
+
+        // Malformed: a wrong length, which an uncompressed key also has.
+        for (key, hash, signature, argument) in [
+            (UNCOMPRESSED_KEY, HASH, format!("{R}{S}"), "public key"),
+            (&KEY[2..], HASH, format!("{R}{S}"), "public key"),
+            (KEY, &HASH[2..], format!("{R}{S}"), "message hash"),
+            (KEY, &format!("{HASH}00"), format!("{R}{S}"), "message hash"),
+            (KEY, HASH, format!("{R}{}", &S[2..]), "signature"),
+            (KEY, HASH, String::new(), "signature"),
         ] {
             assert!(
-                verify(key, hash, &signature).is_err(),
+                matches!(
+                    verify(key, hash, &signature),
+                    Err(Error::UnexpectedArgumentLength { argument: a, .. }) if a == argument
+                ),
                 "{key} {hash} {signature}"
             );
         }
@@ -3000,11 +3024,10 @@ mod tests {
                 signature,
             )
         };
-        let bool = |b: bool| Value::bool(b);
 
         assert_eq!(
             verify(KEY, MESSAGE, &format!("{R}{S}")).unwrap(),
-            bool(true)
+            Value::bool(true)
         );
 
         // BIP-340 test vector 15: messages of any length are accepted.
@@ -3015,11 +3038,11 @@ mod tests {
                 "71535db165ecd9fbbc046e5ffaea61186bb6ad436732fccc25291a55895464cf6069ce26bf03466228f19a3a62db8a649f2d560fac652827d1af0574e427ab63",
             )
             .unwrap(),
-            bool(true)
+            Value::bool(true)
         );
         assert_eq!(
             verify(KEY, &format!("{MESSAGE}00"), &format!("{R}{S}")).unwrap(),
-            bool(false)
+            Value::bool(false)
         );
 
         // Any 64 bytes are a signature: out-of-range components do not verify.
@@ -3031,23 +3054,28 @@ mod tests {
         ] {
             assert_eq!(
                 verify(KEY, MESSAGE, &signature).unwrap(),
-                bool(false),
+                Value::bool(false),
                 "{signature}"
             );
         }
 
-        // Malformed: a key that is not on the curve, or a wrong length.
-        for (key, signature) in [
-            (PRIME.to_string(), format!("{R}{S}")),
-            (KEY[2..].to_string(), format!("{R}{S}")),
-            (format!("{KEY}00"), format!("{R}{S}")),
-            (String::new(), format!("{R}{S}")),
-            (KEY.to_string(), format!("{R}{}", &S[2..])),
-            (KEY.to_string(), format!("{R}{S}00")),
-            (KEY.to_string(), String::new()),
+        // Malformed: a key that is not on the curve.
+        assert!(verify(PRIME, MESSAGE, &format!("{R}{S}")).is_err());
+
+        // Malformed: a wrong length.
+        for (key, signature, argument) in [
+            (KEY[2..].to_string(), format!("{R}{S}"), "public key"),
+            (format!("{KEY}00"), format!("{R}{S}"), "public key"),
+            (String::new(), format!("{R}{S}"), "public key"),
+            (KEY.to_string(), format!("{R}{}", &S[2..]), "signature"),
+            (KEY.to_string(), format!("{R}{S}00"), "signature"),
+            (KEY.to_string(), String::new(), "signature"),
         ] {
             assert!(
-                verify(&key, MESSAGE, &signature).is_err(),
+                matches!(
+                    verify(&key, MESSAGE, &signature),
+                    Err(Error::UnexpectedArgumentLength { argument: a, .. }) if a == argument
+                ),
                 "{key} {signature}"
             );
         }
@@ -3186,42 +3214,60 @@ mod tests {
 
     #[test]
     fn protocol_versions_select_ledger_semantics() {
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV2, 8),
-            BuiltinSemantics::A
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV2, 9),
-            BuiltinSemantics::B
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV3, 10),
-            BuiltinSemantics::C
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV3, 11),
-            BuiltinSemantics::E
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV2, 11),
-            BuiltinSemantics::D
-        );
+        use BuiltinSemantics::*;
+        use Language::*;
+
+        // The protocol versions at which each language's semantics variant
+        // changes (`builtinSemanticsVariant` in plutus-ledger-api).
+        for (language, variants) in [
+            (
+                PlutusV1,
+                [(5, A), (8, A), (9, B), (10, B), (11, D), (12, F)],
+            ),
+            (
+                PlutusV2,
+                [(7, A), (8, A), (9, B), (10, B), (11, D), (12, F)],
+            ),
+            (
+                PlutusV3,
+                [(9, C), (10, C), (11, E), (12, G), (13, G), (u16::MAX, G)],
+            ),
+        ] {
+            for (protocol_major_version, semantics) in variants {
+                assert_eq!(
+                    BuiltinSemantics::for_language_and_protocol(&language, protocol_major_version),
+                    semantics,
+                    "{language:?} at protocol version {protocol_major_version}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn cons_byte_string_keeps_d_wrapping_and_e_range_checking() {
+    fn cons_byte_string_wraps_or_range_checks_its_byte() {
+        use BuiltinSemantics::*;
+
         let args = [Value::integer(256.into()), Value::byte_string(vec![])];
 
-        let wrapped = DefaultFunction::ConsByteString
-            .call(BuiltinSemantics::D, &args, &mut vec![])
-            .unwrap();
+        for semantics in [A, B, D, F] {
+            assert_eq!(
+                DefaultFunction::ConsByteString
+                    .call(semantics, &args, &mut vec![])
+                    .unwrap(),
+                Value::byte_string(vec![0]),
+                "{semantics:?}"
+            );
+        }
 
-        assert_eq!(wrapped, Value::byte_string(vec![0]));
-        assert!(
-            DefaultFunction::ConsByteString
-                .call(BuiltinSemantics::E, &args, &mut vec![])
-                .is_err()
-        );
+        for semantics in [C, E, G] {
+            assert!(
+                matches!(
+                    DefaultFunction::ConsByteString.call(semantics, &args, &mut vec![]),
+                    Err(Error::ByteStringConsNotAByte(_))
+                ),
+                "{semantics:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,13 @@
 use std::{fmt::Display, ptr::NonNull, rc::Rc};
 
-use crate::ast::{Constant, NamedDeBruijn, Term, Type};
+use crate::{
+    ast::{Constant, NamedDeBruijn, Program, Term, Type},
+    data::Data,
+    protocol::{
+        self, DIJKSTRA_PROTOCOL_VERSION, MAX_CONSTANT_TYPE_SIZE, MAX_CONSTR_FIELDS,
+        VAN_ROSSEM_PROTOCOL_VERSION,
+    },
+};
 use num_traits::ToPrimitive;
 
 pub mod cost_model;
@@ -16,9 +23,7 @@ use pallas_primitives::conway::Language;
 
 use self::{
     cost_model::CostModel,
-    runtime::{
-        BuiltinRuntime, BuiltinSemantics, DIJKSTRA_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION,
-    },
+    runtime::{BuiltinRuntime, BuiltinSemantics},
     value::{Env, Value},
 };
 
@@ -94,6 +99,10 @@ pub const TERM_COUNT: usize = 9;
 // Builtin tags are sparse; this is the highest tag plus one for debug counters.
 pub const BUILTIN_COUNT: usize = 101;
 
+/// The memory and CPU spent on each step kind, then on each builtin, in
+/// that order.
+pub type SpendCounter = [i64; (TERM_COUNT + BUILTIN_COUNT) * 2];
+
 #[derive(Debug, Clone)]
 pub enum Trace {
     Log(String),
@@ -131,11 +140,24 @@ pub struct Machine {
     slippage: u32,
     unbudgeted_steps: [u32; 10],
     pub traces: Vec<Trace>,
-    pub spend_counter: Option<[i64; (TERM_COUNT + BUILTIN_COUNT) * 2]>,
+    pub spend_counter: Option<SpendCounter>,
     semantics: BuiltinSemantics,
+    caser: Caser,
     language: Language,
     protocol_major_version: u16,
     frames: Vec<Frame>,
+}
+
+/// What `case` may scrutinise besides `constr` values (Plutus'
+/// `defaultCaserBuiltinFor`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Caser {
+    /// Nothing else: before protocol version 11 (Van Rossem).
+    ConstrOnly,
+    /// Unit, booleans, integers, lists and pairs.
+    BuiltinsButData,
+    /// Data too: from protocol version 12 (Dijkstra), in UPLC 1.2.0 programs.
+    Builtins,
 }
 
 impl Machine {
@@ -212,10 +234,16 @@ impl Machine {
         costs: CostModel,
         initial_budget: ExBudget,
         slippage: u32,
-        spend_counter: Option<[i64; (TERM_COUNT + BUILTIN_COUNT) * 2]>,
+        spend_counter: Option<SpendCounter>,
     ) -> Machine {
         let semantics =
             BuiltinSemantics::for_language_and_protocol(&language, protocol_major_version);
+
+        let caser = if protocol_major_version < VAN_ROSSEM_PROTOCOL_VERSION {
+            Caser::ConstrOnly
+        } else {
+            Caser::BuiltinsButData
+        };
 
         Machine {
             costs,
@@ -225,13 +253,39 @@ impl Machine {
             traces: vec![],
             spend_counter,
             semantics,
+            caser,
             language,
             protocol_major_version,
             frames: vec![],
         }
     }
 
+    /// Evaluates a program. From protocol version 12 (Dijkstra), `case` may
+    /// scrutinise Data in programs of UPLC version 1.2.0 or later (Plutus'
+    /// `defaultCaserBuiltinFor`).
+    ///
+    /// The ledger only runs programs whose UPLC version the ledger language
+    /// has at the protocol version (see
+    /// [`protocol::is_uplc_version_available`]); this does not check that.
+    pub fn run_program(
+        &mut self,
+        program: Program<NamedDeBruijn>,
+    ) -> Result<Term<NamedDeBruijn>, Error> {
+        if self.protocol_major_version >= DIJKSTRA_PROTOCOL_VERSION && program.version >= (1, 2, 0)
+        {
+            self.caser = Caser::Builtins;
+        }
+
+        self.run(program.term)
+    }
+
+    /// Evaluates a term, as [`Machine::run_program`] evaluates the term of a
+    /// program of UPLC version 1.1.0.
     pub fn run(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
+        if self.protocol_major_version < protocol::language_introduced_in(&self.language) {
+            return Err(Error::LanguageNotAvailable(self.language.clone()));
+        }
+
         self.check_term(&term)?;
 
         let startup_budget = self.costs.machine_costs.get(StepKind::StartUp);
@@ -264,16 +318,20 @@ impl Machine {
     }
 
     /// Reject, before any budget is spent, terms the ledger would refuse to
-    /// evaluate: open terms (the ledger scope-checks every script it runs) and,
-    /// before protocol version 11 (Van Rossem), builtins and constant types the
-    /// ledger language does not have yet (see `DefaultFunction::introduced_in`).
-    /// From Van Rossem onwards everything this machine knows about is available
-    /// in every ledger language. Both are whole-program well-formedness rules:
-    /// occurrences in latent code (under lambdas, delays or untaken branches)
-    /// are rejected too, except that before protocol version 12 (Dijkstra) the
-    /// ledger's scope check does not look inside `constr` and `case` (Plutus'
-    /// `checkScope NoCaseConstr`), so a free variable there only fails the
-    /// program if it is evaluated.
+    /// evaluate. The ledger refuses to decode (Plutus' `deserialiseScript`):
+    ///
+    /// - builtins the ledger language does not have yet at the protocol
+    ///   version (see `DefaultFunction::introduced_in`);
+    /// - `constr` terms with more than 1024 fields;
+    /// - constants whose type takes more than 32 tags to encode.
+    ///
+    /// It also refuses to evaluate open terms (`mkTermToEvaluate`), although
+    /// before protocol version 12 (Dijkstra) its scope check does not look
+    /// inside `constr` and `case` (Plutus' `checkScope NoCaseConstr`), so a
+    /// free variable there only fails the program if it is evaluated.
+    ///
+    /// These are whole-program rules: occurrences in latent code (under
+    /// lambdas, delays or untaken branches) count too.
     fn check_term(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
         let check_availability = self.protocol_major_version < VAN_ROSSEM_PROTOCOL_VERSION;
         let scope_case_constr = self.protocol_major_version >= DIJKSTRA_PROTOCOL_VERSION;
@@ -300,6 +358,10 @@ impl Machine {
                     stack.push((argument.as_ref(), depth));
                 }
                 Term::Constr { fields, .. } => {
+                    if fields.len() > MAX_CONSTR_FIELDS {
+                        return Err(Error::ConstrTooManyFields(fields.len()));
+                    }
+
                     let depth = depth.filter(|_| scope_case_constr);
 
                     stack.extend(fields.iter().map(|field| (field, depth)));
@@ -310,20 +372,19 @@ impl Machine {
                     stack.push((constr.as_ref(), depth));
                     stack.extend(branches.iter().map(|branch| (branch, depth)));
                 }
-                Term::Constant(constant) if check_availability => {
-                    if Constant::contains_value(constant) {
-                        return Err(Error::ValueConstantNotAvailable);
-                    }
-                    if Constant::contains_array(constant) {
-                        return Err(Error::ArrayConstantNotAvailable);
+                Term::Constant(constant) => {
+                    if !constant_type_fits(constant) {
+                        return Err(Error::ConstantTypeTooLarge(Type::from(constant.as_ref())));
                     }
                 }
-                Term::Builtin(fun) if check_availability => {
-                    if !fun.is_available_in(&self.language, self.protocol_major_version) {
+                Term::Builtin(fun) => {
+                    if check_availability
+                        && !fun.is_available_in(&self.language, self.protocol_major_version)
+                    {
                         return Err(Error::BuiltinNotAvailable(*fun));
                     }
                 }
-                Term::Constant(_) | Term::Builtin(_) | Term::Error => {}
+                Term::Error => {}
             }
         }
 
@@ -494,7 +555,7 @@ impl Machine {
                 )),
             },
             Value::Con(constant) => {
-                if !self.semantics.is_van_rossem() {
+                if self.caser == Caser::ConstrOnly {
                     return Err(Error::NonConstrScrutinized(Value::Con(constant)));
                 }
 
@@ -527,6 +588,18 @@ impl Machine {
                         vec![Value::Con(first.clone()), Value::Con(second.clone())],
                         1,
                     ),
+                    Constant::Data(Data::Constr(constr)) if self.caser == Caser::Builtins => {
+                        // An index beyond `usize` has no branch either.
+                        let tag = constr
+                            .constr_index()
+                            .as_u64()
+                            .and_then(|tag| usize::try_from(tag).ok())
+                            .unwrap_or(usize::MAX);
+                        let fields =
+                            Constant::ProtoList(Type::Data, constr.fields.as_data_list().clone());
+
+                        (tag, vec![Value::Con(fields.into())], usize::MAX)
+                    }
                     _ => return Err(Error::NonConstrScrutinized(Value::Con(constant))),
                 };
 
@@ -619,8 +692,8 @@ impl Machine {
         if let Some(counter) = &mut self.spend_counter {
             let i = (runtime.fun as usize + TERM_COUNT) * 2;
 
-            counter[i] += cost.mem;
-            counter[i + 1] += cost.cpu;
+            counter[i] = counter[i].saturating_add(cost.mem);
+            counter[i + 1] = counter[i + 1].saturating_add(cost.cpu);
         }
 
         runtime.call(self.semantics, &mut self.traces)
@@ -687,6 +760,30 @@ impl Machine {
     }
 }
 
+/// Whether a constant's type is within the ledger's limit on the size of the
+/// type tags that encode it (Plutus' `maxHeaderSize`, measured by
+/// `defaultUniSize`): one per type and one per type application, so `list a`
+/// takes two more than `a`, and `pair a b` three more than `a` and `b`.
+fn constant_type_fits(constant: &Constant) -> bool {
+    fn size(ty: &Type, budget: usize) -> Option<usize> {
+        match ty {
+            Type::List(item) | Type::Array(item) => size(item, budget.checked_sub(2)?),
+            Type::Pair(first, second) => size(second, size(first, budget.checked_sub(3)?)?),
+            _ => budget.checked_sub(1),
+        }
+    }
+
+    match constant {
+        Constant::ProtoList(item, _) | Constant::ProtoArray(item, _) => {
+            size(item, MAX_CONSTANT_TYPE_SIZE - 2).is_some()
+        }
+        Constant::ProtoPair(first, second, _, _) => size(first, MAX_CONSTANT_TYPE_SIZE - 3)
+            .and_then(|budget| size(second, budget))
+            .is_some(),
+        _ => true,
+    }
+}
+
 impl From<&Constant> for Type {
     fn from(constant: &Constant) -> Self {
         match constant {
@@ -712,7 +809,6 @@ impl From<&Constant> for Type {
 #[cfg(test)]
 mod tests {
     use num_bigint::BigInt;
-    use std::rc::Rc;
 
     use super::{
         Error, Machine,
@@ -720,14 +816,21 @@ mod tests {
         runtime::Compressable,
     };
     use crate::{
-        ast::{Constant, NamedDeBruijn, Program, Term},
+        ast::{Constant, NamedDeBruijn, Program, Term, Type},
         builtins::DefaultFunction,
+        data::Data,
+        machine::eval_result::EvalResult,
+        protocol::{
+            ALONZO_PROTOCOL_VERSION, CHANG_PROTOCOL_VERSION, DIJKSTRA_PROTOCOL_VERSION,
+            MAX_CONSTR_FIELDS, PLOMIN_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION,
+            VASIL_PROTOCOL_VERSION, language_introduced_in,
+        },
     };
     use pallas_primitives::conway::Language;
+    use strum::IntoEnumIterator;
 
     #[test]
-    fn open_terms_rejected_before_evaluation() {
-        use super::runtime::{DIJKSTRA_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION};
+    fn scope_checked_as_the_ledger_does() {
         use crate::ast::DeBruijn;
 
         let var = |index: u64| {
@@ -858,128 +961,73 @@ mod tests {
     }
 
     #[test]
-    fn van_rossem_features_unavailable_before_van_rossem() {
-        let program = |term: Term<NamedDeBruijn>| Program {
-            version: (1, 1, 0),
-            term,
+    fn builtins_unavailable_before_they_are_introduced() {
+        // A builtin that evaluation never reaches is rejected all the same.
+        let latent = |fun| Program::<NamedDeBruijn> {
+            version: (1, 0, 0),
+            term: Term::Builtin(fun).delay(),
         };
 
-        let builtin = Term::Builtin(DefaultFunction::LookupCoin);
-        let constant: Term<NamedDeBruijn> =
-            Term::Constant(Constant::Value(crate::ast::Value::empty()).into());
-        // Availability is a whole-program rule: latent occurrences that
-        // evaluation never reaches must be rejected too.
-        let latent: Term<NamedDeBruijn> = Term::Lambda {
-            parameter_name: NamedDeBruijn {
-                text: "x".to_string(),
-                index: 0.into(),
-            }
-            .into(),
-            body: Term::Builtin(DefaultFunction::ScaleValue).into(),
-        };
-        // Public AST callers can construct type-inconsistent constants even
-        // though Flat decoding cannot. Inspect both declared types and actual
-        // elements so this cannot bypass protocol availability checks.
-        let array_builtin = Term::Builtin(DefaultFunction::IndexArray);
-        let array_constant: Term<NamedDeBruijn> = Term::Constant(
-            Constant::ProtoArray(
-                crate::ast::Type::Integer,
-                vec![Rc::new(Constant::Integer(1.into()))].into(),
-            )
-            .into(),
-        );
-        let inconsistent: Term<NamedDeBruijn> = Term::Constant(
-            Constant::ProtoList(
-                crate::ast::Type::Integer,
-                vec![Rc::new(Constant::Value(crate::ast::Value::empty()))].into(),
-            )
-            .into(),
-        );
-
-        for (language, protocol) in [
-            (Language::PlutusV3, 10),
-            (Language::PlutusV2, 10),
-            (Language::PlutusV1, 10),
-        ] {
-            for term in [array_builtin.clone(), array_constant.clone()] {
-                let result = program(term)
-                    .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                    .result();
-                assert!(
-                    matches!(
-                        result,
-                        Err(Error::BuiltinNotAvailable(_) | Error::ArrayConstantNotAvailable)
-                    ),
-                    "expected arrays to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-                );
-            }
-
-            let result = program(builtin.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::BuiltinNotAvailable(_))),
-                "expected lookupCoin to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-
-            let result = program(constant.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::ValueConstantNotAvailable)),
-                "expected Value constant to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-
-            let result = program(inconsistent.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::ValueConstantNotAvailable)),
-                "expected nested Value constant to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-
-            let result = program(latent.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::BuiltinNotAvailable(_))),
-                "expected latent scaleValue to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-
-            // Direct calls through the public runtime API are gated too.
-            let semantics =
-                super::runtime::BuiltinSemantics::for_language_and_protocol(&language, protocol);
-            let result = DefaultFunction::UnValueData.call(
-                semantics,
-                &[super::value::Value::Con(
-                    Constant::Data(crate::ast::Data::map(vec![])).into(),
-                )],
-                &mut vec![],
-            );
-            assert!(
-                matches!(result, Err(Error::BuiltinNotAvailable(_))),
-                "expected direct unValueData call to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-        }
-
-        // From Van Rossem onwards every builtin and constant type is available
-        // in every ledger language.
         for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
-            for term in [
-                builtin.clone(),
-                constant.clone(),
-                latent.clone(),
-                array_builtin.clone(),
-                array_constant.clone(),
-            ] {
-                let result = program(term)
-                    .eval_version_with_protocol(ExBudget::default(), &language, 11)
-                    .result();
-                assert!(result.is_ok(), "{language:?}: {result:?}");
+            for fun in DefaultFunction::iter() {
+                let introduced_in = fun.introduced_in(&language);
+                let eval = |protocol_major_version| {
+                    latent(fun)
+                        .eval_version_with_protocol(
+                            ExBudget::default(),
+                            &language,
+                            protocol_major_version,
+                        )
+                        .result()
+                };
+
+                if introduced_in > language_introduced_in(&language) {
+                    assert_eq!(
+                        eval(introduced_in - 1),
+                        Err(Error::BuiltinNotAvailable(fun)),
+                        "{fun} in {language:?}"
+                    );
+                }
+                assert!(eval(introduced_in).is_ok(), "{fun} in {language:?}");
             }
         }
     }
 
+    #[test]
+    fn constants_of_any_type_available_in_every_language() {
+        // Unlike builtins, constant types are not tied to protocol versions:
+        // the ledger decodes array and Value constants whenever it decodes
+        // scripts of the language at all (plutus 1b03c165).
+        for constant in [
+            "(con (array integer) [1, 2])",
+            "(con value [(#aa, [(#aa, 1)])])",
+        ] {
+            for (language, protocol_major_version) in [
+                (Language::PlutusV1, ALONZO_PROTOCOL_VERSION),
+                (Language::PlutusV2, VASIL_PROTOCOL_VERSION),
+                (Language::PlutusV3, CHANG_PROTOCOL_VERSION),
+            ] {
+                let program =
+                    crate::parser::program(&format!("(program 1.0.0 {constant})")).unwrap();
+                let result = Program::<NamedDeBruijn>::try_from(program)
+                    .unwrap()
+                    .eval_version_with_protocol(
+                        ExBudget::default(),
+                        &language,
+                        protocol_major_version,
+                    );
+
+                assert!(result.result().is_ok(), "{constant} in {language:?}");
+                assert_eq!(
+                    result.cost(),
+                    ExBudget {
+                        mem: 200,
+                        cpu: 16100
+                    }
+                );
+            }
+        }
+    }
     #[test]
     fn exp_mod_integer_modulus_bound_matches_plutus() {
         let modulus = |m: BigInt| {
@@ -993,7 +1041,7 @@ mod tests {
                 .eval_version_with_protocol(
                     ExBudget::max(),
                     &Language::PlutusV3,
-                    super::VAN_ROSSEM_PROTOCOL_VERSION,
+                    VAN_ROSSEM_PROTOCOL_VERSION,
                 )
         };
         let two = BigInt::from(2);
@@ -1041,119 +1089,8 @@ mod tests {
     }
 
     #[test]
-    fn scope_checked_like_the_ledger_at_van_rossem() {
-        use super::runtime::VAN_ROSSEM_PROTOCOL_VERSION;
-        use crate::{ast::DeBruijn, data::Data};
-
-        // Plutus V3 scripts as the Haskell ledger API serialises them (flat,
-        // without the CBOR wrapper), each a lambda over its script context, with
-        // what the ledger gives them at protocol version 11 applied to
-        // `Constr 0 []`: whether they return unit, and their cost (plutus
-        // 1b03c165, `mkTermToEvaluate` and `evaluateTerm counting`). A free
-        // variable fails the script only if it is evaluated, before the step
-        // that evaluates it is charged.
-        let cases = [
-            // case (constr 0 [\y -> x]) [\f -> ()], with x free
-            (
-                "free var under a lambda in a constr field",
-                "010100298009001a4931",
-                true,
-                128100,
-                900,
-            ),
-            (
-                "free var as a constr field",
-                "01010029800801249301",
-                false,
-                100,
-                100,
-            ),
-            (
-                "free var in an untaken case branch",
-                "010100298005268011",
-                true,
-                96100,
-                700,
-            ),
-            (
-                "free var in the taken case branch",
-                "010100298015268011",
-                false,
-                100,
-                100,
-            ),
-            (
-                "free var as the case scrutinee",
-                "01010029002a4c01",
-                false,
-                100,
-                100,
-            ),
-            (
-                "index 2^32 in an untaken case branch",
-                "01010029800526840404040081",
-                true,
-                96100,
-                700,
-            ),
-            (
-                "index 2^64-1 in an untaken case branch",
-                "0101002980052687fffffffffffffffff809",
-                true,
-                96100,
-                700,
-            ),
-            (
-                "index 0 in an untaken case branch",
-                "010100298005268001",
-                true,
-                96100,
-                700,
-            ),
-            (
-                "free var in a constr under an unapplied lambda",
-                "010100232498a00200a1",
-                true,
-                112100,
-                800,
-            ),
-        ];
-
-        for (name, flat, returns_unit, cpu, mem) in cases {
-            let bytes = hex::decode(flat).unwrap();
-            let program = Program::<DeBruijn>::from_flat(&bytes).unwrap();
-
-            assert_eq!(program.to_flat().unwrap(), bytes, "{name}");
-
-            let result = Program::<NamedDeBruijn>::from(program)
-                .apply_data(Data::constr(0, vec![]))
-                .eval_version_with_protocol(
-                    ExBudget::max(),
-                    &Language::PlutusV3,
-                    VAN_ROSSEM_PROTOCOL_VERSION,
-                );
-            let cost = result.cost();
-
-            if returns_unit {
-                assert_eq!(
-                    result.result(),
-                    Ok(Term::Constant(Constant::Unit.into())),
-                    "{name}"
-                );
-            } else {
-                assert!(
-                    matches!(result.result(), Err(Error::OpenTermEvaluated(_))),
-                    "{name}"
-                );
-            }
-            assert_eq!((cost.cpu, cost.mem), (cpu, mem), "{name}");
-        }
-    }
-
-    #[test]
     fn data_like_the_ledger_before_and_at_van_rossem() {
-        use super::runtime::{PLOMIN_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION};
-        use crate::{ast::DeBruijn, builtins::DefaultFunction};
+        use crate::{ast::DeBruijn, protocol::PLOMIN_PROTOCOL_VERSION};
 
         // Plutus V3 programs (flat, without the CBOR wrapper) with what the
         // Haskell ledger API makes of them at protocol versions 10 and 11: the
@@ -1360,14 +1297,6 @@ mod tests {
                 ],
             ),
             (
-                "serialiseData 102-form indefinite pair",
-                "0101003766980105d8668200800001",
-                [
-                    (Some("(con bytestring #d87980)"), 1856854, 408),
-                    (Some("(con bytestring #d87980)"), 1856854, 408),
-                ],
-            ),
-            (
                 "serialiseData bignum 1",
                 "0101003766980103c241010001",
                 [
@@ -1448,7 +1377,7 @@ mod tests {
                 ],
             ),
             (
-                "serialiseData non-minimal int 1",
+                "serialiseData int 1",
                 "0101003766980101010001",
                 [
                     (Some("(con bytestring #01)"), 2070166, 410),
@@ -1456,7 +1385,7 @@ mod tests {
                 ],
             ),
             (
-                "serialiseData indefinite bytes",
+                "serialiseData bytes #01",
                 "010100376698010241010001",
                 [
                     (Some("(con bytestring #4101)"), 2070166, 410),
@@ -1589,11 +1518,7 @@ mod tests {
 
             Program::<NamedDeBruijn>::try_from(program)
                 .unwrap()
-                .eval_version_with_protocol(
-                    ExBudget::max(),
-                    language,
-                    super::VAN_ROSSEM_PROTOCOL_VERSION,
-                )
+                .eval_version_with_protocol(ExBudget::max(), language, VAN_ROSSEM_PROTOCOL_VERSION)
         };
         let bound = BigInt::from(2).pow(262143);
         let scalar_bound = BigInt::from(2).pow(4095);
@@ -2173,5 +2098,186 @@ mod tests {
             ),
             int(2)
         );
+    }
+
+    /// Evaluates a textual program at a protocol version, with the default
+    /// cost model.
+    fn eval_at(language: Language, protocol_major_version: u16, source: &str) -> EvalResult {
+        let program = crate::parser::program(source).unwrap();
+
+        Program::<NamedDeBruijn>::try_from(program)
+            .unwrap()
+            .eval_version_with_protocol(ExBudget::default(), &language, protocol_major_version)
+    }
+
+    fn program(
+        version: (usize, usize, usize),
+        term: Term<NamedDeBruijn>,
+    ) -> Program<NamedDeBruijn> {
+        Program { version, term }
+    }
+
+    // The expected outcomes below are the Haskell evaluator's
+    // (`deserialiseScript` -> `evaluateTerm`) at plutus 1b03c165.
+
+    #[test]
+    fn case_on_builtin_types_from_van_rossem() {
+        let source = "(program 1.1.0 (case (con bool True) (con integer 0) (con integer 1)))";
+
+        assert!(matches!(
+            eval_at(Language::PlutusV3, PLOMIN_PROTOCOL_VERSION, source).result,
+            Err(Error::NonConstrScrutinized(_))
+        ));
+
+        for language in [Language::PlutusV1, Language::PlutusV3] {
+            let result = eval_at(language, VAN_ROSSEM_PROTOCOL_VERSION, source);
+
+            assert_eq!(result.result().unwrap(), Term::integer(1.into()));
+            assert_eq!(
+                result.cost(),
+                ExBudget {
+                    mem: 400,
+                    cpu: 48100
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn case_on_data_from_dijkstra_and_uplc_1_2() {
+        let case = |version: &str, scrutinee: &str, branches: &str| {
+            format!("(program {version} (case (con data {scrutinee}) {branches}))")
+        };
+        let source = case(
+            "1.2.0",
+            "(Constr 1 [I 5])",
+            "(lam x (con integer 0)) (lam x x)",
+        );
+
+        for language in [Language::PlutusV1, Language::PlutusV3] {
+            let result = eval_at(language, DIJKSTRA_PROTOCOL_VERSION, &source);
+
+            assert_eq!(
+                result.result().unwrap(),
+                Term::Constant(
+                    Constant::ProtoList(
+                        Type::Data,
+                        vec![Constant::Data(Data::integer(5.into())).into()].into(),
+                    )
+                    .into()
+                )
+            );
+            assert_eq!(
+                result.cost(),
+                ExBudget {
+                    mem: 500,
+                    cpu: 64100
+                }
+            );
+        }
+
+        for (protocol_major_version, source) in [
+            // Before Dijkstra, or before UPLC 1.2.0, Data is not a scrutinee.
+            (VAN_ROSSEM_PROTOCOL_VERSION, source.clone()),
+            (DIJKSTRA_PROTOCOL_VERSION, source.replace("1.2.0", "1.1.0")),
+            // A constructor without a branch, and Data other than a constructor.
+            (
+                DIJKSTRA_PROTOCOL_VERSION,
+                case("1.2.0", "(Constr 2 [])", "(lam x x) (lam x x)"),
+            ),
+            (
+                DIJKSTRA_PROTOCOL_VERSION,
+                case("1.2.0", "(I 0)", "(lam x x)"),
+            ),
+        ] {
+            let result = eval_at(Language::PlutusV3, protocol_major_version, &source);
+
+            assert!(
+                result.result.is_err(),
+                "{source} at {protocol_major_version}"
+            );
+            assert_eq!(result.cost(), ExBudget { mem: 100, cpu: 100 });
+        }
+    }
+
+    #[test]
+    fn constr_fields_limited_as_the_ledger_does() {
+        let constr =
+            |fields: usize| program((1, 1, 0), Term::constr(0, vec![Term::unit(); fields]));
+
+        let result =
+            constr(MAX_CONSTR_FIELDS).eval_version(ExBudget::default(), &Language::PlutusV3);
+        assert!(result.result.is_ok());
+        assert_eq!(
+            result.cost(),
+            ExBudget {
+                mem: 102600,
+                cpu: 16400100
+            }
+        );
+
+        // Rejected wherever it is, as the ledger refuses to decode it.
+        let latent = program(
+            (1, 1, 0),
+            Term::Delay(Term::constr(0, vec![Term::unit(); MAX_CONSTR_FIELDS + 1]).into()),
+        );
+        for program in [constr(MAX_CONSTR_FIELDS + 1), latent] {
+            assert_eq!(
+                program
+                    .eval_version(ExBudget::default(), &Language::PlutusV3)
+                    .result,
+                Err(Error::ConstrTooManyFields(MAX_CONSTR_FIELDS + 1))
+            );
+        }
+    }
+
+    #[test]
+    fn constant_types_limited_as_the_ledger_does() {
+        let lists = |depth: usize, element: &str| {
+            (0..depth).fold(element.to_string(), |t, _| format!("(list {t})"))
+        };
+
+        // A list type takes 2 more tags than its element type, and a pair type
+        // 3 more than its two; the ledger allows 32.
+        for (r#type, value, fits) in [
+            (lists(15, "integer"), "[]".to_string(), true),
+            (lists(16, "integer"), "[]".to_string(), false),
+            (
+                format!("(pair {} unit)", lists(13, "integer")),
+                "([], ())".to_string(),
+                true,
+            ),
+            (
+                format!("(pair {} (list unit))", lists(13, "integer")),
+                "([], [])".to_string(),
+                false,
+            ),
+        ] {
+            let source = format!("(program 1.1.0 (con {type} {value}))");
+            let result = eval_at(Language::PlutusV3, VAN_ROSSEM_PROTOCOL_VERSION, &source);
+
+            if fits {
+                assert!(result.result.is_ok(), "{type}");
+            } else {
+                assert!(
+                    matches!(result.result, Err(Error::ConstantTypeTooLarge(_))),
+                    "{type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn languages_unavailable_before_they_are_introduced() {
+        for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            let introduced_in = language_introduced_in(&language);
+            let source = "(program 1.0.0 (con unit ()))";
+
+            assert_eq!(
+                eval_at(language.clone(), introduced_in - 1, source).result,
+                Err(Error::LanguageNotAvailable(language.clone()))
+            );
+            assert!(eval_at(language, introduced_in, source).result.is_ok());
+        }
     }
 }

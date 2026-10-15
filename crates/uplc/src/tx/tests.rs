@@ -9,7 +9,7 @@ use crate::{
 use pallas_codec::utils::MaybeIndefArray;
 use pallas_primitives::{
     Fragment,
-    conway::{CostModels, Redeemer, RedeemerTag, TransactionInput, TransactionOutput},
+    conway::{CostModels, Language, Redeemer, RedeemerTag, TransactionInput, TransactionOutput},
 };
 use pallas_traverse::{Era, MultiEraTx};
 
@@ -2028,10 +2028,10 @@ fn script_cache_evicts_the_least_recently_used_script() {
     let (a, b, c) = (script(1, 10), script(2, 10), script(3, 10));
     let mut script_cache = ScriptCache::with_limits(2, usize::MAX);
 
-    script_cache.program(&a).unwrap();
-    script_cache.program(&b).unwrap();
-    script_cache.program(&a).unwrap();
-    script_cache.program(&c).unwrap();
+    script_cache.program(&Language::PlutusV3, &a).unwrap();
+    script_cache.program(&Language::PlutusV3, &b).unwrap();
+    script_cache.program(&Language::PlutusV3, &a).unwrap();
+    script_cache.program(&Language::PlutusV3, &c).unwrap();
 
     assert_eq!(script_cache.len(), 2);
     assert!(script_cache.contains(&a));
@@ -2044,9 +2044,9 @@ fn script_cache_keeps_its_scripts_within_the_byte_limit() {
     let (a, b, c) = (script(1, 100), script(2, 100), script(3, 150));
     let mut script_cache = ScriptCache::with_limits(usize::MAX, b.len() + c.len());
 
-    script_cache.program(&a).unwrap();
-    script_cache.program(&b).unwrap();
-    script_cache.program(&c).unwrap();
+    script_cache.program(&Language::PlutusV3, &a).unwrap();
+    script_cache.program(&Language::PlutusV3, &b).unwrap();
+    script_cache.program(&Language::PlutusV3, &c).unwrap();
 
     assert_eq!(script_cache.len(), 2);
     assert!(!script_cache.contains(&a));
@@ -2061,11 +2061,62 @@ fn script_cache_decodes_scripts_it_cannot_keep() {
     let mut too_small = ScriptCache::with_limits(usize::MAX, script.len() - 1);
     let mut no_room = ScriptCache::with_limits(0, usize::MAX);
 
-    let decoded = ScriptCache::default().program(&script).unwrap();
+    let decoded = ScriptCache::default()
+        .program(&Language::PlutusV3, &script)
+        .unwrap();
 
-    assert_eq!(too_small.program(&script).unwrap(), decoded);
-    assert_eq!(no_room.program(&script).unwrap(), decoded);
+    assert_eq!(
+        too_small.program(&Language::PlutusV3, &script).unwrap(),
+        decoded
+    );
+    assert_eq!(
+        no_room.program(&Language::PlutusV3, &script).unwrap(),
+        decoded
+    );
 
     assert!(too_small.is_empty());
     assert!(no_room.is_empty());
+}
+
+#[test]
+fn script_cache_evicts_as_many_scripts_as_it_must() {
+    let (a, b, c) = (script(1, 40), script(2, 40), script(3, 150));
+    let mut script_cache = ScriptCache::with_limits(usize::MAX, c.len());
+
+    script_cache.program(&Language::PlutusV3, &a).unwrap();
+    script_cache.program(&Language::PlutusV3, &b).unwrap();
+    assert_eq!(script_cache.len(), 2);
+
+    script_cache.program(&Language::PlutusV3, &c).unwrap();
+    assert_eq!(script_cache.len(), 1);
+    assert!(script_cache.contains(&c));
+}
+
+#[test]
+fn script_cache_is_empty_once_cleared() {
+    let (a, b) = (script(1, 100), script(2, 100));
+    let mut script_cache = ScriptCache::with_limits(usize::MAX, a.len() + b.len());
+
+    script_cache.program(&Language::PlutusV3, &a).unwrap();
+    script_cache.clear();
+    assert!(script_cache.is_empty());
+
+    // The cleared script no longer takes up room.
+    script_cache.program(&Language::PlutusV3, &a).unwrap();
+    script_cache.program(&Language::PlutusV3, &b).unwrap();
+    assert_eq!(script_cache.len(), 2);
+}
+
+#[test]
+fn only_plutus_v3_scripts_must_end_with_their_cbor() {
+    let script = [script(1, 10), vec![0]].concat();
+
+    for language in [Language::PlutusV1, Language::PlutusV2] {
+        assert!(ScriptCache::default().program(&language, &script).is_ok());
+    }
+
+    assert!(matches!(
+        ScriptCache::default().program(&Language::PlutusV3, &script),
+        Err(super::error::Error::ScriptTrailingBytes(1))
+    ));
 }

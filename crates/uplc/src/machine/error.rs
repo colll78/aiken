@@ -4,6 +4,7 @@ use crate::{
     builtins::DefaultFunction,
 };
 use num_bigint::BigInt;
+use pallas_primitives::conway::Language;
 use std::string::FromUtf8Error;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error, miette::Diagnostic)]
@@ -166,10 +167,15 @@ pub enum Error {
     ValueBuiltin(#[source] ValueError),
     #[error("builtin {0} is not available in this plutus / protocol version")]
     BuiltinNotAvailable(DefaultFunction),
-    #[error("Value constants are not available in this plutus / protocol version")]
-    ValueConstantNotAvailable,
-    #[error("array constants are not available in this plutus / protocol version")]
-    ArrayConstantNotAvailable,
+    #[error("{0:?} is not available at this protocol version")]
+    LanguageNotAvailable(Language),
+    #[error("a constr has {0} fields, more than the 1024 the ledger allows")]
+    ConstrTooManyFields(usize),
+    #[error(
+        "the type of a constant is too large for the ledger\n{:>13} {0}",
+        "Type"
+    )]
+    ConstantTypeTooLarge(Type),
     #[error("{0} is not within the bounds of a Natural")]
     OutsideNaturalBounds(BigInt),
     #[error("{0} is not within the bounds of a Byte")]

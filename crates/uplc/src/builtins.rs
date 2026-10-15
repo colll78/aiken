@@ -1,6 +1,6 @@
 use crate::{
     ast::Term,
-    machine::runtime::{
+    protocol::{
         ALONZO_PROTOCOL_VERSION, CHANG_PROTOCOL_VERSION, PLOMIN_PROTOCOL_VERSION,
         VALENTINE_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION, VASIL_PROTOCOL_VERSION,
     },
@@ -600,21 +600,20 @@ impl Display for DefaultFunction {
     }
 }
 
-impl DefaultFunction {
-    /// The CIP-0153 value builtins.
-    pub fn is_value_builtin(&self) -> bool {
-        matches!(
-            self,
-            DefaultFunction::InsertCoin
-                | DefaultFunction::LookupCoin
-                | DefaultFunction::UnionValue
-                | DefaultFunction::ValueContains
-                | DefaultFunction::ValueData
-                | DefaultFunction::UnValueData
-                | DefaultFunction::ScaleValue
-        )
-    }
+/// A group of builtins that reached the ledger languages together. Batch 4
+/// is split because PlutusV2 received its two halves separately.
+#[derive(Clone, Copy)]
+enum Batch {
+    One,
+    Two,
+    Three,
+    FourA,
+    FourB,
+    Five,
+    Six,
+}
 
+impl DefaultFunction {
     /// The builtins over builtin arrays.
     pub fn is_array_builtin(&self) -> bool {
         matches!(
@@ -625,16 +624,65 @@ impl DefaultFunction {
         )
     }
 
-    /// The protocol major version from which this builtin is available in the
-    /// given ledger language. Mirrors `builtinsIntroducedIn` in
-    /// plutus-ledger-api: from protocol version 11 (Van Rossem) onwards every
-    /// builtin is available in every ledger language.
-    pub fn introduced_in(&self, language: &Language) -> u16 {
+    /// The batch of builtins this builtin was released in, as plutus-ledger-api
+    /// groups them in `PlutusLedgerApi.Common.Versions`.
+    fn batch(&self) -> Batch {
         use DefaultFunction::*;
 
-        let batch = match self {
-            SerialiseData => 2,
-            VerifyEcdsaSecp256k1Signature | VerifySchnorrSecp256k1Signature => 3,
+        match self {
+            AddInteger
+            | SubtractInteger
+            | MultiplyInteger
+            | DivideInteger
+            | QuotientInteger
+            | RemainderInteger
+            | ModInteger
+            | EqualsInteger
+            | LessThanInteger
+            | LessThanEqualsInteger
+            | AppendByteString
+            | ConsByteString
+            | SliceByteString
+            | LengthOfByteString
+            | IndexByteString
+            | EqualsByteString
+            | LessThanByteString
+            | LessThanEqualsByteString
+            | Sha2_256
+            | Sha3_256
+            | Blake2b_256
+            | VerifyEd25519Signature
+            | AppendString
+            | EqualsString
+            | EncodeUtf8
+            | DecodeUtf8
+            | IfThenElse
+            | ChooseUnit
+            | Trace
+            | FstPair
+            | SndPair
+            | ChooseList
+            | MkCons
+            | HeadList
+            | TailList
+            | NullList
+            | ChooseData
+            | ConstrData
+            | MapData
+            | ListData
+            | IData
+            | BData
+            | UnConstrData
+            | UnMapData
+            | UnListData
+            | UnIData
+            | UnBData
+            | EqualsData
+            | MkPairData
+            | MkNilData
+            | MkNilPairData => Batch::One,
+            SerialiseData => Batch::Two,
+            VerifyEcdsaSecp256k1Signature | VerifySchnorrSecp256k1Signature => Batch::Three,
             Bls12_381_G1_Add
             | Bls12_381_G1_Neg
             | Bls12_381_G1_ScalarMul
@@ -653,11 +701,11 @@ impl DefaultFunction {
             | Bls12_381_MulMlResult
             | Bls12_381_FinalVerify
             | Keccak_256
-            | Blake2b_224 => 40,
-            IntegerToByteString | ByteStringToInteger => 41,
+            | Blake2b_224 => Batch::FourA,
+            IntegerToByteString | ByteStringToInteger => Batch::FourB,
             AndByteString | OrByteString | XorByteString | ComplementByteString | ReadBit
             | WriteBits | ReplicateByte | ShiftByteString | RotateByteString | CountSetBits
-            | FindFirstSetBit | Ripemd_160 => 5,
+            | FindFirstSetBit | Ripemd_160 => Batch::Five,
             ExpModInteger
             | DropList
             | LengthOfArray
@@ -671,33 +719,34 @@ impl DefaultFunction {
             | ValueContains
             | ValueData
             | UnValueData
-            | ScaleValue => 6,
-            _ => 1,
-        };
+            | ScaleValue => Batch::Six,
+        }
+    }
 
-        // 40 / 41 are batches 4a and 4b, which PlutusV2 received separately.
-        match (language, batch) {
-            (Language::PlutusV1, 1) => ALONZO_PROTOCOL_VERSION,
+    /// The protocol major version from which this builtin is available in the
+    /// given ledger language (`builtinsIntroducedIn`). From protocol version 11
+    /// (Van Rossem) onwards every builtin is available in every ledger language.
+    pub fn introduced_in(&self, language: &Language) -> u16 {
+        match (language, self.batch()) {
+            (Language::PlutusV1, Batch::One) => ALONZO_PROTOCOL_VERSION,
             (Language::PlutusV1, _) => VAN_ROSSEM_PROTOCOL_VERSION,
-            (Language::PlutusV2, 1 | 2) => VASIL_PROTOCOL_VERSION,
-            (Language::PlutusV2, 3) => VALENTINE_PROTOCOL_VERSION,
-            (Language::PlutusV2, 41) => PLOMIN_PROTOCOL_VERSION,
-            (Language::PlutusV2, _) => VAN_ROSSEM_PROTOCOL_VERSION,
-            (Language::PlutusV3, 5) => PLOMIN_PROTOCOL_VERSION,
-            (Language::PlutusV3, 6) => VAN_ROSSEM_PROTOCOL_VERSION,
-            (Language::PlutusV3, _) => CHANG_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::One | Batch::Two) => VASIL_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::Three) => VALENTINE_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::FourB) => PLOMIN_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::FourA | Batch::Five | Batch::Six) => {
+                VAN_ROSSEM_PROTOCOL_VERSION
+            }
+            (
+                Language::PlutusV3,
+                Batch::One | Batch::Two | Batch::Three | Batch::FourA | Batch::FourB,
+            ) => CHANG_PROTOCOL_VERSION,
+            (Language::PlutusV3, Batch::Five) => PLOMIN_PROTOCOL_VERSION,
+            (Language::PlutusV3, Batch::Six) => VAN_ROSSEM_PROTOCOL_VERSION,
         }
     }
 
     pub fn is_available_in(&self, language: &Language, protocol_major_version: u16) -> bool {
         protocol_major_version >= self.introduced_in(language)
-    }
-
-    /// Batch 6 (expModInteger, dropList, arrays, multi-scalar multiplication
-    /// and the CIP-0153 value builtins): introduced in every ledger language
-    /// at protocol version 11 (Van Rossem).
-    pub fn is_van_rossem_builtin(&self) -> bool {
-        self.introduced_in(&Language::PlutusV3) == VAN_ROSSEM_PROTOCOL_VERSION
     }
 
     pub fn aiken_name(&self) -> String {
@@ -821,5 +870,38 @@ impl<T> From<DefaultFunction> for Term<T> {
 impl<T> From<DefaultFunction> for Rc<Term<T>> {
     fn from(builtin: DefaultFunction) -> Self {
         Term::Builtin(builtin).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DefaultFunction::{self, *};
+    use pallas_primitives::conway::Language;
+
+    /// A builtin of each batch, and the protocol versions at which it reached
+    /// Plutus V1, V2 and V3 (`builtinsIntroducedIn` at plutus 1b03c165).
+    const INTRODUCED_IN: [(DefaultFunction, [u16; 3]); 7] = [
+        (AddInteger, [5, 7, 9]),
+        (SerialiseData, [11, 7, 9]),
+        (VerifyEcdsaSecp256k1Signature, [11, 8, 9]),
+        (Bls12_381_G1_Add, [11, 11, 9]),
+        (IntegerToByteString, [11, 10, 9]),
+        (AndByteString, [11, 11, 10]),
+        (IndexArray, [11, 11, 11]),
+    ];
+
+    #[test]
+    fn builtins_are_introduced_as_plutus_ledger_api_says() {
+        let languages = [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3];
+
+        for (builtin, introduced_in) in INTRODUCED_IN {
+            for (language, protocol_major_version) in languages.iter().zip(introduced_in) {
+                assert_eq!(
+                    builtin.introduced_in(language),
+                    protocol_major_version,
+                    "{builtin} in {language:?}"
+                );
+            }
+        }
     }
 }

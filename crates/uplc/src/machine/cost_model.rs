@@ -1711,6 +1711,11 @@ pub struct BuiltinCosts {
     pub scale_value: CostingFun<TwoArguments>,
 }
 
+/// The default cost-model parameters, in the order of each language's
+/// `ParamName` in plutus-ledger-api. `DEFAULT_V3` is plutus 1b03c165's
+/// `builtinCostModelE.json` and `cekMachineCostsE.json`; the `Value`
+/// builtins' parameters, which end every array, take the same values in
+/// `DEFAULT_V1` and `DEFAULT_V2`.
 impl BuiltinCosts {
     pub const DEFAULT_V1: [i64; 332] = [
         100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000,
@@ -3020,7 +3025,7 @@ fn initialize_cost_model_with_semantics(
                             })),
                         })
                     }
-                    BuiltinSemantics::D => {
+                    BuiltinSemantics::D | BuiltinSemantics::F => {
                         TwoArguments::AboveAndBelowDiagonal(ConstantOrTwoArguments {
                             constant: get(DivideInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::MultipliedSizes(MultipliedSizes {
@@ -3049,7 +3054,7 @@ fn initialize_cost_model_with_semantics(
                             )),
                         })
                     }
-                    BuiltinSemantics::E => {
+                    BuiltinSemantics::E | BuiltinSemantics::G => {
                         TwoArguments::AboveAndBelowDiagonal(ConstantOrTwoArguments {
                             constant: get(DivideInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::QuadraticInXAndY(
@@ -3194,12 +3199,14 @@ fn initialize_cost_model_with_semantics(
                             slope: get(ModInteger_memory_arguments_slope),
                         })
                     }
-                    BuiltinSemantics::D => TwoArguments::LinearInY2(SubtractedSizes {
-                        intercept: get(ModInteger_memory_arguments_intercept),
-                        minimum: get(ModInteger_memory_arguments_minimum),
-                        slope: get(ModInteger_memory_arguments_slope),
-                    }),
-                    BuiltinSemantics::C | BuiltinSemantics::E => {
+                    BuiltinSemantics::D | BuiltinSemantics::F => {
+                        TwoArguments::LinearInY2(SubtractedSizes {
+                            intercept: get(ModInteger_memory_arguments_intercept),
+                            minimum: get(ModInteger_memory_arguments_minimum),
+                            slope: get(ModInteger_memory_arguments_slope),
+                        })
+                    }
+                    BuiltinSemantics::C | BuiltinSemantics::E | BuiltinSemantics::G => {
                         TwoArguments::LinearInY(LinearSize {
                             intercept: get(ModInteger_memory_arguments_intercept),
                             slope: get(ModInteger_memory_arguments_slope),
@@ -3216,7 +3223,7 @@ fn initialize_cost_model_with_semantics(
                             })),
                         })
                     }
-                    BuiltinSemantics::D => {
+                    BuiltinSemantics::D | BuiltinSemantics::F => {
                         TwoArguments::AboveAndBelowDiagonal(ConstantOrTwoArguments {
                             constant: get(ModInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::MultipliedSizes(MultipliedSizes {
@@ -3241,7 +3248,7 @@ fn initialize_cost_model_with_semantics(
                             )),
                         })
                     }
-                    BuiltinSemantics::E => {
+                    BuiltinSemantics::E | BuiltinSemantics::G => {
                         TwoArguments::AboveAndBelowDiagonal(ConstantOrTwoArguments {
                             constant: get(ModInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::QuadraticInXAndY(
@@ -3272,7 +3279,9 @@ fn initialize_cost_model_with_semantics(
                     BuiltinSemantics::B
                     | BuiltinSemantics::C
                     | BuiltinSemantics::D
-                    | BuiltinSemantics::E => TwoArguments::MultipliedSizes(MultipliedSizes {
+                    | BuiltinSemantics::E
+                    | BuiltinSemantics::F
+                    | BuiltinSemantics::G => TwoArguments::MultipliedSizes(MultipliedSizes {
                         intercept: get(MultiplyInteger_cpu_arguments_intercept),
                         slope: get(MultiplyInteger_cpu_arguments_slope),
                     }),
@@ -3289,7 +3298,10 @@ fn initialize_cost_model_with_semantics(
                     minimum: get(QuotientInteger_memory_arguments_minimum),
                 }),
                 cpu: match semantics {
-                    BuiltinSemantics::A | BuiltinSemantics::B | BuiltinSemantics::D => {
+                    BuiltinSemantics::A
+                    | BuiltinSemantics::B
+                    | BuiltinSemantics::D
+                    | BuiltinSemantics::F => {
                         TwoArguments::ConstAboveDiagonal(ConstantOrTwoArguments {
                             constant: get(QuotientInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::MultipliedSizes(MultipliedSizes {
@@ -3300,7 +3312,7 @@ fn initialize_cost_model_with_semantics(
                             })),
                         })
                     }
-                    BuiltinSemantics::C | BuiltinSemantics::E => {
+                    BuiltinSemantics::C | BuiltinSemantics::E | BuiltinSemantics::G => {
                         TwoArguments::ConstAboveDiagonal(ConstantOrTwoArguments {
                             constant: get(QuotientInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::QuadraticInXAndY(
@@ -3341,12 +3353,14 @@ fn initialize_cost_model_with_semantics(
                             slope: get(RemainderInteger_memory_arguments_slope),
                         })
                     }
-                    BuiltinSemantics::D => TwoArguments::LinearInY2(SubtractedSizes {
-                        intercept: get(RemainderInteger_memory_arguments_intercept),
-                        minimum: get(RemainderInteger_memory_arguments_minimum),
-                        slope: get(RemainderInteger_memory_arguments_slope),
-                    }),
-                    BuiltinSemantics::C | BuiltinSemantics::E => {
+                    BuiltinSemantics::D | BuiltinSemantics::F => {
+                        TwoArguments::LinearInY2(SubtractedSizes {
+                            intercept: get(RemainderInteger_memory_arguments_intercept),
+                            minimum: get(RemainderInteger_memory_arguments_minimum),
+                            slope: get(RemainderInteger_memory_arguments_slope),
+                        })
+                    }
+                    BuiltinSemantics::C | BuiltinSemantics::E | BuiltinSemantics::G => {
                         TwoArguments::LinearInY(LinearSize {
                             intercept: get(RemainderInteger_memory_arguments_intercept),
                             slope: get(RemainderInteger_memory_arguments_slope),
@@ -3354,7 +3368,10 @@ fn initialize_cost_model_with_semantics(
                     }
                 },
                 cpu: match semantics {
-                    BuiltinSemantics::A | BuiltinSemantics::B | BuiltinSemantics::D => {
+                    BuiltinSemantics::A
+                    | BuiltinSemantics::B
+                    | BuiltinSemantics::D
+                    | BuiltinSemantics::F => {
                         TwoArguments::ConstAboveDiagonal(ConstantOrTwoArguments {
                             constant: get(RemainderInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::MultipliedSizes(MultipliedSizes {
@@ -3365,7 +3382,7 @@ fn initialize_cost_model_with_semantics(
                             })),
                         })
                     }
-                    BuiltinSemantics::C | BuiltinSemantics::E => {
+                    BuiltinSemantics::C | BuiltinSemantics::E | BuiltinSemantics::G => {
                         TwoArguments::ConstAboveDiagonal(ConstantOrTwoArguments {
                             constant: get(RemainderInteger_cpu_arguments_constant),
                             model: Box::new(TwoArguments::QuadraticInXAndY(
@@ -3489,7 +3506,9 @@ fn initialize_cost_model_with_semantics(
                     BuiltinSemantics::B
                     | BuiltinSemantics::C
                     | BuiltinSemantics::D
-                    | BuiltinSemantics::E => ThreeArguments::LinearInY(LinearSize {
+                    | BuiltinSemantics::E
+                    | BuiltinSemantics::F
+                    | BuiltinSemantics::G => ThreeArguments::LinearInY(LinearSize {
                         intercept: get(VerifyEd25519Signature_cpu_arguments_intercept),
                         slope: get(VerifyEd25519Signature_cpu_arguments_slope),
                     }),
@@ -3947,10 +3966,10 @@ impl TwoArguments {
             TwoArguments::LinearInY2(l) => Sat(l.slope) * y + Sat(l.intercept),
             TwoArguments::LinearInXAndY(l) => l.cost(x, y),
             TwoArguments::WithInteractionInXAndY(l) => {
-                Sat(l.coeff_00)
-                    + Sat(l.coeff_10) * x
+                Sat(l.coeff_10) * x
                     + Sat(l.coeff_01) * y
-                    + Sat(l.coeff_11) * x * y
+                    + Sat(l.coeff_11) * (x * y)
+                    + Sat(l.coeff_00)
             }
             TwoArguments::AddedSizes(s) => Sat(s.slope) * (x + y) + Sat(s.intercept),
             TwoArguments::SubtractedSizes(s) => {
@@ -4036,7 +4055,7 @@ impl ThreeArguments {
                     + Sat(e.coefficient_11) * y * z
                     + Sat(e.coefficient_12) * y * z * z;
 
-                if x <= z { cost } else { cost + cost / 2 }
+                if x <= z { cost } else { cost + cost.halve() }
             }
             ThreeArguments::LiteralInYorLinearInZ(l) => {
                 if y == Sat(0) {
@@ -4123,11 +4142,9 @@ impl std::ops::Mul for Sat {
     }
 }
 
-impl std::ops::Div<i64> for Sat {
-    type Output = Sat;
-
-    fn div(self, divisor: i64) -> Sat {
-        Sat(self.0 / divisor)
+impl Sat {
+    fn halve(self) -> Sat {
+        Sat(self.0 / 2)
     }
 }
 

@@ -25,7 +25,30 @@ pub trait Binder<'b>: Encode + Decode<'b> {
     fn text(&self) -> String;
 }
 
-impl<'b, T> Flat<'b> for Program<T> where T: Binder<'b> + Debug {}
+impl<'b, T> Flat<'b> for Program<T>
+where
+    T: Binder<'b> + Debug,
+{
+    /// Decodes a program and its filler, rejecting anything after them as
+    /// Plutus' flat decoder does (`TooMuchSpace`).
+    fn unflat(bytes: &'b [u8]) -> Result<Self, de::Error> {
+        let mut d = Decoder::new(bytes);
+
+        let program = d.decode()?;
+
+        d.filler()?;
+
+        // A filler ending inside a byte leaves `pos` on that byte.
+        if d.pos < bytes.len() {
+            return Err(de::Error::Message(format!(
+                "{} unexpected bytes after the program",
+                bytes.len() - d.pos
+            )));
+        }
+
+        Ok(program)
+    }
+}
 
 impl<'b, T> Program<T>
 where
@@ -534,6 +557,15 @@ impl Encode for Constant {
 
                 e.encode_list_with(list, |item, e| encode_constant_value(item, e))?;
             }
+            Constant::ProtoArray(typ, items) => {
+                let mut type_encode = vec![7, 12];
+
+                encode_type(typ, &mut type_encode);
+
+                encode_constant(&type_encode, e)?;
+
+                e.encode_list_with(items, |item, e| encode_constant_value(item, e))?;
+            }
             Constant::ProtoPair(type1, type2, a, b) => {
                 let mut type_encode = vec![7, 7, 6];
 
@@ -574,15 +606,6 @@ impl Encode for Constant {
                 return Err(en::Error::Message(
                     "BLS12-381 ML results are not supported for flat encoding".to_string(),
                 ));
-            }
-            Constant::ProtoArray(typ, items) => {
-                let mut type_encode = vec![7, 12];
-
-                encode_type(typ, &mut type_encode);
-
-                encode_constant(&type_encode, e)?;
-
-                e.encode_list_with(items, |item, e| encode_constant_value(item, e))?;
             }
             Constant::Value(value) => {
                 encode_constant(&[13], e)?;
@@ -668,7 +691,7 @@ fn encode_type(typ: &Type, bytes: &mut Vec<u8>) {
         Type::Bls12_381G2Element => bytes.push(10),
         Type::Bls12_381MlResult => bytes.push(11),
         Type::Array(sub_typ) => {
-            bytes.extend(vec![7, 12]);
+            bytes.extend_from_slice(&[7, 12]);
             encode_type(sub_typ, bytes);
         }
         Type::Value => bytes.push(13),
@@ -1509,12 +1532,45 @@ mod tests {
 
     #[test]
     fn constr_and_case_rejected_before_uplc_1_1() {
-        let mut bytes = constr_with_tag_groups(&[0]);
-        assert!(Program::<DeBruijn>::unflat(&bytes).is_ok());
+        for source in [
+            "(constr 0)",
+            "(case (constr 0) (con integer 1))",
+            "(lam x [(force (delay (constr 1 x))) x])",
+        ] {
+            let mut program: Program<DeBruijn> =
+                parser::program(&format!("(program 1.1.0 {source})"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+            assert!(Program::<DeBruijn>::unflat(&program.to_flat().unwrap()).is_ok());
 
-        // Same program, but version 1.0.0.
-        bytes[1] = 0;
-        assert!(Program::<DeBruijn>::unflat(&bytes).is_err());
+            program.version = (1, 0, 0);
+            assert!(
+                Program::<DeBruijn>::unflat(&program.to_flat().unwrap()).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_after_the_program_rejected() {
+        let program: Program<DeBruijn> = parser::program("(program 1.0.0 (con integer 1))")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let bytes = program.to_flat().unwrap();
+
+        assert_eq!(Program::<DeBruijn>::unflat(&bytes).unwrap(), program);
+
+        for trailing in [&[0x00][..], &[0x01], &[0x00, 0x00, 0x00, 0x00]] {
+            let bytes = [&bytes[..], trailing].concat();
+
+            assert!(
+                Program::<DeBruijn>::unflat(&bytes).is_err(),
+                "{}",
+                hex::encode(&bytes)
+            );
+        }
     }
 
     #[test]
@@ -1528,6 +1584,9 @@ mod tests {
         ));
 
         let bytes = program.to_flat().unwrap();
+        // Decodes to the same array in Plutus.
+        assert_eq!(hex::encode(&bytes), "0101004bf2f58302822c1801");
+
         let decoded = Program::<DeBruijn>::unflat(&bytes).unwrap();
         assert_eq!(decoded, program);
 

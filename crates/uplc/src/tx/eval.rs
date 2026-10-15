@@ -7,11 +7,13 @@ use crate::{
     PlutusData,
     ast::{Data, FakeNamedDeBruijn, NamedDeBruijn, Program},
     machine::{cost_model::ExBudget, eval_result::EvalResult},
+    protocol::{self, VAN_ROSSEM_PROTOCOL_VERSION},
     tx::{
         phase_one::redeemer_tag_to_string,
         script_context::{DataLookupTable, PlutusScript, TxInfoV1, TxInfoV2, TxInfoV3},
     },
 };
+use pallas_codec::{flat, minicbor};
 use pallas_primitives::conway::{CostModel, CostModels, ExUnits, Language, MintedTx, Redeemer};
 use std::collections::HashMap;
 
@@ -124,7 +126,24 @@ impl ScriptCache {
         self.script_bytes = 0;
     }
 
-    pub(crate) fn program(&mut self, script: &[u8]) -> Result<Program<NamedDeBruijn>, Error> {
+    /// Decodes a serialised script of a ledger language as the ledger does
+    /// (Plutus' `deserialiseScript`), except for the builtin limits that the
+    /// machine checks before evaluating.
+    pub(crate) fn program(
+        &mut self,
+        language: &Language,
+        script: &[u8],
+    ) -> Result<Program<NamedDeBruijn>, Error> {
+        let mut cbor = minicbor::Decoder::new(script);
+        let flat = cbor
+            .bytes()
+            .map_err(|err| flat::de::Error::Message(err.to_string()))?;
+
+        // PlutusV1 and PlutusV2 scripts may be followed by anything.
+        if *language == Language::PlutusV3 && cbor.position() < script.len() {
+            return Err(Error::ScriptTrailingBytes(script.len() - cbor.position()));
+        }
+
         self.clock += 1;
 
         if let Some(cached) = self.programs.get_mut(script) {
@@ -132,9 +151,7 @@ impl ScriptCache {
             return Ok(cached.program.clone());
         }
 
-        let mut buffer = Vec::new();
-        let program: Program<NamedDeBruijn> =
-            Program::<FakeNamedDeBruijn>::from_cbor(script, &mut buffer)?.into();
+        let program: Program<NamedDeBruijn> = Program::<FakeNamedDeBruijn>::from_flat(flat)?.into();
 
         if self.make_room(script.len()) {
             self.script_bytes += script.len();
@@ -230,10 +247,6 @@ impl<'a> TxEvalCache<'a> {
         }
 
         Ok(self.tx_infos[slot].as_ref().unwrap())
-    }
-
-    fn program(&mut self, script: &[u8]) -> Result<Program<NamedDeBruijn>, Error> {
-        self.scripts.program(script)
     }
 }
 
@@ -380,8 +393,18 @@ pub(crate) fn eval_redeemer_cached(
     // Built before the script is decoded, so that errors come in the same order
     // as when nothing is cached.
     cache.tx_info(&lang, tx, utxos, slot_config)?;
-    let program = cache.program(&script)?;
+    let program = cache.scripts.program(&lang, &script)?;
     let tx_info = cache.tx_info(&lang, tx, utxos, slot_config)?;
+
+    let protocol_version = protocol_major_version.unwrap_or(VAN_ROSSEM_PROTOCOL_VERSION);
+
+    if !protocol::is_uplc_version_available(&lang, protocol_version, program.version) {
+        return Err(Error::UplcVersionNotAvailable {
+            language: lang,
+            version: program.version,
+            protocol_major_version: protocol_version,
+        });
+    }
 
     do_eval_redeemer(
         cost_mdl,

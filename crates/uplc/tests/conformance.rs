@@ -6,8 +6,9 @@ use std::{
 };
 use uplc::{
     ast::{DeBruijn, Name, NamedDeBruijn, Program},
-    machine::{Error as MachineError, cost_model::ExBudget, runtime::VAN_ROSSEM_PROTOCOL_VERSION},
+    machine::{Error as MachineError, cost_model::ExBudget},
     parser,
+    protocol::{DIJKSTRA_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION},
 };
 use walkdir::WalkDir;
 
@@ -17,8 +18,8 @@ const EVALUATION_FAILURE: &str = "evaluation failure";
 // Upstream renamed the parse failure marker; older fixtures still use PARSE_ERROR.
 const PARSE_OR_DECODE_ERROR: &str = "parse/decode error";
 
-// Case on Data is a PV12 (Dijkstra) feature; these fixtures fail under PV11 by design.
-const PV12_ONLY: &[&str] = &["term/constant-case/data"];
+// Case on Data is a Dijkstra (protocol version 12) feature, which these fixtures expect.
+const DIJKSTRA_ONLY: &[&str] = &["term/constant-case/data"];
 
 // Upstream computes fixtures in counting mode, where budgets saturate at `maxBound`. Every
 // restricting evaluator, the ledger included, necessarily runs out of budget on such a program,
@@ -220,10 +221,10 @@ fn saturates(budget_file: Option<&PathBuf>) -> bool {
         .is_some_and(|budget| budget.cpu == i64::MAX || budget.mem == i64::MAX)
 }
 
-fn is_pv12_only(root: &str, path: &Path) -> bool {
+fn is_skipped(root: &str, path: &Path, skip: &[&str]) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
 
-    PV12_ONLY.iter().any(|prefix| relative.starts_with(prefix))
+    skip.iter().any(|prefix| relative.starts_with(prefix))
 }
 
 fn plutus_conformance_tests(
@@ -232,6 +233,7 @@ fn plutus_conformance_tests(
     protocol_major_version: u16,
     costs: &[i64],
     compare_budgets: bool,
+    skip: &[&str],
 ) {
     let mut failures = Vec::new();
     let mut programs = 0;
@@ -245,70 +247,72 @@ fn plutus_conformance_tests(
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
 
-        if is_pv12_only(root, path) {
+        if is_skipped(root, path, skip) {
             continue;
         }
 
         let budget_file = budget_file(path);
         let saturates = saturates(budget_file.as_ref());
 
-        if path.extension().and_then(OsStr::to_str) == Some("flat") {
-            programs += 1;
-
-            let expected = if saturates {
-                Err(OUT_OF_BUDGET.to_string())
-            } else {
-                expected_flat_program(&path.with_extension("flat.expected"))
-            };
-            let actual =
-                actual_flat_evaluation_result(path, &language, protocol_major_version, costs)
-                    .result
-                    .map(Program::<DeBruijn>::from);
-
-            check(
-                "flat result",
-                path,
-                expected == actual,
-                format!("expected: {expected:?}\n  actual: {actual:?}"),
-            );
-        }
-
-        if path.extension().and_then(OsStr::to_str) == Some("uplc") {
-            programs += 1;
-
-            let expected_file = path.with_extension("uplc.expected");
-
-            let actual = actual_evaluation_result(path, &language, protocol_major_version, costs);
-            let expected = if saturates {
-                Err(OUT_OF_BUDGET.to_string())
-            } else {
-                expected_to_program(&expected_file)
-                    .map(|program| Program::<NamedDeBruijn>::try_from(program).unwrap())
-            };
-
-            check(
-                "result",
-                path,
-                expected == actual.result,
-                format!("expected: {expected:?}\n  actual: {:?}", actual.result),
-            );
-
-            if compare_budgets {
-                let budget_file = budget_file
-                    .unwrap_or_else(|| panic!("missing budget fixture for {}", path.display()));
-                let expected_cost = if saturates {
+        let actual = match path.extension().and_then(OsStr::to_str) {
+            Some("flat") => {
+                let expected = if saturates {
                     Err(OUT_OF_BUDGET.to_string())
                 } else {
-                    expected_budget(&budget_file)
+                    expected_flat_program(&path.with_extension("flat.expected"))
                 };
+                let actual =
+                    actual_flat_evaluation_result(path, &language, protocol_major_version, costs);
+                let result = actual.result.clone().map(Program::<DeBruijn>::from);
 
                 check(
-                    "budget",
+                    "flat result",
                     path,
-                    expected_cost == actual.budget,
-                    format!("expected: {expected_cost:?}\n  actual: {:?}", actual.budget),
+                    expected == result,
+                    format!("expected: {expected:?}\n  actual: {result:?}"),
                 );
+
+                actual
             }
+            Some("uplc") => {
+                let expected = if saturates {
+                    Err(OUT_OF_BUDGET.to_string())
+                } else {
+                    expected_to_program(&path.with_extension("uplc.expected"))
+                        .map(|program| Program::<NamedDeBruijn>::try_from(program).unwrap())
+                };
+                let actual =
+                    actual_evaluation_result(path, &language, protocol_major_version, costs);
+
+                check(
+                    "result",
+                    path,
+                    expected == actual.result,
+                    format!("expected: {expected:?}\n  actual: {:?}", actual.result),
+                );
+
+                actual
+            }
+            _ => continue,
+        };
+
+        programs += 1;
+
+        if compare_budgets {
+            let budget_file = budget_file
+                .unwrap_or_else(|| panic!("missing budget fixture for {}", path.display()));
+            let expected_cost = if saturates {
+                Err(OUT_OF_BUDGET.to_string())
+            } else {
+                expected_budget(&budget_file)
+            };
+
+            check(
+                "budget",
+                path,
+                expected_cost == actual.budget,
+                format!("expected: {expected_cost:?}\n  actual: {:?}", actual.budget),
+            );
         }
     }
 
@@ -356,18 +360,32 @@ fn plutus_conformance_tests_v2() {
         ],
         // This root combines budget fixtures from incompatible upstream cost-model revisions
         // (legacy BLS fixtures and newer CEK/builtin fixtures). Result conformance remains valid;
-        // budget conformance is enabled for the homogeneous V3 PV11 root below.
+        // budget conformance is enabled for the homogeneous V3 root below.
         false,
+        &[],
     )
 }
 
 #[test]
-fn plutus_conformance_tests_v3() {
+fn plutus_conformance_tests_v3_van_rossem() {
     plutus_conformance_tests(
         "test_data/conformance/v3",
         Language::PlutusV3,
         VAN_ROSSEM_PROTOCOL_VERSION,
         V3_PV11_COSTS,
         true,
+        DIJKSTRA_ONLY,
+    )
+}
+
+#[test]
+fn plutus_conformance_tests_v3_dijkstra() {
+    plutus_conformance_tests(
+        "test_data/conformance/v3",
+        Language::PlutusV3,
+        DIJKSTRA_PROTOCOL_VERSION,
+        V3_PV11_COSTS,
+        true,
+        &[],
     )
 }
