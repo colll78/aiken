@@ -5,6 +5,7 @@ use crate::{
     },
     builtins::DefaultFunction,
     machine::runtime::Compressable,
+    protocol::MAX_CONSTANT_TYPE_SIZE,
 };
 use num_bigint::BigInt;
 use pallas_codec::flat::{
@@ -698,84 +699,22 @@ fn encode_type(typ: &Type, bytes: &mut Vec<u8>) {
     }
 }
 
+/// Decodes a constant as Plutus' `decodeKindedUni` does: its type tags must
+/// encode exactly one type, with no tag left over.
 impl Decode<'_> for Constant {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        match &decode_constant(d)?[..] {
-            [0] => Ok(Constant::Integer(BigInt::decode(d)?)),
-            [1] => Ok(Constant::ByteString(Vec::<u8>::decode(d)?)),
-            [2] => Ok(Constant::String(String::decode(d)?)),
-            [3] => Ok(Constant::Unit),
-            [4] => Ok(Constant::Bool(bool::decode(d)?)),
-            [7, 5, rest @ ..] => {
-                let mut rest = VecDeque::from(rest.to_vec());
+        let tags = decode_constant(d)?;
+        let mut rest = VecDeque::from(tags.clone());
 
-                let typ = decode_type(&mut rest)?;
+        let typ = decode_type(&mut rest)?;
 
-                let list: Vec<Rc<Constant>> = d.decode_list_with(|d| {
-                    decode_constant_value(typ.clone().into(), d).map(Rc::new)
-                })?;
-
-                Ok(Constant::ProtoList(typ, list.into()))
-            }
-            [7, 12, rest @ ..] => {
-                let mut rest = VecDeque::from(rest.to_vec());
-
-                let typ = decode_type(&mut rest)?;
-
-                let items: Vec<Rc<Constant>> = d.decode_list_with(|d| {
-                    decode_constant_value(typ.clone().into(), d).map(Rc::new)
-                })?;
-
-                Ok(Constant::ProtoArray(typ, items.into()))
-            }
-            [7, 7, 6, rest @ ..] => {
-                let mut rest = VecDeque::from(rest.to_vec());
-
-                let type1 = decode_type(&mut rest)?;
-                let type2 = decode_type(&mut rest)?;
-
-                let a = decode_constant_value(type1.clone().into(), d)?;
-                let b = decode_constant_value(type2.clone().into(), d)?;
-
-                Ok(Constant::ProtoPair(type1, type2, a.into(), b.into()))
-            }
-            [8] => {
-                let cbor = Vec::<u8>::decode(d)?;
-
-                let data = Data::decode_fragment(&cbor)
-                    .map_err(|err| de::Error::Message(err.to_string()))?;
-
-                Ok(Constant::Data(data))
-            }
-            [9] => {
-                let p1 = Vec::<u8>::decode(d)?;
-
-                let _p1 = blst::blst_p1::uncompress(&p1)
-                    .map_err(|err| de::Error::Message(format!("Failed to uncompress p1: {err}")))?;
-
-                Err(de::Error::Message(
-                    "BLS12-381 G1 points are not supported for flat decoding.".to_string(),
-                ))
-            }
-
-            [10] => {
-                let p2 = Vec::<u8>::decode(d)?;
-
-                let _p2 = blst::blst_p2::uncompress(&p2)
-                    .map_err(|err| de::Error::Message(format!("Failed to uncompress p2: {err}")))?;
-
-                Err(de::Error::Message(
-                    "BLS12-381 G2 points are not supported for flat decoding.".to_string(),
-                ))
-            }
-            [11] => Err(de::Error::Message(
-                "BLS12-381 ML results are not supported for flat decoding".to_string(),
-            )),
-            [13] => Ok(Constant::Value(decode_value(d)?)),
-            x => Err(de::Error::Message(format!(
-                "Unknown constant constructor tag: {x:?}"
-            ))),
+        if !rest.is_empty() {
+            return Err(de::Error::Message(format!(
+                "Constant type tags {tags:?} encode more than one type"
+            )));
         }
+
+        decode_constant_value(typ.into(), d)
     }
 }
 
@@ -800,7 +739,7 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
         Type::ByteString => Ok(Constant::ByteString(Vec::<u8>::decode(d)?)),
         Type::String => Ok(Constant::String(String::decode(d)?)),
         Type::Unit => Ok(Constant::Unit),
-        Type::Bool => Ok(Constant::Bool(bool::decode(d)?)),
+        Type::Bool => Ok(Constant::Bool(decode_bool(d)?)),
         Type::List(sub_type) => {
             let list: Vec<Rc<Constant>> =
                 d.decode_list_with(|d| decode_constant_value(sub_type.clone(), d).map(Rc::new))?;
@@ -860,6 +799,12 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
         )),
         Type::Value => Ok(Constant::Value(decode_value(d)?)),
     }
+}
+
+/// Decodes a bool, failing at the end of the input where pallas'
+/// `Decoder::bool` panics.
+fn decode_bool(d: &mut Decoder) -> Result<bool, de::Error> {
+    Ok(d.bits8(1)? == 1)
 }
 
 fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
@@ -1154,8 +1099,23 @@ pub fn encode_constant(tag: &[u8], e: &mut Encoder) -> Result<(), en::Error> {
     Ok(())
 }
 
+/// Decodes the type tags of a constant, rejecting more than the ledger
+/// allows ([`MAX_CONSTANT_TYPE_SIZE`]) as soon as there are, so that a long
+/// list is neither read in full nor decoded into a deeply nested type.
 pub fn decode_constant(d: &mut Decoder) -> Result<Vec<u8>, de::Error> {
-    d.decode_list_with(decode_constant_tag)
+    let mut tags = Vec::new();
+
+    while decode_bool(d)? {
+        if tags.len() == MAX_CONSTANT_TYPE_SIZE {
+            return Err(de::Error::Message(format!(
+                "Constant type takes more than {MAX_CONSTANT_TYPE_SIZE} tags"
+            )));
+        }
+
+        tags.push(decode_constant_tag(d)?);
+    }
+
+    Ok(tags)
 }
 
 pub fn encode_constant_tag(tag: &u8, e: &mut Encoder) -> Result<(), en::Error> {
@@ -1168,7 +1128,7 @@ pub fn decode_constant_tag(d: &mut Decoder) -> Result<u8, de::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Constant, Program, Term, decode_value};
+    use super::{Constant, Program, Term, decode_bool, decode_value, encode_constant};
     use crate::{
         ast::{BigIntValueEntries, DeBruijn, Name, Type, Value},
         parser,
@@ -1596,5 +1556,83 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(reparsed, program);
+    }
+
+    /// Flat bytes for `(program 1.1.0 (con <type> <value>))`, with the type
+    /// given as its raw tags and the value written by `value`.
+    fn constant_with_tags(tags: &[u8], value: impl FnOnce(&mut Encoder)) -> Vec<u8> {
+        let mut e = Encoder::new();
+        for word in [1_usize, 1, 0] {
+            word.encode(&mut e).unwrap();
+        }
+        e.bits(4, 4);
+        encode_constant(tags, &mut e).unwrap();
+        value(&mut e);
+        pallas_codec::flat::filler::Filler::FillerEnd
+            .encode(&mut e)
+            .unwrap();
+        e.buffer
+    }
+
+    #[test]
+    fn constant_type_tags_must_encode_one_type() {
+        // Units have no value, and a list or array value here is empty.
+        for (tags, is_list, leftover) in [
+            (&[3][..], false, &[3][..]),
+            (&[7, 7, 6, 3, 3], false, &[3]),
+            (&[7, 5, 3], true, &[0]),
+            (&[7, 12, 3], true, &[3, 3, 3]),
+            (&[7, 5, 7, 7, 6, 3, 3], true, &[7]),
+        ] {
+            let value = |e: &mut Encoder| {
+                if is_list {
+                    e.bits(1, 0);
+                }
+            };
+
+            let valid = constant_with_tags(tags, value);
+            assert!(Program::<DeBruijn>::unflat(&valid).is_ok(), "{tags:?}");
+
+            let invalid = constant_with_tags(&[tags, leftover].concat(), value);
+            assert!(
+                Program::<DeBruijn>::unflat(&invalid).is_err(),
+                "{tags:?} {leftover:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_types_limited_to_32_tags() {
+        // A list type takes 2 more tags than its element type, and a pair
+        // type 3 more than its two, so a type takes an odd number of tags.
+        let lists = |depth: usize| [&[7, 5].repeat(depth)[..], &[3]].concat();
+        let empty = |e: &mut Encoder| {
+            e.bits(1, 0);
+        };
+
+        assert_eq!(lists(15).len(), 31);
+        assert!(Program::<DeBruijn>::unflat(&constant_with_tags(&lists(15), empty)).is_ok());
+
+        // Rejected before the tags are decoded into a type.
+        for depth in [16, 100_000] {
+            assert!(
+                Program::<DeBruijn>::unflat(&constant_with_tags(&lists(depth), empty)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_bools_rejected() {
+        let mut d = Decoder::new(&[0b1000_0000]);
+        assert!(decode_bool(&mut d).unwrap());
+        for _ in 0..7 {
+            assert!(!decode_bool(&mut d).unwrap());
+        }
+        assert!(decode_bool(&mut d).is_err());
+
+        // A `bool` constant whose value is past the end of the input, which
+        // used to panic in pallas' `Decoder::bool`.
+        let bytes = hex::decode("010000183682d528").unwrap();
+        assert!(Program::<DeBruijn>::unflat(&bytes).is_err());
     }
 }

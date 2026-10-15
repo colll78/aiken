@@ -38,6 +38,7 @@
 - **uplc**: Before protocol version 11, let `constrData` take any integer index, as Plutus does. `Data` now converts to `PlutusData` with `TryFrom`, failing on an index outside 64 bits, and `Constr::constr_index` returns a `ConstrIndex`. @colll78
 - **uplc**: Serialise `Data` canonically, as Plutus does, whatever encoding it was decoded from (`102([0, []])` serialises as `121([])`, and `2(h'01')` as `1`), and compare negative big integers by value in `equalsData`. @colll78
 - **uplc**: Decode `Data` as Plutus does, rejecting what pallas accepts but Plutus does not: byte strings and big integers with a chunk of more than 64 bytes, a big integer tag not written in a single byte (`d8 02 41 01`), and a tag 102 constructor that is not exactly a pair of an index and fields. @colll78
+- **uplc**: Reject a flat constant whose type tags encode more than one type (`[7, 5, 0, 0]` used to decode as a `list integer`), and fail instead of panicking on a `bool` constant cut off by the end of the input. @colll78
 
 ## v1.1.24 - 2026-09-26
 
