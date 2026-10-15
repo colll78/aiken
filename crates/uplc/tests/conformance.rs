@@ -5,8 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use uplc::{
-    ast::{Name, NamedDeBruijn, Program},
-    machine::{cost_model::ExBudget, runtime::VAN_ROSSEM_PROTOCOL_VERSION},
+    ast::{DeBruijn, Name, NamedDeBruijn, Program},
+    machine::{Error as MachineError, cost_model::ExBudget, runtime::VAN_ROSSEM_PROTOCOL_VERSION},
     parser,
 };
 use walkdir::WalkDir;
@@ -14,15 +14,30 @@ use walkdir::WalkDir;
 const PARSE_ERROR: &str = "parse error";
 const EVALUATION_FAILURE: &str = "evaluation failure";
 
-// CIP-0153 fixtures are copied byte-for-byte from IntersectMBO/plutus revision
-// 5f785edeac0d1d89622d44344fdda07ef48e8c73 under
-// plutus-conformance/test-cases/uplc/evaluation/builtin/{constant/value,semantics/<builtin>}.
-// At that revision, regenerate this PlutusV3 parameter array with:
-// cabal run dump-cost-model-parameters -- -V 3 --untagged
-//
-// Upstream disables its generated unValueData coefficient test over a suspected top-coefficient
-// rounding discrepancy. These imported budget fixtures still exercise unValueData against that
-// exact dumped model. Run all 98 Value cases with `cargo test -p uplc --test conformance`.
+// Upstream renamed the parse failure marker; older fixtures still use PARSE_ERROR.
+const PARSE_OR_DECODE_ERROR: &str = "parse/decode error";
+
+// Case on Data is a PV12 (Dijkstra) feature; these fixtures fail under PV11 by design.
+const PV12_ONLY: &[&str] = &["term/constant-case/data"];
+
+// Upstream computes fixtures in counting mode, where budgets saturate at `maxBound`. Every
+// restricting evaluator, the ledger included, necessarily runs out of budget on such a program,
+// so that is what these fixtures are held to here.
+const OUT_OF_BUDGET: &str = "out of budget";
+
+// As close to the reference counting mode as a restricting machine gets.
+const UNLIMITED_BUDGET: ExBudget = ExBudget {
+    mem: i64::MAX,
+    cpu: i64::MAX,
+};
+
+// test_data/conformance/v3 is a byte-for-byte copy of
+// plutus-conformance/test-cases/uplc/evaluation from IntersectMBO/plutus revision
+// 1b03c165b854548cc8de77e7bb01a8d96b9c74f5 (minus the repository's helper script and
+// multiScalarMul input dump). This PlutusV3 parameter array is the first 350 entries (everything
+// up to batch 6, i.e. the Van Rossem set) of what that revision's
+// plutus-core/cost-model/data/{builtinCostModelE,cekMachineCostsE}.json give in `ParamName` order.
+// Both `.uplc` and `.flat` fixtures are checked: `cargo test -p uplc --test conformance`.
 const V3_PV11_COSTS: &[i64] = &[
     100788, 420, 1, 1, 1000, 173, 0, 1, 1000, 59957, 4, 1, 11183, 32, 201305, 8356, 4, 16000, 100,
     16000, 100, 16000, 100, 16000, 100, 16000, 100, 16000, 100, 100, 100, 16000, 100, 94375, 32,
@@ -42,15 +57,15 @@ const V3_PV11_COSTS: &[i64] = &[
     1, 100181, 726, 719, 0, 1, 100181, 726, 719, 0, 1, 107878, 680, 0, 1, 95336, 1, 281145, 18848,
     0, 1, 180194, 159, 1, 1, 158519, 8942, 0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655,
     1, 1964219, 24520, 3, 607153, 231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7,
-    1, 232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951,
-    9444, 1, 1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
-    1000, 95933, 1, 1, 11, 1000, 277577, 12, 21,
+    1, 232010, 32, 321837444, 25087669, 18, 617887431, 67302824, 36, 390841, 30257, 47, 27, 219951,
+    9444, 1, 1000, 284948, 143815, 4, 26, 29, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
+    1000, 128595, 1, 14, 18, 1000, 383231, 14, 29,
 ];
 
 fn expected_to_program(expected_file: &PathBuf) -> Result<Program<Name>, String> {
     let code = fs::read_to_string(expected_file).expect("Failed to read .uplc.expected file");
 
-    if code.contains(PARSE_ERROR) {
+    if code.contains(PARSE_ERROR) || code.contains(PARSE_OR_DECODE_ERROR) {
         Err(PARSE_ERROR.to_string())
     } else if code.contains(EVALUATION_FAILURE) {
         Err(EVALUATION_FAILURE.to_string())
@@ -65,7 +80,7 @@ fn expected_budget(expected_file: &Path) -> Result<ExBudget, String> {
     let code = code.strip_suffix('\n').unwrap_or(&code);
 
     match code {
-        PARSE_ERROR => Err(PARSE_ERROR.to_string()),
+        PARSE_ERROR | PARSE_OR_DECODE_ERROR => Err(PARSE_ERROR.to_string()),
         EVALUATION_FAILURE => Err(EVALUATION_FAILURE.to_string()),
         _ => {
             let fields = code
@@ -114,26 +129,29 @@ fn actual_evaluation_result(
 
     let program = match parser::program(&code) {
         Ok(program) => program,
-        Err(_) => {
-            return ConformanceResult {
-                result: Err(PARSE_ERROR.to_string()),
-                budget: Err(PARSE_ERROR.to_string()),
-            };
-        }
+        Err(_) => return ConformanceResult::failure(PARSE_ERROR),
     };
 
-    let program: Program<NamedDeBruijn> = match program.try_into() {
-        Ok(program) => program,
-        Err(_) => {
-            return ConformanceResult {
-                result: Err(EVALUATION_FAILURE.to_string()),
-                budget: Err(EVALUATION_FAILURE.to_string()),
-            };
-        }
-    };
+    // Upstream reports scope errors (free variables) as parse/decode errors.
+    match program.try_into() {
+        Ok(program) => evaluate(program, language, protocol_major_version, costs),
+        Err(_) => ConformanceResult::failure(PARSE_ERROR),
+    }
+}
 
+fn evaluate(
+    program: Program<NamedDeBruijn>,
+    language: &Language,
+    protocol_major_version: u16,
+    costs: &[i64],
+) -> ConformanceResult {
     let version = program.version;
-    let eval = program.eval_as_with_protocol(language, protocol_major_version, costs, None);
+    let eval = program.eval_as_with_protocol(
+        language,
+        protocol_major_version,
+        costs,
+        Some(&UNLIMITED_BUDGET),
+    );
     let cost = eval.cost();
 
     match eval.result() {
@@ -141,11 +159,71 @@ fn actual_evaluation_result(
             result: Ok(Program { version, term }),
             budget: Ok(cost),
         },
-        Err(_) => ConformanceResult {
-            result: Err(EVALUATION_FAILURE.to_string()),
-            budget: Err(EVALUATION_FAILURE.to_string()),
-        },
+        // The machine scope-checks before evaluating, as the ledger does; upstream
+        // reports that as a parse/decode error.
+        Err(MachineError::OpenTermEvaluated(_)) => ConformanceResult::failure(PARSE_ERROR),
+        Err(MachineError::OutOfExError(_)) => ConformanceResult::failure(OUT_OF_BUDGET),
+        Err(_) => ConformanceResult::failure(EVALUATION_FAILURE),
     }
+}
+
+impl ConformanceResult {
+    fn failure(reason: &str) -> Self {
+        ConformanceResult {
+            result: Err(reason.to_string()),
+            budget: Err(reason.to_string()),
+        }
+    }
+}
+
+fn expected_flat_program(expected_file: &Path) -> Result<Program<DeBruijn>, String> {
+    let bytes = fs::read(expected_file)
+        .unwrap_or_else(|err| panic!("failed to read {}: {err}", expected_file.display()));
+
+    match std::str::from_utf8(&bytes).map(str::trim_end) {
+        Ok(PARSE_OR_DECODE_ERROR) => Err(PARSE_ERROR.to_string()),
+        Ok(EVALUATION_FAILURE) => Err(EVALUATION_FAILURE.to_string()),
+        _ => Ok(
+            Program::<DeBruijn>::from_flat(&bytes).unwrap_or_else(|err| {
+                panic!("invalid flat fixture {}: {err}", expected_file.display())
+            }),
+        ),
+    }
+}
+
+fn actual_flat_evaluation_result(
+    file: &Path,
+    language: &Language,
+    protocol_major_version: u16,
+    costs: &[i64],
+) -> ConformanceResult {
+    let bytes = fs::read(file).expect("Failed to read .flat file");
+
+    match Program::<DeBruijn>::from_flat(&bytes) {
+        Ok(program) => evaluate(program.into(), language, protocol_major_version, costs),
+        Err(_) => ConformanceResult::failure(PARSE_ERROR),
+    }
+}
+
+fn budget_file(path: &Path) -> Option<PathBuf> {
+    [
+        path.with_extension("budget.expected"),
+        path.with_extension("uplc.budget.expected"),
+    ]
+    .into_iter()
+    .find(|file| file.exists())
+}
+
+fn saturates(budget_file: Option<&PathBuf>) -> bool {
+    budget_file
+        .and_then(|file| expected_budget(file).ok())
+        .is_some_and(|budget| budget.cpu == i64::MAX || budget.mem == i64::MAX)
+}
+
+fn is_pv12_only(root: &str, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+
+    PV12_ONLY.iter().any(|prefix| relative.starts_with(prefix))
 }
 
 fn plutus_conformance_tests(
@@ -155,36 +233,95 @@ fn plutus_conformance_tests(
     costs: &[i64],
     compare_budgets: bool,
 ) {
+    let mut failures = Vec::new();
+    let mut programs = 0;
+
+    let mut check = |what: &str, path: &Path, matches: bool, detail: String| {
+        if !matches {
+            failures.push(format!("{what} mismatch for {}\n{detail}", path.display()));
+        }
+    };
+
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         let path = entry.path();
 
+        if is_pv12_only(root, path) {
+            continue;
+        }
+
+        let budget_file = budget_file(path);
+        let saturates = saturates(budget_file.as_ref());
+
+        if path.extension().and_then(OsStr::to_str) == Some("flat") {
+            programs += 1;
+
+            let expected = if saturates {
+                Err(OUT_OF_BUDGET.to_string())
+            } else {
+                expected_flat_program(&path.with_extension("flat.expected"))
+            };
+            let actual =
+                actual_flat_evaluation_result(path, &language, protocol_major_version, costs)
+                    .result
+                    .map(Program::<DeBruijn>::from);
+
+            check(
+                "flat result",
+                path,
+                expected == actual,
+                format!("expected: {expected:?}\n  actual: {actual:?}"),
+            );
+        }
+
         if path.extension().and_then(OsStr::to_str) == Some("uplc") {
+            programs += 1;
+
             let expected_file = path.with_extension("uplc.expected");
 
             let actual = actual_evaluation_result(path, &language, protocol_major_version, costs);
-            let expected = expected_to_program(&expected_file)
-                .map(|program| Program::<NamedDeBruijn>::try_from(program).unwrap());
+            let expected = if saturates {
+                Err(OUT_OF_BUDGET.to_string())
+            } else {
+                expected_to_program(&expected_file)
+                    .map(|program| Program::<NamedDeBruijn>::try_from(program).unwrap())
+            };
 
-            pretty_assertions::assert_eq!(
-                expected,
-                actual.result,
-                "result fixture for {}",
-                path.display()
+            check(
+                "result",
+                path,
+                expected == actual.result,
+                format!("expected: {expected:?}\n  actual: {:?}", actual.result),
             );
-            if compare_budgets {
-                let budget_file = path.with_extension("uplc.budget.expected");
-                let expected_cost = expected_budget(&budget_file);
 
-                pretty_assertions::assert_eq!(
-                    expected_cost,
-                    actual.budget,
-                    "budget fixture {} for {}",
-                    budget_file.display(),
-                    path.display()
+            if compare_budgets {
+                let budget_file = budget_file
+                    .unwrap_or_else(|| panic!("missing budget fixture for {}", path.display()));
+                let expected_cost = if saturates {
+                    Err(OUT_OF_BUDGET.to_string())
+                } else {
+                    expected_budget(&budget_file)
+                };
+
+                check(
+                    "budget",
+                    path,
+                    expected_cost == actual.budget,
+                    format!("expected: {expected_cost:?}\n  actual: {:?}", actual.budget),
                 );
             }
         }
     }
+
+    // Guards against running from a directory where the fixtures are not found,
+    // which would otherwise pass without checking anything.
+    assert!(programs > 0, "no conformance programs found under {root}");
+
+    assert!(
+        failures.is_empty(),
+        "{} conformance failure(s) under {root}:\n\n{}",
+        failures.len(),
+        failures.join("\n\n")
+    );
 }
 
 #[test]
@@ -213,9 +350,9 @@ fn plutus_conformance_tests_v2() {
             1, 107878, 680, 0, 1, 95336, 1, 281145, 18848, 0, 1, 180194, 159, 1, 1, 158519, 8942,
             0, 1, 159378, 8813, 0, 1, 107490, 3298, 1, 106057, 655, 1, 1964219, 24520, 3, 607153,
             231697, 53144, 0, 1, 116711, 1957, 4, 231883, 10, 1000, 24838, 7, 1, 232010, 32,
-            321837444, 25087669, 18, 617887431, 67302824, 36, 356924, 18413, 45, 21, 219951, 9444,
-            1, 1000, 172116, 183150, 6, 24, 21, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
-            1000, 95933, 1, 1, 11, 1000, 277577, 12, 21,
+            321837444, 25087669, 18, 617887431, 67302824, 36, 390841, 30257, 47, 27, 219951, 9444,
+            1, 1000, 284948, 143815, 4, 26, 29, 213283, 618401, 1998, 28258, 1, 1000, 38159, 2, 22,
+            1000, 128595, 1, 14, 18, 1000, 383231, 14, 29,
         ],
         // This root combines budget fixtures from incompatible upstream cost-model revisions
         // (legacy BLS fixtures and newer CEK/builtin fixtures). Result conformance remains valid;
