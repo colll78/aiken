@@ -130,6 +130,13 @@ pub enum Error {
     UnexpectedEd25519PublicKeyLength(usize),
     #[error("Ed25519S Signature should be 64 bytes but it was {0}")]
     UnexpectedEd25519SignatureLength(usize),
+    #[error("{builtin} expects a {expected}-byte {argument} but got {actual} bytes")]
+    UnexpectedArgumentLength {
+        builtin: DefaultFunction,
+        argument: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     #[error(
       "failed to deserialise PlutusData using {0}\n{:>13} {}",
       "Value",

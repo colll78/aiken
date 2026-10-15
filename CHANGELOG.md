@@ -23,6 +23,7 @@
 - **uplc**: Parse string constants with Haskell character escapes, as the Plutus parser does (`\83`, `\o143`, `\x7f`, `\^A`, `\DEL`, `\&`, …), instead of keeping numeric escapes literally. @colll78
 - **uplc**: Print the `bls12_381_G2_element` type as such in the textual syntax instead of as `bls12_381_G1_element`. @colll78
 - **uplc**: Fail `sliceByteString` and `indexByteString` cleanly when an integer operand is outside the signed 64-bit range, as Plutus does when unlifting an `Int`, instead of clamping or panicking. @colll78
+- **uplc**: Check the arguments of `verifyEcdsaSecp256k1Signature` and `verifySchnorrSecp256k1Signature` exactly as Plutus does, on every target. A key, signature or message hash of the wrong length is an error instead of a panic on wasm, a 65-byte uncompressed ECDSA key is rejected instead of accepted, and a signature with a zero component, or a Schnorr signature with an out-of-range component, verifies as false on wasm instead of failing. @colll78
 
 ## v1.1.24 - 2026-09-26
 

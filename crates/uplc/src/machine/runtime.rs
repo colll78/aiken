@@ -2240,77 +2240,163 @@ pub fn convert_constr_to_tag(constr: u64) -> Option<u64> {
 
 pub static ANY_TAG: u64 = 102;
 
-#[cfg(not(target_family = "wasm"))]
+/// Plutus (through cardano-crypto-class) only accepts a 33-byte compressed
+/// public key, a 64-byte compact signature whose scalars are below the group
+/// order, and a 32-byte message hash; anything else fails the builtin. A
+/// well-formed signature that does not verify (including one with a zero or
+/// high `s`) is `False`.
 fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use secp256k1::{Message, PublicKey, Secp256k1, ecdsa::Signature};
+    let builtin = DefaultFunction::VerifyEcdsaSecp256k1Signature;
 
-    let secp = Secp256k1::verification_only();
+    expect_length(builtin, "public key", public_key, 33)?;
+    expect_length(builtin, "signature", signature, 64)?;
+    expect_length(builtin, "message hash", message, 32)?;
 
-    let public_key = PublicKey::from_slice(public_key)?;
+    let valid = secp256k1::verify_ecdsa(public_key, message, signature)?;
 
-    let signature = Signature::from_compact(signature)?;
-
-    let message = Message::from_slice(message)?;
-
-    let valid = secp.verify_ecdsa(&message, &signature, &public_key);
-
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
+    Ok(Value::Con(Constant::Bool(valid).into()))
 }
 
-/// Plutus delegates Schnorr verification to libsecp256k1's BIP-340 verifier,
-/// which accepts arbitrary message lengths. The high-level Rust wrapper only
-/// accepts 32-byte `Message`s, so call the FFI verifier directly.
-#[cfg(not(target_family = "wasm"))]
+/// Plutus only accepts a 32-byte x-only public key and a 64-byte signature,
+/// which is not parsed any further: a signature whose `r` or `s` is out of
+/// range simply does not verify. The message may have any length (BIP-340).
 fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use secp256k1::{
-        Secp256k1, XOnlyPublicKey,
+    let builtin = DefaultFunction::VerifySchnorrSecp256k1Signature;
+
+    expect_length(builtin, "public key", public_key, 32)?;
+    expect_length(builtin, "signature", signature, 64)?;
+
+    let valid = secp256k1::verify_schnorr(public_key, message, signature)?;
+
+    Ok(Value::Con(Constant::Bool(valid).into()))
+}
+
+fn expect_length(
+    builtin: DefaultFunction,
+    argument: &'static str,
+    bytes: &[u8],
+    expected: usize,
+) -> Result<(), Error> {
+    if bytes.len() == expected {
+        Ok(())
+    } else {
+        Err(Error::UnexpectedArgumentLength {
+            builtin,
+            argument,
+            expected,
+            actual: bytes.len(),
+        })
+    }
+}
+
+/// libsecp256k1, which Plutus itself uses. The callers have already checked
+/// the argument lengths.
+#[cfg(not(target_family = "wasm"))]
+mod secp256k1 {
+    use super::Error;
+    use ::secp256k1::{
+        Message, PublicKey, Secp256k1, XOnlyPublicKey, ecdsa,
         ffi::{self, CPtr},
-        schnorr::Signature,
+        schnorr,
     };
 
-    let secp = Secp256k1::verification_only();
+    pub(super) fn verify_ecdsa(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let secp = Secp256k1::verification_only();
 
-    let public_key = XOnlyPublicKey::from_slice(public_key)?;
+        let public_key = PublicKey::from_slice(public_key)?;
 
-    let signature = Signature::from_slice(signature)?;
+        let signature = ecdsa::Signature::from_compact(signature)?;
 
-    let valid = unsafe {
-        ffi::secp256k1_schnorrsig_verify(
-            secp.ctx().as_ptr(),
-            signature.as_c_ptr(),
-            message.as_c_ptr(),
-            message.len(),
-            public_key.as_c_ptr(),
-        )
+        let message = Message::from_slice(message)?;
+
+        Ok(secp.verify_ecdsa(&message, &signature, &public_key).is_ok())
+    }
+
+    /// The high-level wrapper only accepts 32-byte `Message`s, so call the
+    /// BIP-340 verifier, which takes messages of any length, directly.
+    pub(super) fn verify_schnorr(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let secp = Secp256k1::verification_only();
+
+        let public_key = XOnlyPublicKey::from_slice(public_key)?;
+
+        let signature = schnorr::Signature::from_slice(signature)?;
+
+        let valid = unsafe {
+            ffi::secp256k1_schnorrsig_verify(
+                secp.ctx().as_ptr(),
+                signature.as_c_ptr(),
+                message.as_c_ptr(),
+                message.len(),
+                public_key.as_c_ptr(),
+            )
+        };
+
+        Ok(valid == 1)
+    }
+}
+
+/// k256, a pure-Rust implementation, where libsecp256k1 does not build. Its
+/// parsers are stricter than libsecp256k1's (they reject zero scalars, and
+/// Schnorr signature components out of range), so those cases are mapped
+/// back to the `False` that libsecp256k1 gives. The callers have already
+/// checked the argument lengths, which k256 would otherwise panic on.
+#[cfg(target_family = "wasm")]
+mod secp256k1 {
+    use super::Error;
+    use k256::{
+        FieldBytes, Scalar,
+        ecdsa::{self, signature::hazmat::PrehashVerifier as _},
+        elliptic_curve::PrimeField,
+        schnorr,
     };
 
-    Ok(Value::Con(Constant::Bool(valid == 1).into()))
-}
+    pub(super) fn verify_ecdsa(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let verifying_key = ecdsa::VerifyingKey::from_sec1_bytes(public_key)?;
 
-#[cfg(target_family = "wasm")]
-fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use k256::ecdsa::{self, signature::hazmat::PrehashVerifier};
+        let (r, s) = signature.split_at(32);
 
-    let verifying_key = ecdsa::VerifyingKey::try_from(public_key)?;
+        let (Some(r), Some(s)) = (
+            Option::<Scalar>::from(Scalar::from_repr(*FieldBytes::from_slice(r))),
+            Option::<Scalar>::from(Scalar::from_repr(*FieldBytes::from_slice(s))),
+        ) else {
+            return Err(Error::K256Error(
+                "ECDSA signature scalar is not below the group order".to_string(),
+            ));
+        };
 
-    let signature = ecdsa::Signature::try_from(signature)?;
+        let Ok(signature) = ecdsa::Signature::from_scalars(r, s) else {
+            // A zero scalar parses in libsecp256k1 but never verifies.
+            return Ok(false);
+        };
 
-    let valid = verifying_key.verify_prehash(message, &signature);
+        Ok(verifying_key.verify_prehash(message, &signature).is_ok())
+    }
 
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
-}
+    pub(super) fn verify_schnorr(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let verifying_key = schnorr::VerifyingKey::from_bytes(public_key)?;
 
-#[cfg(target_family = "wasm")]
-fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use k256::schnorr::{self, signature::hazmat::PrehashVerifier};
+        let Ok(signature) = schnorr::Signature::try_from(signature) else {
+            return Ok(false);
+        };
 
-    let verifying_key = schnorr::VerifyingKey::from_bytes(public_key)?;
-
-    let signature = schnorr::Signature::try_from(signature)?;
-
-    let valid = verifying_key.verify_prehash(message, &signature);
-
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
+        Ok(verifying_key.verify_raw(message, &signature).is_ok())
+    }
 }
 
 #[cfg(test)]
@@ -2378,6 +2464,154 @@ mod tests {
         }
         for i in [huge.clone(), -enormous.clone(), enormous] {
             assert!(matches!(index(i), Err(Error::IntegerOutOfInt64Range(_, _))));
+        }
+    }
+
+    fn secp256k1(
+        builtin: DefaultFunction,
+        public_key: &str,
+        message: &str,
+        signature: &str,
+    ) -> Result<Value, Error> {
+        let bytes = |h: &str| Value::byte_string(hex::decode(h).unwrap());
+
+        builtin.call(
+            BuiltinSemantics::E,
+            &[bytes(public_key), bytes(message), bytes(signature)],
+            &mut vec![],
+        )
+    }
+
+    // Both backends (libsecp256k1 natively, k256 on wasm) must agree with
+    // Plutus on which arguments fail the builtin and which merely do not
+    // verify.
+    #[test]
+    fn verify_ecdsa_secp256k1_matches_plutus() {
+        // Conformance test-vector-01: the SHA2-256 of "" signed with a low s.
+        const KEY: &str = "032e433589dce61863199171f4d1e3fa946a5832621fcd29559940a0950f96fb6f";
+        const UNCOMPRESSED_KEY: &str = "042e433589dce61863199171f4d1e3fa946a5832621fcd29559940a0950f96fb6f503f0ede730b04c413cc9525f51d638b834fadefea334c42df7d96ea54c00723";
+        const HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const R: &str = "4941155e2303988a1be97a021fbaf9fe6064d05ea694bc5e89328f297154e5c6";
+        const S: &str = "3a2f3e7b5f509294a4c2e22feb697a16b792fabfebe9d0f38403b1c929836b5a";
+        const HIGH_S: &str = "c5d0c184a0af6d6b5b3d1dd0149685e8031be226c35ecf483bceacc3a6b2d5e7";
+        const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        const ORDER: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+
+        let verify = |key: &str, hash: &str, signature: &str| {
+            secp256k1(
+                DefaultFunction::VerifyEcdsaSecp256k1Signature,
+                key,
+                hash,
+                signature,
+            )
+        };
+        let bool = |b: bool| Value::bool(b);
+
+        assert_eq!(verify(KEY, HASH, &format!("{R}{S}")).unwrap(), bool(true));
+
+        // Well-formed, but not a valid signature.
+        assert_eq!(
+            verify(KEY, HASH, &format!("{R}{HIGH_S}")).unwrap(),
+            bool(false)
+        );
+        assert_eq!(
+            verify(KEY, HASH, &format!("{ZERO}{S}")).unwrap(),
+            bool(false)
+        );
+        assert_eq!(
+            verify(KEY, HASH, &format!("{R}{ZERO}")).unwrap(),
+            bool(false)
+        );
+
+        // Malformed: a scalar not below the group order, an uncompressed or
+        // invalid key, or a wrong length.
+        for (key, hash, signature) in [
+            (KEY, HASH, format!("{ORDER}{S}")),
+            (KEY, HASH, format!("{R}{ORDER}")),
+            (UNCOMPRESSED_KEY, HASH, format!("{R}{S}")),
+            (&format!("02{ZERO}"), HASH, format!("{R}{S}")),
+            (&KEY[2..], HASH, format!("{R}{S}")),
+            (KEY, &HASH[2..], format!("{R}{S}")),
+            (KEY, &format!("{HASH}00"), format!("{R}{S}")),
+            (KEY, HASH, format!("{R}{}", &S[2..])),
+            (KEY, HASH, String::new()),
+        ] {
+            assert!(
+                verify(key, hash, &signature).is_err(),
+                "{key} {hash} {signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_schnorr_secp256k1_matches_plutus() {
+        // BIP-340 test vector 1.
+        const KEY: &str = "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659";
+        const MESSAGE: &str = "243f6a8885a308d313198a2e03707344a4093822299f31d0082efa98ec4e6c89";
+        const R: &str = "6896bd60eeae296db48a229ff71dfe071bde413e6d43f917dc8dcf8c78de3341";
+        const S: &str = "8906d11ac976abccb20b091292bff4ea897efcb639ea871cfa95f6de339e4b0a";
+        const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        const ORDER: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+        const PRIME: &str = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
+
+        let verify = |key: &str, message: &str, signature: &str| {
+            secp256k1(
+                DefaultFunction::VerifySchnorrSecp256k1Signature,
+                key,
+                message,
+                signature,
+            )
+        };
+        let bool = |b: bool| Value::bool(b);
+
+        assert_eq!(
+            verify(KEY, MESSAGE, &format!("{R}{S}")).unwrap(),
+            bool(true)
+        );
+
+        // BIP-340 test vector 15: messages of any length are accepted.
+        assert_eq!(
+            verify(
+                "778caa53b4393ac467774d09497a87224bf9fab6f6e68b23086497324d6fd117",
+                "",
+                "71535db165ecd9fbbc046e5ffaea61186bb6ad436732fccc25291a55895464cf6069ce26bf03466228f19a3a62db8a649f2d560fac652827d1af0574e427ab63",
+            )
+            .unwrap(),
+            bool(true)
+        );
+        assert_eq!(
+            verify(KEY, &format!("{MESSAGE}00"), &format!("{R}{S}")).unwrap(),
+            bool(false)
+        );
+
+        // Any 64 bytes are a signature: out-of-range components do not verify.
+        for signature in [
+            format!("{ZERO}{S}"),
+            format!("{PRIME}{S}"),
+            format!("{R}{ZERO}"),
+            format!("{R}{ORDER}"),
+        ] {
+            assert_eq!(
+                verify(KEY, MESSAGE, &signature).unwrap(),
+                bool(false),
+                "{signature}"
+            );
+        }
+
+        // Malformed: a key that is not on the curve, or a wrong length.
+        for (key, signature) in [
+            (PRIME.to_string(), format!("{R}{S}")),
+            (KEY[2..].to_string(), format!("{R}{S}")),
+            (format!("{KEY}00"), format!("{R}{S}")),
+            (String::new(), format!("{R}{S}")),
+            (KEY.to_string(), format!("{R}{}", &S[2..])),
+            (KEY.to_string(), format!("{R}{S}00")),
+            (KEY.to_string(), String::new()),
+        ] {
+            assert!(
+                verify(&key, MESSAGE, &signature).is_err(),
+                "{key} {signature}"
+            );
         }
     }
 
