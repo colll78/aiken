@@ -1481,29 +1481,45 @@ impl From<NamedDeBruijn> for FakeNamedDeBruijn {
 }
 
 /// Represents a debruijn index.
+///
+/// Indices are 64-bit words, as on chain, whatever the target's pointer width:
+/// the ledger admits a free variable with any index where it does not
+/// scope-check. An index that does not fit in a `usize` can never be bound, as
+/// no term nests that many lambdas, so converting it to a `usize` saturates to
+/// `usize::MAX`, which is never bound either.
 #[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub struct DeBruijn(usize);
+pub struct DeBruijn(u64);
 
 impl DeBruijn {
     /// Create a new debruijn index.
     pub fn new(index: usize) -> Self {
+        DeBruijn(index as u64)
+    }
+
+    /// Create a debruijn index from the 64-bit word it is encoded as.
+    pub fn from_word(index: u64) -> Self {
         DeBruijn(index)
     }
 
     pub fn inner(&self) -> usize {
+        usize::try_from(self.0).unwrap_or(usize::MAX)
+    }
+
+    /// The index as the 64-bit word it is encoded as.
+    pub fn word(&self) -> u64 {
         self.0
     }
 }
 
 impl From<usize> for DeBruijn {
     fn from(i: usize) -> Self {
-        DeBruijn(i)
+        DeBruijn::new(i)
     }
 }
 
 impl From<DeBruijn> for usize {
     fn from(d: DeBruijn) -> Self {
-        d.0
+        d.inner()
     }
 }
 

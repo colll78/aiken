@@ -16,7 +16,9 @@ use pallas_primitives::conway::Language;
 
 use self::{
     cost_model::CostModel,
-    runtime::{BuiltinRuntime, BuiltinSemantics, VAN_ROSSEM_PROTOCOL_VERSION},
+    runtime::{
+        BuiltinRuntime, BuiltinSemantics, DIJKSTRA_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION,
+    },
     value::{Env, Value},
 };
 
@@ -268,32 +270,43 @@ impl Machine {
     /// From Van Rossem onwards everything this machine knows about is available
     /// in every ledger language. Both are whole-program well-formedness rules:
     /// occurrences in latent code (under lambdas, delays or untaken branches)
-    /// are rejected too.
+    /// are rejected too, except that before protocol version 12 (Dijkstra) the
+    /// ledger's scope check does not look inside `constr` and `case` (Plutus'
+    /// `checkScope NoCaseConstr`), so a free variable there only fails the
+    /// program if it is evaluated.
     fn check_term(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
         let check_availability = self.protocol_major_version < VAN_ROSSEM_PROTOCOL_VERSION;
+        let scope_case_constr = self.protocol_major_version >= DIJKSTRA_PROTOCOL_VERSION;
 
-        // Each term is paired with the number of lambdas enclosing it.
-        let mut stack = vec![(term, 0_usize)];
+        // Each term is paired with the number of lambdas enclosing it, or with
+        // `None` when its variables are not scope-checked.
+        let mut stack = vec![(term, Some(0_u64))];
 
         while let Some((term, depth)) = stack.pop() {
             match term {
                 Term::Var(name) => {
-                    let index = usize::from(name.index);
+                    let index = name.index.word();
 
-                    if index == 0 || index > depth {
+                    if depth.is_some_and(|depth| index == 0 || index > depth) {
                         return Err(Error::OpenTermEvaluated(term.clone()));
                     }
                 }
-                Term::Lambda { body, .. } => stack.push((body.as_ref(), depth + 1)),
+                Term::Lambda { body, .. } => {
+                    stack.push((body.as_ref(), depth.map(|depth| depth + 1)))
+                }
                 Term::Delay(body) | Term::Force(body) => stack.push((body.as_ref(), depth)),
                 Term::Apply { function, argument } => {
                     stack.push((function.as_ref(), depth));
                     stack.push((argument.as_ref(), depth));
                 }
                 Term::Constr { fields, .. } => {
+                    let depth = depth.filter(|_| scope_case_constr);
+
                     stack.extend(fields.iter().map(|field| (field, depth)));
                 }
                 Term::Case { constr, branches } => {
+                    let depth = depth.filter(|_| scope_case_constr);
+
                     stack.push((constr.as_ref(), depth));
                     stack.extend(branches.iter().map(|branch| (branch, depth)));
                 }
@@ -714,13 +727,14 @@ mod tests {
 
     #[test]
     fn open_terms_rejected_before_evaluation() {
+        use super::runtime::{DIJKSTRA_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION};
         use crate::ast::DeBruijn;
 
-        let var = |index: usize| {
+        let var = |index: u64| {
             Term::Var(
                 NamedDeBruijn {
                     text: "x".to_string(),
-                    index: DeBruijn::new(index),
+                    index: DeBruijn::from_word(index),
                 }
                 .into(),
             )
@@ -733,45 +747,114 @@ mod tests {
             .into(),
             body: body.into(),
         };
+        let unit = || Term::Constant(Constant::Unit.into());
+        let untaken_branch = |branch: Term<NamedDeBruijn>| Term::Case {
+            constr: Term::Constr {
+                tag: 0,
+                fields: vec![],
+            }
+            .into(),
+            branches: vec![unit(), branch],
+        };
+        let eval = |term: Term<NamedDeBruijn>, protocol_major_version: u16| {
+            Program {
+                version: (1, 1, 0),
+                term,
+            }
+            .eval_version_with_protocol(
+                ExBudget::max(),
+                &Language::PlutusV3,
+                protocol_major_version,
+            )
+            .result()
+        };
 
-        // A free variable that evaluation would never reach: under a delay
-        // that is not forced, in an unused argument, in an untaken branch, or
-        // under a lambda that is never applied.
+        // A free variable that evaluation would never reach, outside of any
+        // constr or case: under a delay that is not forced, in an unused
+        // argument, or under a lambda that is never applied.
         for term in [
             Term::Delay(var(1).into()),
-            lambda(Term::integer(0.into())).apply(Term::Delay(var(1).into())),
+            lambda(unit()).apply(Term::Delay(var(1).into())),
+            lambda(var(1).apply(var(2))),
+            lambda(var(1).apply(var(1 << 32))),
+        ] {
+            for protocol_major_version in [VAN_ROSSEM_PROTOCOL_VERSION, DIJKSTRA_PROTOCOL_VERSION] {
+                assert!(
+                    matches!(
+                        eval(term.clone(), protocol_major_version),
+                        Err(Error::OpenTermEvaluated(_))
+                    ),
+                    "{} at {protocol_major_version}",
+                    term.to_pretty()
+                );
+            }
+        }
+
+        // Before Dijkstra the ledger does not scope-check inside constr and
+        // case, so a free variable there, with any index, only fails the
+        // program if evaluation reaches it (as checked against the Haskell
+        // ledger API at plutus 1b03c165).
+        for term in [
+            untaken_branch(var(1)),
+            untaken_branch(var(0)),
+            untaken_branch(var(1 << 32)),
+            untaken_branch(var(u64::MAX)),
             Term::Case {
                 constr: Term::Constr {
                     tag: 0,
+                    fields: vec![lambda(var(2))],
+                }
+                .into(),
+                branches: vec![lambda(unit())],
+            },
+            lambda(unit()).apply(lambda(Term::Constr {
+                tag: 0,
+                fields: vec![var(4)],
+            })),
+        ] {
+            assert_eq!(
+                eval(term.clone(), VAN_ROSSEM_PROTOCOL_VERSION),
+                Ok(unit()),
+                "{}",
+                term.to_pretty()
+            );
+            assert!(
+                matches!(
+                    eval(term.clone(), DIJKSTRA_PROTOCOL_VERSION),
+                    Err(Error::OpenTermEvaluated(_))
+                ),
+                "{}",
+                term.to_pretty()
+            );
+        }
+
+        // Evaluating one fails all the same.
+        for term in [
+            Term::Case {
+                constr: Term::Constr {
+                    tag: 1,
                     fields: vec![],
                 }
                 .into(),
-                branches: vec![Term::integer(0.into()), var(1)],
+                branches: vec![unit(), var(1 << 32)],
             },
-            lambda(var(1).apply(var(2))),
+            Term::Case {
+                constr: var(1).into(),
+                branches: vec![unit()],
+            },
         ] {
-            let program = Program {
-                version: (1, 1, 0),
-                term,
-            };
-
-            let source = program.to_pretty();
-
             assert!(
                 matches!(
-                    program.eval(ExBudget::max()).result(),
+                    eval(term.clone(), VAN_ROSSEM_PROTOCOL_VERSION),
                     Err(Error::OpenTermEvaluated(_))
                 ),
-                "{source}"
+                "{}",
+                term.to_pretty()
             );
         }
 
         // Closed, for comparison.
-        let program = Program {
-            version: (1, 1, 0),
-            term: lambda(var(1)),
-        };
-        assert!(program.eval(ExBudget::max()).result().is_ok());
+        assert!(eval(lambda(var(1)), DIJKSTRA_PROTOCOL_VERSION).is_ok());
     }
 
     #[test]
@@ -954,6 +1037,116 @@ mod tests {
                 result.result()
             );
             assert_eq!(result.cost(), cost);
+        }
+    }
+
+    #[test]
+    fn scope_checked_like_the_ledger_at_van_rossem() {
+        use super::runtime::VAN_ROSSEM_PROTOCOL_VERSION;
+        use crate::{ast::DeBruijn, data::Data};
+
+        // Plutus V3 scripts as the Haskell ledger API serialises them (flat,
+        // without the CBOR wrapper), each a lambda over its script context, with
+        // what the ledger gives them at protocol version 11 applied to
+        // `Constr 0 []`: whether they return unit, and their cost (plutus
+        // 1b03c165, `mkTermToEvaluate` and `evaluateTerm counting`). A free
+        // variable fails the script only if it is evaluated, before the step
+        // that evaluates it is charged.
+        let cases = [
+            // case (constr 0 [\y -> x]) [\f -> ()], with x free
+            (
+                "free var under a lambda in a constr field",
+                "010100298009001a4931",
+                true,
+                128100,
+                900,
+            ),
+            (
+                "free var as a constr field",
+                "01010029800801249301",
+                false,
+                100,
+                100,
+            ),
+            (
+                "free var in an untaken case branch",
+                "010100298005268011",
+                true,
+                96100,
+                700,
+            ),
+            (
+                "free var in the taken case branch",
+                "010100298015268011",
+                false,
+                100,
+                100,
+            ),
+            (
+                "free var as the case scrutinee",
+                "01010029002a4c01",
+                false,
+                100,
+                100,
+            ),
+            (
+                "index 2^32 in an untaken case branch",
+                "01010029800526840404040081",
+                true,
+                96100,
+                700,
+            ),
+            (
+                "index 2^64-1 in an untaken case branch",
+                "0101002980052687fffffffffffffffff809",
+                true,
+                96100,
+                700,
+            ),
+            (
+                "index 0 in an untaken case branch",
+                "010100298005268001",
+                true,
+                96100,
+                700,
+            ),
+            (
+                "free var in a constr under an unapplied lambda",
+                "010100232498a00200a1",
+                true,
+                112100,
+                800,
+            ),
+        ];
+
+        for (name, flat, returns_unit, cpu, mem) in cases {
+            let bytes = hex::decode(flat).unwrap();
+            let program = Program::<DeBruijn>::from_flat(&bytes).unwrap();
+
+            assert_eq!(program.to_flat().unwrap(), bytes, "{name}");
+
+            let result = Program::<NamedDeBruijn>::from(program)
+                .apply_data(Data::constr(0, vec![]))
+                .eval_version_with_protocol(
+                    ExBudget::max(),
+                    &Language::PlutusV3,
+                    VAN_ROSSEM_PROTOCOL_VERSION,
+                );
+            let cost = result.cost();
+
+            if returns_unit {
+                assert_eq!(
+                    result.result(),
+                    Ok(Term::Constant(Constant::Unit.into())),
+                    "{name}"
+                );
+            } else {
+                assert!(
+                    matches!(result.result(), Err(Error::OpenTermEvaluated(_))),
+                    "{name}"
+                );
+            }
+            assert_eq!((cost.cpu, cost.mem), (cpu, mem), "{name}");
         }
     }
 

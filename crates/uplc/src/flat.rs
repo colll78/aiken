@@ -967,7 +967,7 @@ impl Binder<'_> for NamedDeBruijn {
 
 impl Encode for DeBruijn {
     fn encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
-        usize::from(*self).encode(e)?;
+        encode_word64(self.word(), e);
 
         Ok(())
     }
@@ -975,7 +975,7 @@ impl Encode for DeBruijn {
 
 impl Decode<'_> for DeBruijn {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        Ok(decode_usize(d)?.into())
+        Ok(DeBruijn::from_word(decode_word64(d)?))
     }
 }
 

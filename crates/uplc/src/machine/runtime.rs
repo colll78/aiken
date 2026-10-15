@@ -67,6 +67,7 @@ pub const VALENTINE_PROTOCOL_VERSION: u16 = 8;
 pub const CHANG_PROTOCOL_VERSION: u16 = 9;
 pub const PLOMIN_PROTOCOL_VERSION: u16 = 10;
 pub const VAN_ROSSEM_PROTOCOL_VERSION: u16 = 11;
+pub const DIJKSTRA_PROTOCOL_VERSION: u16 = 12;
 
 /// Ledger builtin semantics variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
