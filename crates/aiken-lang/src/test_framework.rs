@@ -680,28 +680,26 @@ impl Prng {
 
         Prng::Seeded {
             choices: vec![],
-            uplc: Data::constr(
+            uplc: plutus_data(Data::constr(
                 Prng::SEEDED,
                 vec![
                     Data::bytestring(digest.to_vec()), // Prng's seed
                     Data::bytestring(vec![]),          // Random choices
                 ],
-            )
-            .into(),
+            )),
         }
     }
 
     /// Construct a Pseudo-random number generator from a pre-defined list of choices.
     pub fn from_choices(choices: &[u8]) -> Prng {
         Prng::Replayed {
-            uplc: Data::constr(
+            uplc: plutus_data(Data::constr(
                 Prng::REPLAYED,
                 vec![
                     Data::integer(choices.len().into()),
                     Data::bytestring(choices.iter().rev().cloned().collect::<Vec<_>>()),
                 ],
-            )
-            .into(),
+            )),
             choices: choices.to_vec(),
         }
     }
@@ -743,7 +741,7 @@ impl Prng {
                 {
                     return Prng::Seeded {
                         choices: choices.to_vec(),
-                        uplc: Data::constr(
+                        uplc: plutus_data(Data::constr(
                             Prng::SEEDED,
                             vec![
                                 Data::BoundedBytes(bytes.to_owned()),
@@ -751,8 +749,7 @@ impl Prng {
                                 // accumulate ALL choices ever made.
                                 Data::bytestring(vec![]),
                             ],
-                        )
-                        .into(),
+                        )),
                     };
                 }
 
@@ -761,7 +758,7 @@ impl Prng {
                 {
                     return Prng::Replayed {
                         choices: choices.to_vec(),
-                        uplc: cst.into(),
+                        uplc: plutus_data(cst.clone()),
                     };
                 }
             }
@@ -777,7 +774,7 @@ impl Prng {
                 && constr.fields.len() == 1
                 && let [new_seed, value] = elems.iter().collect::<Vec<_>>()[..]
             {
-                return Some((as_prng(new_seed), value.into()));
+                return Some((as_prng(new_seed), plutus_data(value.clone())));
             }
 
             // May occurs when replaying a fuzzer from a shrinked sequence of
@@ -1710,6 +1707,13 @@ pub struct BenchmarkResult {
 
 unsafe impl Send for BenchmarkResult {}
 unsafe impl Sync for BenchmarkResult {}
+
+/// A `Data` as a `PlutusData`. Fuzzers are evaluated at protocol version 11,
+/// where `constrData` only takes 64-bit constructor indices, so every `Data`
+/// they yield fits.
+fn plutus_data(data: Data) -> PlutusData {
+    PlutusData::try_from(data).expect("constructor index fits in 64 bits")
+}
 
 #[cfg(test)]
 mod test {

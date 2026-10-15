@@ -1351,9 +1351,8 @@ impl DefaultFunction {
                 let i = args[0].unwrap_integer()?;
                 let l = args[1].unwrap_data_list()?;
 
-                let i: u64 = i.try_into().map_err(|_| Error::OverflowError)?;
-
-                let constr_data = Constr::new(i, Array::from_data_list(l.clone()));
+                // Any integer, unless unlifting bounded it to a 64-bit word.
+                let constr_data = Constr::with_index(i, Array::from_data_list(l.clone()));
 
                 let value = Value::data(Data::Constr(constr_data));
 
@@ -1409,12 +1408,7 @@ impl DefaultFunction {
                     let constant = Constant::ProtoPair(
                         Type::Integer,
                         Type::List(Type::Data.into()),
-                        Constant::Integer(
-                            convert_tag_to_constr(c.tag)
-                                .unwrap_or_else(|| c.any_constructor.unwrap())
-                                .into(),
-                        )
-                        .into(),
+                        Constant::Integer(c.constr_index().into()).into(),
                         Constant::ProtoList(Type::Data, c.fields.as_data_list().clone()).into(),
                     );
 

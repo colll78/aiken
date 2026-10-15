@@ -389,11 +389,8 @@ peg::parser! {
           = "\"" body:$(("\\" [_] / [^ '"' | '\\'])*) "\"" {? read_string_literal(body) }
 
         rule data() -> Data
-          = _* "Constr" _+ t:decimal() _+ fs:plutus_list() {?
-            Ok(Data::constr(
-                u64::try_from(t).or(Err("tag"))?,
-                fs,
-            ))
+          = _* "Constr" _+ t:big_number() _+ fs:plutus_list() {
+            Data::constr_with_index(&t, fs)
           }
           / _* "Map" _+ kvps:plutus_key_value_pairs() {
             Data::map(kvps)
@@ -662,6 +659,28 @@ mod tests {
             super::program(uplc).unwrap().term,
             Term::Constant(Constant::Data(Data::bytestring(vec![0xAF, 0x00])).into(),)
         );
+    }
+
+    #[test]
+    fn parse_data_constr_with_any_integer_index() {
+        // As Plutus' parser reads them; only `constrData` builds the indices
+        // outside 64 bits on chain.
+        for index in ["0", "18446744073709551615", "18446744073709551616", "-1"] {
+            let uplc = format!("(program 1.0.0 (con data (Constr {index} [I 1])))");
+            let index = index.parse::<num_bigint::BigInt>().unwrap();
+
+            assert_eq!(
+                super::program(&uplc).unwrap().term,
+                Term::Constant(
+                    Constant::Data(Data::constr_with_index(
+                        &index,
+                        vec![Data::integer(1.into())]
+                    ))
+                    .into()
+                ),
+                "{index}"
+            );
+        }
     }
 
     #[test]

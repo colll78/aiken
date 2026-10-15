@@ -1151,6 +1151,434 @@ mod tests {
     }
 
     #[test]
+    fn data_like_the_ledger_before_and_at_van_rossem() {
+        use super::runtime::{PLOMIN_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION};
+        use crate::{ast::DeBruijn, builtins::DefaultFunction};
+
+        // Plutus V3 programs (flat, without the CBOR wrapper) with what the
+        // Haskell ledger API makes of them at protocol versions 10 and 11: the
+        // result, or none if evaluation fails, and the cost (plutus 1b03c165,
+        // `mkTermToEvaluate` and `evaluateTerm counting`).
+        //
+        // Before protocol version 11, `constrData` takes any integer as the
+        // index, which the Data builtins then handle like any other; from it,
+        // only a 64-bit word. `serialiseData` encodes the value, choosing tags
+        // and integer encodings afresh, and `equalsData` compares integers by
+        // value, however the Data constants they are given are encoded.
+        let cases = [
+            (
+                "constrData 2^64",
+                "0101003374a904040404040404040400225eb801",
+                [
+                    (
+                        Some("(con data (Constr 18446744073709551616 []))"),
+                        102251,
+                        632,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "constrData -1",
+                "0101003374a9000a5eb801",
+                [
+                    (Some("(con data (Constr -1 []))"), 102251, 632),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "constrData 2^64-1",
+                "0101003374a907f7fffffffffffffff81a5eb801",
+                [
+                    (
+                        Some("(con data (Constr 18446744073709551615 []))"),
+                        102251,
+                        632,
+                    ),
+                    (
+                        Some("(con data (Constr 18446744073709551615 []))"),
+                        102251,
+                        632,
+                    ),
+                ],
+            ),
+            (
+                "serialiseData constrData 2^64",
+                "010100376666e9520808080808080808080044bd7001",
+                [
+                    (
+                        Some("(con bytestring #d86682c24901000000000000000080)"),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData -1",
+                "010100376666e9520014bd7001",
+                [
+                    (Some("(con bytestring #d866822080)"), 1943005, 840),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData -2^64",
+                "010100376666e9520ffffffffffffffffff034bd7001",
+                [
+                    (
+                        Some("(con bytestring #d866823bffffffffffffffff80)"),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData -2^64-1",
+                "010100376666e9520818080808080808080044bd7001",
+                [
+                    (
+                        Some("(con bytestring #d86682c34901000000000000000080)"),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData 2^200 [I 1]",
+                "010100376666e952080808080808080808080808080808080808080808080808080808080204bd708101010001",
+                [
+                    (
+                        Some(
+                            "(con bytestring #d86682c2581a01000000000000000000000000000000000000000000000000009f01ff)",
+                        ),
+                        3009565,
+                        850,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData 2^520",
+                "010100376666e95208080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080084bd7001",
+                [
+                    (
+                        Some(
+                            "(con bytestring #d86682c2584201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080)",
+                        ),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData listData [constrData 2^64]",
+                "01010037666e9ccd5d019ba5482020202020202020200112f5c097ae01",
+                [
+                    (
+                        Some("(con bytestring #9fd86682c24901000000000000000080ff)"),
+                        3014467,
+                        1612,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "fstPair unConstrData constrData 2^64",
+                "01010035573a6ea8cdd2a410101010101010101000897ae001",
+                [
+                    (Some("(con integer 18446744073709551616)"), 364734, 1296),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "fstPair unConstrData constrData -5",
+                "01010035573a6ea8cdd2a401297ae001",
+                [(Some("(con integer -5)"), 364734, 1296), (None, 100, 100)],
+            ),
+            (
+                "equalsData constrData 2^64 itself",
+                "0101003375e66e9520808080808080808080044bd7019ba5482020202020202020200112f5c1",
+                [(Some("(con bool True)"), 1259666, 1465), (None, 100, 100)],
+            ),
+            (
+                "equalsData constrData 2^64 vs 0",
+                "0101003375e66e9520808080808080808080044bd7019ba5480012f5c1",
+                [(Some("(con bool False)"), 1259666, 1465), (None, 100, 100)],
+            ),
+            (
+                "equalsData constrData -1 vs 2^64-1",
+                "0101003375e66e9520014bd7019ba5483fbfffffffffffffffc0d2f5c1",
+                [(Some("(con bool False)"), 1259666, 1465), (None, 100, 100)],
+            ),
+            (
+                "chooseData constrData 2^64",
+                "010100333333574866e9520808080808080808080044bd702400490022400c9004240141",
+                [(Some("(con integer 1)"), 404626, 1964), (None, 100, 100)],
+            ),
+            (
+                "serialiseData constrData 127",
+                "010100376666e9520fe014bd7001",
+                [
+                    (Some("(con bytestring #d9057880)"), 1943005, 840),
+                    (Some("(con bytestring #d9057880)"), 1943005, 840),
+                ],
+            ),
+            (
+                "serialiseData constrData 128",
+                "010100376666e952080024bd7001",
+                [
+                    (Some("(con bytestring #d86682188080)"), 1943005, 840),
+                    (Some("(con bytestring #d86682188080)"), 1943005, 840),
+                ],
+            ),
+            (
+                "serialiseData 102-form index 0",
+                "0101003766980105d8668200800001",
+                [
+                    (Some("(con bytestring #d87980)"), 1856854, 408),
+                    (Some("(con bytestring #d87980)"), 1856854, 408),
+                ],
+            ),
+            (
+                "serialiseData 102-form index 6",
+                "0101003766980105d8668206800001",
+                [
+                    (Some("(con bytestring #d87f80)"), 1856854, 408),
+                    (Some("(con bytestring #d87f80)"), 1856854, 408),
+                ],
+            ),
+            (
+                "serialiseData 102-form index 127",
+                "0101003766980106d86682187f800001",
+                [
+                    (Some("(con bytestring #d9057880)"), 1856854, 408),
+                    (Some("(con bytestring #d9057880)"), 1856854, 408),
+                ],
+            ),
+            (
+                "serialiseData 102-form indefinite pair",
+                "0101003766980105d8668200800001",
+                [
+                    (Some("(con bytestring #d87980)"), 1856854, 408),
+                    (Some("(con bytestring #d87980)"), 1856854, 408),
+                ],
+            ),
+            (
+                "serialiseData bignum 1",
+                "0101003766980103c241010001",
+                [
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData bignum 1 padded",
+                "0101003766980104c24200010001",
+                [
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData bignum 0 empty",
+                "0101003766980102c2400001",
+                [
+                    (Some("(con bytestring #00)"), 2070166, 410),
+                    (Some("(con bytestring #00)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData negative bignum -1",
+                "0101003766980103c341000001",
+                [
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData negative bignum -1 empty",
+                "0101003766980102c3400001",
+                [
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData bignum 2^64",
+                "010100376698010bc2490100000000000000000001",
+                [
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                ],
+            ),
+            (
+                "serialiseData bignum 2^64 padded",
+                "010100376698010cc24a000100000000000000000001",
+                [
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                ],
+            ),
+            (
+                "serialiseData bignum 2^64-1",
+                "010100376698010ac248ffffffffffffffff0001",
+                [
+                    (Some("(con bytestring #1bffffffffffffffff)"), 2070166, 410),
+                    (Some("(con bytestring #1bffffffffffffffff)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData non-minimal int 1",
+                "0101003766980101010001",
+                [
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData indefinite bytes",
+                "010100376698010241010001",
+                [
+                    (Some("(con bytestring #4101)"), 2070166, 410),
+                    (Some("(con bytestring #4101)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData indefinite map",
+                "0101003766980104bf0102ff0001",
+                [
+                    (Some("(con bytestring #a10102)"), 3989974, 428),
+                    (Some("(con bytestring #a10102)"), 3989974, 428),
+                ],
+            ),
+            (
+                "equalsData bignum -1 vs -1",
+                "0101003375e98103c34100004c0101200001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum -1 empty vs -1",
+                "0101003375e98102c340004c0101200001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum -6 vs -5",
+                "0101003375e98103c34105004c0101240001",
+                [
+                    (Some("(con bool False)"), 1114643, 601),
+                    (Some("(con bool False)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum -6 vs -6",
+                "0101003375e98103c34105004c0101250001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum 1 padded vs 1",
+                "0101003375e98104c2420001004c0101010001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData 102-form 0 vs 121",
+                "0101003375e98105d866820080004c0103d879800001",
+                [
+                    (Some("(con bool True)"), 1087364, 601),
+                    (Some("(con bool True)"), 1087364, 601),
+                ],
+            ),
+            (
+                "unIData negative bignum -1 empty",
+                "010100375a980102c3400001",
+                [
+                    (Some("(con integer -1)"), 68844, 432),
+                    (Some("(con integer -1)"), 68844, 432),
+                ],
+            ),
+        ];
+
+        for (name, flat, outcomes) in cases {
+            let bytes = hex::decode(flat).unwrap();
+            let program =
+                Program::<NamedDeBruijn>::from(Program::<DeBruijn>::from_flat(&bytes).unwrap());
+
+            for (protocol_version, (expected, cpu, mem)) in
+                [PLOMIN_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION]
+                    .into_iter()
+                    .zip(outcomes)
+            {
+                let result = program.clone().eval_version_with_protocol(
+                    ExBudget::max(),
+                    &Language::PlutusV3,
+                    protocol_version,
+                );
+                let cost = result.cost();
+
+                match expected {
+                    Some(expected) => {
+                        let expected =
+                            crate::parser::program(&format!("(program 1.1.0 {expected})")).unwrap();
+                        let expected = Program::<NamedDeBruijn>::try_from(expected).unwrap().term;
+
+                        assert_eq!(
+                            result.result(),
+                            Ok(expected),
+                            "{name} at {protocol_version}"
+                        );
+                    }
+                    None => assert!(
+                        matches!(
+                            result.result(),
+                            Err(Error::IntegerOutOfWord64Range(
+                                DefaultFunction::ConstrData,
+                                _
+                            ))
+                        ),
+                        "{name} at {protocol_version}"
+                    ),
+                }
+                assert_eq!(
+                    (cost.cpu, cost.mem),
+                    (cpu, mem),
+                    "{name} at {protocol_version}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn builtin_arguments_unlift_like_plutus() {
         let eval = |language: &Language, term: &str| {
             let version = match language {

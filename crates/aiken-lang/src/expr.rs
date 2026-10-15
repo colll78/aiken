@@ -949,15 +949,15 @@ impl UntypedExpr {
     ) -> Result<Self, String> {
         Self::reify_with(data_types, cst, tipo, |data_types, cst, tipo| match cst {
             uplc::ast::Constant::Data(data) => {
-                UntypedExpr::do_reify_data(data_types, data.into(), tipo)
+                UntypedExpr::do_reify_data(data_types, plutus_data(data)?, tipo)
             }
 
             uplc::ast::Constant::Integer(i) => {
-                UntypedExpr::do_reify_data(data_types, Data::integer(i).into(), tipo)
+                UntypedExpr::do_reify_data(data_types, plutus_data(Data::integer(i))?, tipo)
             }
 
             uplc::ast::Constant::ByteString(bytes) => {
-                UntypedExpr::do_reify_data(data_types, Data::bytestring(bytes).into(), tipo)
+                UntypedExpr::do_reify_data(data_types, plutus_data(Data::bytestring(bytes))?, tipo)
             }
 
             uplc::ast::Constant::ProtoList(_, args) => match tipo.deref() {
@@ -1413,12 +1413,11 @@ impl UntypedExpr {
 
                     UntypedExpr::do_reify_data(
                         data_types,
-                        Data::list(
+                        plutus_data(Data::list(
                             kvs.iter()
                                 .map(|(k, v)| Data::list(vec![k.into(), v.into()]))
                                 .collect(),
-                        )
-                        .into(),
+                        ))?,
                         tipo,
                     )
                 }
@@ -1724,6 +1723,12 @@ impl UntypedExpr {
             return_annotation: None,
         }
     }
+}
+
+/// A `Data` as a `PlutusData`, which cannot hold a constructor index that
+/// doesn't fit in 64 bits.
+fn plutus_data(data: Data) -> Result<PlutusData, String> {
+    PlutusData::try_from(data).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -1231,12 +1231,12 @@ mod tests {
 
     #[test]
     fn script_context_simple_send() {
-        let datum = Some(Data::constr(0, Vec::new()).into());
+        let datum = Some(Data::constr(0, Vec::new()).try_into().unwrap());
 
         let redeemer = Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: Data::constr(0, Vec::new()).into(),
+            data: Data::constr(0, Vec::new()).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1273,7 +1273,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Mint,
             index: 1,
-            data: Data::integer(42.into()).into(),
+            data: Data::integer(42.into()).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1333,7 +1333,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Propose,
             index: 3,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1408,7 +1408,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Propose,
             index: 0,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1457,7 +1457,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Cert,
             index: 20,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1527,7 +1527,9 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Vote,
             index: 0,
-            data: Data::constr(0, vec![Data::integer(42.into())]).into(),
+            data: Data::constr(0, vec![Data::integer(42.into())])
+                .try_into()
+                .unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1580,7 +1582,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Reward,
             index: 0,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,

@@ -2,10 +2,7 @@ use crate::{
     ast::{Constant, Data, Program, Term, Type},
     data::Constr,
     flat::Binder,
-    machine::{
-        runtime::{Compressable, convert_tag_to_constr},
-        value::from_pallas_bigint,
-    },
+    machine::{runtime::Compressable, value::from_pallas_bigint},
 };
 use pretty::RcDoc;
 use std::ascii::escape_default;
@@ -365,15 +362,9 @@ impl Constant {
     // This feels a little awkward here; not sure if it should be upstreamed to pallas
     fn to_doc_list_plutus_data(data: &Data) -> RcDoc<'_, ()> {
         match data {
-            Data::Constr(Constr {
-                tag,
-                any_constructor,
-                fields,
-            }) => RcDoc::text("Constr")
+            Data::Constr(constr @ Constr { fields, .. }) => RcDoc::text("Constr")
                 .append(RcDoc::space())
-                .append(RcDoc::as_string(
-                    convert_tag_to_constr(*tag).unwrap_or_else(|| any_constructor.unwrap()),
-                ))
+                .append(RcDoc::as_string(constr.constr_index()))
                 .append(RcDoc::space())
                 .append(RcDoc::text("["))
                 .append(RcDoc::intersperse(

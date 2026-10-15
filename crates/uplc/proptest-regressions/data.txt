@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 567fe7a3b6c1d00b9209a70f79a87429bf681f08935d9c1bce8aa103beee6183 # shrinks to data = Map(Def([(BigInt(Int(Int(Int { neg: false, val: 0 }))), Map(Def([(Constr(Constr { tag: 1378, any_constructor: None, fields: Def([BigInt(BigNInt(BoundedBytes([25, 139, 184, 132, 106, 121, 235]))), BigInt(BigUInt(BoundedBytes([254, 75, 140, 239, 30, 21, 240, 9, 145, 79, 198, 177, 176, 138, 210, 147, 213]))), BigInt(Int(Int(Int { neg: false, val: 3299609676425397696 })))]) }), Array(Indef([BoundedBytes(BoundedBytes([210, 67, 120, 67, 60, 18, 164, 48, 39, 182, 183, 214, 123, 15, 155, 191, 33, 63, 4, 169, 227, 170, 82, 56]))])))])))]))
+cc 9df4c6b8ea579e4fbe494286839a7b14e273abee5064ff8e8810356b094f742e # shrinks to pallas = Constr(Constr { tag: 121, any_constructor: None, fields: Def([Constr(Constr { tag: 121, any_constructor: None, fields: Def([BigInt(BigNInt(BoundedBytes([])))]) })]) })
+cc 1dd28be97b2a804c7379148417961a5804ea8639a29eb22eda10c76d662cfa6c # shrinks to data = Array(Def([Constr(Constr { tag: 121, any_constructor: None, fields: Def([BigInt(BigUInt(BoundedBytes([0, 0, 0, 0, 0, 0, 0, 0, 0])))]) })]))
+cc 37ddfdeb8b8eef0de7c5fe93a50b5bfaa9570d8bbc3f7111666302ac7219f1b8 # shrinks to left = Constr(Constr { tag: 121, any_constructor: None, fields: Def([]) }), right = Constr(Constr { tag: 102, any_constructor: Some(-1), fields: Def([]) })

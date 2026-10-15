@@ -449,7 +449,9 @@ impl<T> TryInto<PlutusData> for Term<T> {
     fn try_into(self) -> Result<PlutusData, String> {
         match self {
             Term::Constant(rc) => match &*rc {
-                Constant::Data(data) => Ok(data.into()),
+                Constant::Data(data) => data
+                    .try_into()
+                    .map_err(|e: crate::data::ConstrIndexOutOfRange| e.to_string()),
                 _ => Err("not a data".to_string()),
             },
             _ => Err("not a data".to_string()),
