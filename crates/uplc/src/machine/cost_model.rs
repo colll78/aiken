@@ -6,9 +6,10 @@ use pallas_primitives::conway::Language;
 use std::collections::HashMap;
 use strum::{Display, EnumIter};
 
-// Existing default cost models use a large sentinel for builtins that are not
-// available in a language version.
-const UNAVAILABLE_BUILTIN_COST_PLACEHOLDER: i64 = 30000000000;
+/// What a cost-model parameter the ledger does not supply costs: Plutus pads
+/// the parameters with `maxBound` (`tagWithParamNames`), which no budget can
+/// afford, and budgeting saturates.
+const UNAVAILABLE_BUILTIN_COST_PLACEHOLDER: i64 = i64::MAX;
 
 /// Can be negative
 #[derive(Debug, Clone, PartialEq, Eq, Copy, serde::Serialize)]
@@ -2864,20 +2865,16 @@ fn initialize_cost_model_with_semantics(
 ) -> CostModel {
     use ParamName::*;
 
-    let cost_map: HashMap<ParamName, i64> = match language {
-        Language::PlutusV1 => ParamName::V1
-            .into_iter()
-            .zip(costs.iter().copied())
-            .collect(),
-        Language::PlutusV2 => ParamName::V2
-            .into_iter()
-            .zip(costs.iter().copied())
-            .collect(),
-        Language::PlutusV3 => ParamName::V3
-            .into_iter()
-            .zip(costs.iter().copied())
-            .collect(),
+    let names = match language {
+        Language::PlutusV1 => &ParamName::V1[..],
+        Language::PlutusV2 => &ParamName::V2[..],
+        Language::PlutusV3 => &ParamName::V3[..],
     };
+
+    // Parameters past the end of `costs` are missing, and cost
+    // `UNAVAILABLE_BUILTIN_COST_PLACEHOLDER`.
+    let cost_map: HashMap<ParamName, i64> =
+        names.iter().copied().zip(costs.iter().copied()).collect();
 
     let get = |param: ParamName| {
         cost_map
@@ -4308,7 +4305,7 @@ impl TryFrom<u8> for StepKind {
 mod tests {
     use super::*;
     use crate::{
-        ast::{Constant, Data, Type},
+        ast::{Constant, Data, NamedDeBruijn, Program, Type},
         builtins::DefaultFunction,
         machine::{runtime::BuiltinSemantics, value::Value},
     };
@@ -4503,6 +4500,33 @@ mod tests {
             130 + 132 * 7,
             builtin_costs.remainder_integer.mem.cost(3, 7)
         );
+    }
+
+    #[test]
+    fn missing_parameters_cost_max_bound() {
+        // A PlutusV3 cost model that stops right before `dropList`'s parameters.
+        let costs = &BuiltinCosts::DEFAULT_V3[..302];
+        let cost_model = initialize_cost_model(&Language::PlutusV3, costs);
+
+        assert_eq!(
+            cost_model.builtin_costs.drop_list.cpu,
+            TwoArguments::LinearInX(LinearSize {
+                intercept: i64::MAX,
+                slope: i64::MAX,
+            })
+        );
+
+        // No budget affords a builtin costed at Plutus' `maxBound`.
+        let program: Program<NamedDeBruijn> = crate::parser::program(
+            "(program 1.1.0 [(force (builtin dropList)) (con integer 1) (con (list integer) [1])])",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        let result = program.eval_as(&Language::PlutusV3, costs, Some(&ExBudget::max()));
+
+        assert!(matches!(result.error(), Some(Error::OutOfExError(_))));
     }
 
     #[test]
