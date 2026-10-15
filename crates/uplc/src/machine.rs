@@ -597,6 +597,8 @@ impl Machine {
     }
 
     fn eval_builtin_app(&mut self, runtime: BuiltinRuntime) -> Result<Value, Error> {
+        runtime.unlift_arguments(self.semantics)?;
+
         let cost = runtime.to_ex_budget(&self.costs.builtin_costs, self.semantics)?;
 
         self.spend_budget(cost)?;
@@ -952,6 +954,249 @@ mod tests {
                 result.result()
             );
             assert_eq!(result.cost(), cost);
+        }
+    }
+
+    #[test]
+    fn builtin_arguments_unlift_like_plutus() {
+        let eval = |language: &Language, term: &str| {
+            let version = match language {
+                Language::PlutusV3 => "1.1.0",
+                _ => "1.0.0",
+            };
+            let program = crate::parser::program(&format!("(program {version} {term})")).unwrap();
+
+            Program::<NamedDeBruijn>::try_from(program)
+                .unwrap()
+                .eval_version_with_protocol(
+                    ExBudget::max(),
+                    language,
+                    super::VAN_ROSSEM_PROTOCOL_VERSION,
+                )
+        };
+        let bound = BigInt::from(2).pow(262143);
+        let scalar_bound = BigInt::from(2).pow(4095);
+        let bytes = |n: usize| format!("#{}", "00".repeat(n));
+        let miller_loop = "[(builtin bls12_381_millerLoop) (con bls12_381_G1_element 0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb) (con bls12_381_G2_element 0x93e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8)]";
+        let g1 = "(con bls12_381_G1_element 0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb)";
+
+        // Expected outcomes (`Err` naming the error) and costs from the
+        // reference evaluator (plutus 1b03c165): semantics variant E for
+        // PlutusV3 and D for PlutusV2. An argument that does not unlift fails
+        // the application once the builtin is saturated, before it is costed;
+        // a costing of 100/100 is the machine's startup cost alone.
+        let v3 = Language::PlutusV3;
+        let v2 = Language::PlutusV2;
+        type Case<'a> = (&'a Language, String, Result<(), &'a str>, i64, i64);
+
+        let cases: Vec<Case> = vec![
+            (
+                &v3,
+                format!("[(builtin addInteger) (con integer {}) (con integer 1)]", &bound - 1),
+                Ok(()),
+                1_901_208,
+                4697,
+            ),
+            (
+                &v3,
+                format!("[(builtin addInteger) (con integer {bound}) (con integer 1)]"),
+                Err("IntegerOutOfBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin lessThanInteger) (con integer {}) (con integer 1)]", -&bound - 1),
+                Err("IntegerOutOfBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin equalsInteger) (con integer {bound}) (con integer 1)]"),
+                Ok(()),
+                132_433,
+                601,
+            ),
+            (
+                &v2,
+                format!("[(builtin addInteger) (con integer {bound}) (con integer 1)]"),
+                Err("IntegerOutOfBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin appendByteString) (con bytestring {}) (con bytestring #)]", bytes(65536)),
+                Ok(()),
+                1_498_489,
+                8793,
+            ),
+            (
+                &v3,
+                format!("[(builtin appendByteString) (con bytestring {}) (con bytestring #)]", bytes(65537)),
+                Err("ByteStringTooLong"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin lengthOfByteString) (con bytestring {})]", bytes(65537)),
+                Ok(()),
+                70_200,
+                410,
+            ),
+            (
+                &v3,
+                "[(builtin consByteString) (con integer 256) (con bytestring #)]".to_string(),
+                Err("ByteStringConsNotAByte"),
+                100,
+                100,
+            ),
+            (
+                &v2,
+                "[(builtin consByteString) (con integer 256) (con bytestring #)]".to_string(),
+                Ok(()),
+                152_288,
+                602,
+            ),
+            (
+                &v3,
+                "[(builtin sliceByteString) (con integer 9223372036854775808) (con integer 1) (con bytestring #00)]".to_string(),
+                Err("IntegerOutOfInt64Range"),
+                100,
+                100,
+            ),
+            (
+                &v2,
+                "[(builtin shiftByteString) (con bytestring #00) (con integer 9223372036854775808)]".to_string(),
+                Err("IntegerOutOfInt64Range"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(force (builtin indexArray)) (con (array integer) [1]) (con integer 9223372036854775808)]".to_string(),
+                Err("IntegerOutOfInt64Range"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(builtin constrData) (con integer 18446744073709551615) (con (list data) [])]".to_string(),
+                Ok(()),
+                102_251,
+                632,
+            ),
+            (
+                &v3,
+                "[(builtin constrData) (con integer 18446744073709551616) (con (list data) [])]".to_string(),
+                Err("IntegerOutOfWord64Range"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(builtin replicateByte) (con integer 1) (con integer 256)]".to_string(),
+                Err("OutsideByteBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(builtin integerToByteString) (con bool True) (con integer -1) (con integer 0)]".to_string(),
+                Err("IntegerToByteStringNegativeSize"),
+                1_322_707,
+                101,
+            ),
+            (
+                &v3,
+                format!("[(builtin writeBits) (con bytestring {}) (con (list integer) [0]) (con bool True)]", bytes(4096)),
+                Ok(()),
+                412_093,
+                1312,
+            ),
+            (
+                &v3,
+                format!("[(builtin writeBits) (con bytestring {}) (con (list integer) [0]) (con bool True)]", bytes(4097)),
+                Err("ByteStringTooLong"),
+                300_093,
+                613,
+            ),
+            (
+                &v3,
+                "[(builtin writeBits) (con bytestring #00) (con (list bool) []) (con bool True)]".to_string(),
+                Err("TypeMismatch"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin bls12_381_G1_scalarMul) (con integer {}) {g1}]", &scalar_bound - 1),
+                Ok(()),
+                77_080_658,
+                618,
+            ),
+            (
+                &v3,
+                format!("[(builtin bls12_381_G1_scalarMul) (con integer {scalar_bound}) {g1}]"),
+                Err("MsmScalarOutOfBounds"),
+                77_000_658,
+                118,
+            ),
+            // The second argument is evaluated, and charged for, before the
+            // first one fails to unlift.
+            (
+                &v3,
+                format!("[(builtin bls12_381_mulMlResult) (con unit ()) {miller_loop}]"),
+                Err("TypeMismatch"),
+                254_006_373,
+                172,
+            ),
+            (
+                &v3,
+                "[(builtin addInteger) (lam x x) (con integer 1)]".to_string(),
+                Err("NotAConstant"),
+                100,
+                100,
+            ),
+            // A partial application is never unlifted.
+            (
+                &v3,
+                "[(lam f (con integer 1)) [(builtin addInteger) (con string \"x\")]]".to_string(),
+                Ok(()),
+                96_100,
+                700,
+            ),
+            // Polymorphic constants are checked by the builtin, once costed.
+            (
+                &v3,
+                "[(force (builtin headList)) (con integer 1)]".to_string(),
+                Err("ListTypeMismatch"),
+                83_250,
+                132,
+            ),
+            (
+                &v3,
+                "[(force (builtin indexArray)) (con (list integer) [1]) (con integer 0)]".to_string(),
+                Err("ArrayTypeMismatch"),
+                232_110,
+                132,
+            ),
+        ];
+
+        for (language, term, expected, cpu, mem) in cases {
+            let term_prefix = &term[..term.len().min(80)];
+            let result = eval(language, &term);
+
+            match (expected, result.result()) {
+                (Ok(()), Ok(_)) => {}
+                (Err(name), Err(e)) if format!("{e:?}").starts_with(name) => {}
+                (expected, actual) => {
+                    panic!("{term_prefix}: expected {expected:?}, got {actual:?}")
+                }
+            }
+            assert_eq!(result.cost(), ExBudget { mem, cpu }, "{term_prefix}");
         }
     }
 

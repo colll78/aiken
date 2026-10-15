@@ -13,7 +13,7 @@ use bitvec::{order::Msb0, vec::BitVec};
 use itertools::Itertools;
 use num_bigint::BigInt;
 use num_integer::Integer;
-use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
+use num_traits::{FromPrimitive, Signed, Zero};
 use once_cell::sync::Lazy;
 use pallas_primitives::conway::Language;
 use std::{mem::size_of, rc::Rc};
@@ -29,8 +29,9 @@ static SCALAR_PERIOD: Lazy<BigInt> = Lazy::new(|| {
     )
 });
 
-// The maximum size of a scalar for the BLS12-381 multiScalarMul functions is
-// 512 bytes = 4096 bits, so valid scalars lie in [-(2^4095), 2^4095 - 1].
+// The maximum size of a scalar for the BLS12-381 multiScalarMul functions (and,
+// in semantics variants D and E, the scalarMul functions) is 512 bytes = 4096
+// bits, so valid scalars lie in [-(2^4095), 2^4095 - 1].
 // See PlutusCore.Crypto.BLS12_381.Bounds.
 static MSM_SCALAR_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 4095u32) - 1);
 
@@ -39,6 +40,20 @@ static MSM_SCALAR_LB: Lazy<BigInt> = Lazy::new(|| -(BigInt::from(1) << 4095u32))
 static EXP_MOD_INTEGER_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 8191u32) - 1);
 
 static EXP_MOD_INTEGER_LB: Lazy<BigInt> = Lazy::new(|| -(BigInt::from(1) << 8191u32));
+
+// The bounds of Plutus' `CInteger`, through which semantics variants D and E
+// unlift the operands of integer arithmetic and comparison.
+static BOUNDED_INTEGER_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 262143u32) - 1);
+
+static BOUNDED_INTEGER_LB: Lazy<BigInt> = Lazy::new(|| -(BigInt::from(1) << 262143u32));
+
+/// The bound of Plutus' `CByteString`, through which semantics variants D and
+/// E unlift most bytestring arguments.
+const BOUNDED_BYTE_STRING_MAXIMUM_LENGTH: usize = 65536;
+
+/// The longest input `writeBits` accepts in semantics variants D and E
+/// (Plutus' `Bitwise.maximumInputLength`).
+const WRITE_BITS_MAXIMUM_INPUT_LENGTH: usize = 4096;
 
 const BLST_P1_COMPRESSED_SIZE: usize = 48;
 
@@ -97,6 +112,16 @@ impl BuiltinSemantics {
 
     fn cons_byte_string_range_checks(self) -> bool {
         matches!(self, BuiltinSemantics::C | BuiltinSemantics::E)
+    }
+
+    /// Whether builtins bound their integer and bytestring arguments, as
+    /// Plutus' `CInteger` and `CByteString` do (`ensurableInteger` and
+    /// `ensurableByteString`, which agree on variants A to E). Over these
+    /// semantics, `writeBits` also limits the length of its input, scalar
+    /// multiplication the size of its scalar, and `constrData`, the shifts and
+    /// the rotations take machine-word operands.
+    fn bounds_arguments(self) -> bool {
+        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
     }
 
     /// Whether these are the semantics of protocol version 11 (Van Rossem)
@@ -160,6 +185,18 @@ impl BuiltinRuntime {
         Ok(())
     }
 
+    /// Checks that every argument of a saturated builtin can be unlifted to
+    /// what the builtin expects there. Plutus defers unlifting until the
+    /// builtin is saturated, and fails an application whose arguments do not
+    /// unlift before costing it.
+    pub fn unlift_arguments(&self, semantics: BuiltinSemantics) -> Result<(), Error> {
+        self.args.iter().enumerate().try_for_each(|(index, arg)| {
+            self.fun
+                .argument_unlifting(semantics, index)
+                .unlift(self.fun, arg)
+        })
+    }
+
     pub fn to_ex_budget(
         &self,
         costs: &BuiltinCosts,
@@ -172,6 +209,126 @@ impl BuiltinRuntime {
 impl From<DefaultFunction> for BuiltinRuntime {
     fn from(fun: DefaultFunction) -> Self {
         BuiltinRuntime::new(fun)
+    }
+}
+
+/// What a builtin accepts as one of its arguments, after the Haskell type
+/// Plutus unlifts that argument to; see `BuiltinRuntime::unlift_arguments`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unlift {
+    /// Any value at all (a type variable, or Plutus' `Opaque`).
+    Any,
+    /// Any constant (Plutus' `SomeConstant`), whose type the builtin itself
+    /// checks once it has been costed.
+    Constant,
+    Integer,
+    /// An integer in [-2^262143, 2^262143 - 1] (Plutus' `CInteger`).
+    BoundedInteger,
+    /// An integer in the signed 64-bit range (Plutus' `Int`).
+    Int,
+    /// An integer in [0, 255] (Plutus' `Word8`).
+    Word8,
+    /// An integer in the unsigned 64-bit range (Plutus' `Word64`).
+    Word64,
+    ByteString,
+    /// A bytestring of at most 65536 bytes (Plutus' `CByteString`).
+    BoundedByteString,
+    String,
+    Bool,
+    Unit,
+    Data,
+    Value,
+    Bls12_381G1Element,
+    Bls12_381G2Element,
+    Bls12_381MlResult,
+    ListOfIntegers,
+    ListOfData,
+    ListOfPairsOfData,
+    ListOfBls12_381G1Elements,
+    ListOfBls12_381G2Elements,
+}
+
+impl Unlift {
+    fn unlift(self, builtin: DefaultFunction, arg: &Value) -> Result<(), Error> {
+        match self {
+            Unlift::Any => Ok(()),
+            Unlift::Constant => arg.unwrap_constant().map(|_| ()),
+            Unlift::Integer => arg.unwrap_integer().map(|_| ()),
+            Unlift::BoundedInteger => {
+                let integer = arg.unwrap_integer()?;
+
+                if integer < &BOUNDED_INTEGER_LB || integer > &BOUNDED_INTEGER_UB {
+                    return Err(Error::IntegerOutOfBounds(builtin, integer.bits()));
+                }
+
+                Ok(())
+            }
+            Unlift::Int => int64_operand(builtin, arg.unwrap_integer()?).map(|_| ()),
+            Unlift::Word8 => {
+                let integer = arg.unwrap_integer()?;
+
+                if u8::try_from(integer).is_err() {
+                    return Err(match builtin {
+                        DefaultFunction::ConsByteString => {
+                            Error::ByteStringConsNotAByte(integer.clone())
+                        }
+                        _ => Error::OutsideByteBounds(integer.clone()),
+                    });
+                }
+
+                Ok(())
+            }
+            Unlift::Word64 => {
+                let integer = arg.unwrap_integer()?;
+
+                if u64::try_from(integer).is_err() {
+                    return Err(Error::IntegerOutOfWord64Range(builtin, integer.clone()));
+                }
+
+                Ok(())
+            }
+            Unlift::ByteString => arg.unwrap_byte_string().map(|_| ()),
+            Unlift::BoundedByteString => {
+                let bytes = arg.unwrap_byte_string()?;
+
+                if bytes.len() > BOUNDED_BYTE_STRING_MAXIMUM_LENGTH {
+                    return Err(Error::ByteStringTooLong {
+                        builtin,
+                        maximum: BOUNDED_BYTE_STRING_MAXIMUM_LENGTH,
+                        actual: bytes.len(),
+                    });
+                }
+
+                Ok(())
+            }
+            Unlift::String => arg.unwrap_string().map(|_| ()),
+            Unlift::Bool => arg.unwrap_bool().map(|_| ()),
+            Unlift::Unit => arg.unwrap_unit(),
+            Unlift::Data => arg.unwrap_data().map(|_| ()),
+            Unlift::Value => arg.unwrap_value().map(|_| ()),
+            Unlift::Bls12_381G1Element => arg.unwrap_bls12_381_g1_element().map(|_| ()),
+            Unlift::Bls12_381G2Element => arg.unwrap_bls12_381_g2_element().map(|_| ()),
+            Unlift::Bls12_381MlResult => arg.unwrap_bls12_381_ml_result().map(|_| ()),
+            Unlift::ListOfIntegers => unlift_list(arg, Type::Integer),
+            Unlift::ListOfData => unlift_list(arg, Type::Data),
+            Unlift::ListOfPairsOfData => {
+                unlift_list(arg, Type::Pair(Type::Data.into(), Type::Data.into()))
+            }
+            Unlift::ListOfBls12_381G1Elements => unlift_list(arg, Type::Bls12_381G1Element),
+            Unlift::ListOfBls12_381G2Elements => unlift_list(arg, Type::Bls12_381G2Element),
+        }
+    }
+}
+
+fn unlift_list(arg: &Value, element_type: Type) -> Result<(), Error> {
+    let constant = arg.unwrap_constant()?;
+
+    match constant {
+        Constant::ProtoList(r#type, _) if *r#type == element_type => Ok(()),
+        _ => Err(Error::TypeMismatch(
+            Type::List(element_type.into()),
+            constant.into(),
+        )),
     }
 }
 
@@ -492,6 +649,224 @@ impl DefaultFunction {
             | DefaultFunction::ValueData
             | DefaultFunction::UnValueData
             | DefaultFunction::ScaleValue => 0,
+        }
+    }
+
+    /// How the builtin unlifts its `index`-th argument under the given
+    /// semantics; see `Unlift`.
+    fn argument_unlifting(&self, semantics: BuiltinSemantics, index: usize) -> Unlift {
+        let (integer, byte_string) = if semantics.bounds_arguments() {
+            (Unlift::BoundedInteger, Unlift::BoundedByteString)
+        } else {
+            (Unlift::Integer, Unlift::ByteString)
+        };
+
+        match (self, index) {
+            (
+                DefaultFunction::AddInteger
+                | DefaultFunction::SubtractInteger
+                | DefaultFunction::MultiplyInteger
+                | DefaultFunction::DivideInteger
+                | DefaultFunction::QuotientInteger
+                | DefaultFunction::RemainderInteger
+                | DefaultFunction::ModInteger
+                | DefaultFunction::LessThanInteger
+                | DefaultFunction::LessThanEqualsInteger,
+                _,
+            ) => integer,
+            (DefaultFunction::EqualsInteger, _) => Unlift::Integer,
+            (
+                DefaultFunction::AppendByteString
+                | DefaultFunction::EqualsByteString
+                | DefaultFunction::LessThanByteString
+                | DefaultFunction::LessThanEqualsByteString
+                | DefaultFunction::Sha2_256
+                | DefaultFunction::Sha3_256
+                | DefaultFunction::Blake2b_224
+                | DefaultFunction::Blake2b_256
+                | DefaultFunction::Keccak_256
+                | DefaultFunction::Ripemd_160
+                | DefaultFunction::DecodeUtf8
+                | DefaultFunction::ComplementByteString
+                | DefaultFunction::CountSetBits
+                | DefaultFunction::FindFirstSetBit,
+                _,
+            ) => byte_string,
+            (DefaultFunction::ConsByteString, 0) => {
+                if semantics.cons_byte_string_range_checks() {
+                    Unlift::Word8
+                } else {
+                    integer
+                }
+            }
+            (DefaultFunction::ConsByteString, _) => byte_string,
+            (DefaultFunction::SliceByteString, 0 | 1) => Unlift::Int,
+            (DefaultFunction::SliceByteString, _) => byte_string,
+            (DefaultFunction::LengthOfByteString, _) => Unlift::ByteString,
+            (DefaultFunction::IndexByteString, 0) => byte_string,
+            (DefaultFunction::IndexByteString, _) => Unlift::Int,
+            (
+                DefaultFunction::VerifyEd25519Signature
+                | DefaultFunction::VerifySchnorrSecp256k1Signature,
+                1,
+            ) => byte_string,
+            (
+                DefaultFunction::VerifyEd25519Signature
+                | DefaultFunction::VerifyEcdsaSecp256k1Signature
+                | DefaultFunction::VerifySchnorrSecp256k1Signature,
+                _,
+            ) => Unlift::ByteString,
+            (
+                DefaultFunction::AppendString
+                | DefaultFunction::EqualsString
+                | DefaultFunction::EncodeUtf8,
+                _,
+            ) => Unlift::String,
+            (DefaultFunction::IfThenElse, 0) => Unlift::Bool,
+            (DefaultFunction::ChooseUnit, 0) => Unlift::Unit,
+            (DefaultFunction::Trace, 0) => Unlift::String,
+            (DefaultFunction::ChooseList, 0) => Unlift::Constant,
+            (DefaultFunction::ChooseData, 0) => Unlift::Data,
+            (
+                DefaultFunction::IfThenElse
+                | DefaultFunction::ChooseUnit
+                | DefaultFunction::Trace
+                | DefaultFunction::ChooseList
+                | DefaultFunction::ChooseData,
+                _,
+            ) => Unlift::Any,
+            (
+                DefaultFunction::FstPair
+                | DefaultFunction::SndPair
+                | DefaultFunction::MkCons
+                | DefaultFunction::HeadList
+                | DefaultFunction::TailList
+                | DefaultFunction::NullList
+                | DefaultFunction::LengthOfArray
+                | DefaultFunction::ListToArray,
+                _,
+            ) => Unlift::Constant,
+            (DefaultFunction::ConstrData, 0) => {
+                if semantics.bounds_arguments() {
+                    Unlift::Word64
+                } else {
+                    Unlift::Integer
+                }
+            }
+            (DefaultFunction::ConstrData | DefaultFunction::ListData, _) => Unlift::ListOfData,
+            (DefaultFunction::MapData, _) => Unlift::ListOfPairsOfData,
+            (DefaultFunction::IData, _) => Unlift::Integer,
+            (DefaultFunction::BData, _) => Unlift::ByteString,
+            (
+                DefaultFunction::UnConstrData
+                | DefaultFunction::UnMapData
+                | DefaultFunction::UnListData
+                | DefaultFunction::UnIData
+                | DefaultFunction::UnBData
+                | DefaultFunction::EqualsData
+                | DefaultFunction::SerialiseData
+                | DefaultFunction::MkPairData
+                | DefaultFunction::UnValueData,
+                _,
+            ) => Unlift::Data,
+            (DefaultFunction::MkNilData | DefaultFunction::MkNilPairData, _) => Unlift::Unit,
+            (
+                DefaultFunction::Bls12_381_G1_ScalarMul | DefaultFunction::Bls12_381_G2_ScalarMul,
+                0,
+            ) => Unlift::Integer,
+            (
+                DefaultFunction::Bls12_381_G1_Add
+                | DefaultFunction::Bls12_381_G1_Neg
+                | DefaultFunction::Bls12_381_G1_ScalarMul
+                | DefaultFunction::Bls12_381_G1_Equal
+                | DefaultFunction::Bls12_381_G1_Compress,
+                _,
+            ) => Unlift::Bls12_381G1Element,
+            (
+                DefaultFunction::Bls12_381_G2_Add
+                | DefaultFunction::Bls12_381_G2_Neg
+                | DefaultFunction::Bls12_381_G2_ScalarMul
+                | DefaultFunction::Bls12_381_G2_Equal
+                | DefaultFunction::Bls12_381_G2_Compress,
+                _,
+            ) => Unlift::Bls12_381G2Element,
+            (
+                DefaultFunction::Bls12_381_G1_HashToGroup
+                | DefaultFunction::Bls12_381_G2_HashToGroup,
+                0,
+            ) => byte_string,
+            (
+                DefaultFunction::Bls12_381_G1_Uncompress
+                | DefaultFunction::Bls12_381_G2_Uncompress
+                | DefaultFunction::Bls12_381_G1_HashToGroup
+                | DefaultFunction::Bls12_381_G2_HashToGroup,
+                _,
+            ) => Unlift::ByteString,
+            (DefaultFunction::Bls12_381_MillerLoop, 0) => Unlift::Bls12_381G1Element,
+            (DefaultFunction::Bls12_381_MillerLoop, _) => Unlift::Bls12_381G2Element,
+            (
+                DefaultFunction::Bls12_381_MulMlResult | DefaultFunction::Bls12_381_FinalVerify,
+                _,
+            ) => Unlift::Bls12_381MlResult,
+            (
+                DefaultFunction::Bls12_381_G1_MultiScalarMul
+                | DefaultFunction::Bls12_381_G2_MultiScalarMul,
+                0,
+            ) => Unlift::ListOfIntegers,
+            (DefaultFunction::Bls12_381_G1_MultiScalarMul, _) => Unlift::ListOfBls12_381G1Elements,
+            (DefaultFunction::Bls12_381_G2_MultiScalarMul, _) => Unlift::ListOfBls12_381G2Elements,
+            (DefaultFunction::IntegerToByteString, 0) => Unlift::Bool,
+            (DefaultFunction::IntegerToByteString, _) => Unlift::Integer,
+            (DefaultFunction::ByteStringToInteger, 0) => Unlift::Bool,
+            (DefaultFunction::ByteStringToInteger, _) => byte_string,
+            (
+                DefaultFunction::AndByteString
+                | DefaultFunction::OrByteString
+                | DefaultFunction::XorByteString,
+                0,
+            ) => Unlift::Bool,
+            (
+                DefaultFunction::AndByteString
+                | DefaultFunction::OrByteString
+                | DefaultFunction::XorByteString,
+                _,
+            ) => byte_string,
+            (DefaultFunction::ReadBit, 0) => byte_string,
+            (DefaultFunction::ReadBit, _) => Unlift::Int,
+            (DefaultFunction::WriteBits, 0) => Unlift::ByteString,
+            (DefaultFunction::WriteBits, 1) => Unlift::ListOfIntegers,
+            (DefaultFunction::WriteBits, _) => Unlift::Bool,
+            (DefaultFunction::ReplicateByte, 0) => Unlift::Integer,
+            (DefaultFunction::ReplicateByte, _) => Unlift::Word8,
+            (DefaultFunction::ShiftByteString | DefaultFunction::RotateByteString, 0) => {
+                Unlift::ByteString
+            }
+            (DefaultFunction::ShiftByteString | DefaultFunction::RotateByteString, _) => {
+                if semantics.bounds_arguments() {
+                    Unlift::Int
+                } else {
+                    Unlift::Integer
+                }
+            }
+            (DefaultFunction::ExpModInteger, _) => Unlift::Integer,
+            (DefaultFunction::DropList, 0) => Unlift::Integer,
+            (DefaultFunction::DropList, _) => Unlift::Constant,
+            (DefaultFunction::IndexArray, 0) => Unlift::Constant,
+            (DefaultFunction::IndexArray, _) => Unlift::Int,
+            (DefaultFunction::InsertCoin | DefaultFunction::LookupCoin, 0 | 1) => {
+                Unlift::ByteString
+            }
+            (DefaultFunction::InsertCoin, 2) => Unlift::Integer,
+            (DefaultFunction::ScaleValue, 0) => Unlift::Integer,
+            (
+                DefaultFunction::InsertCoin
+                | DefaultFunction::LookupCoin
+                | DefaultFunction::UnionValue
+                | DefaultFunction::ValueContains
+                | DefaultFunction::ValueData
+                | DefaultFunction::ScaleValue,
+                _,
+            ) => Unlift::Value,
         }
     }
 
@@ -1204,6 +1579,10 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_integer()?;
                 let arg2 = args[1].unwrap_bls12_381_g1_element()?;
 
+                if semantics.bounds_arguments() && msm_scalar_out_of_bounds(arg1) {
+                    return Err(Error::MsmScalarOutOfBounds);
+                }
+
                 let size_scalar = size_of::<blst::blst_scalar>();
 
                 let arg1 = arg1.mod_floor(&SCALAR_PERIOD);
@@ -1335,6 +1714,10 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_integer()?;
                 let arg2 = args[1].unwrap_bls12_381_g2_element()?;
 
+                if semantics.bounds_arguments() && msm_scalar_out_of_bounds(arg1) {
+                    return Err(Error::MsmScalarOutOfBounds);
+                }
+
                 let size_scalar = size_of::<blst::blst_scalar>();
 
                 let arg1 = arg1.mod_floor(&SCALAR_PERIOD);
@@ -1386,7 +1769,7 @@ impl DefaultFunction {
                         ));
                     };
 
-                    if scalar < &MSM_SCALAR_LB || scalar > &MSM_SCALAR_UB {
+                    if msm_scalar_out_of_bounds(scalar) {
                         return Err(Error::MsmScalarOutOfBounds);
                     }
                 }
@@ -1563,12 +1946,7 @@ impl DefaultFunction {
                 let size = args[1].unwrap_integer()?;
                 let input = args[2].unwrap_integer()?;
 
-                // NOTE:
-                // We ought to also check for negative size and too large sizes. These checks
-                // however happens prior to calling the builtin as part of the costing step. So by
-                // the time we reach this builtin call, the size can be assumed to be
-                //
-                // >= 0 && < INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH
+                let size_unwrapped = check_output_length(*self, size)?;
 
                 if size.is_zero()
                     && integer_log2_ref(input) >= 8 * INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH
@@ -1584,8 +1962,6 @@ impl DefaultFunction {
                 if input.is_negative() {
                     return Err(Error::IntegerToByteStringNegativeInput(input.clone()));
                 }
-
-                let size_unwrapped: usize = size.try_into().unwrap();
 
                 if input.is_zero() {
                     let constant = Constant::ByteString(vec![0; size_unwrapped]);
@@ -1755,9 +2131,19 @@ impl DefaultFunction {
                 Ok(Value::bool(bit_test))
             }
             DefaultFunction::WriteBits => {
-                let mut bytes = args[0].unwrap_byte_string()?.clone();
+                let bytes = args[0].unwrap_byte_string()?;
                 let indices = args[1].unwrap_int_list()?;
                 let set_bit = args[2].unwrap_bool()?;
+
+                if semantics.bounds_arguments() && bytes.len() > WRITE_BITS_MAXIMUM_INPUT_LENGTH {
+                    return Err(Error::ByteStringTooLong {
+                        builtin: *self,
+                        maximum: WRITE_BITS_MAXIMUM_INPUT_LENGTH,
+                        actual: bytes.len(),
+                    });
+                }
+
+                let mut bytes = bytes.clone();
 
                 for index in indices {
                     let Constant::Integer(bit_index) = index.as_ref() else {
@@ -1789,8 +2175,7 @@ impl DefaultFunction {
                 let size = args[0].unwrap_integer()?;
                 let byte = args[1].unwrap_integer()?;
 
-                // Safe since this is checked by cost model
-                let size = usize::try_from(size).unwrap();
+                let size = check_output_length(*self, size)?;
 
                 let Ok(byte) = u8::try_from(byte) else {
                     return Err(Error::OutsideByteBounds(byte.clone()));
@@ -1807,10 +2192,6 @@ impl DefaultFunction {
             DefaultFunction::ShiftByteString => {
                 let bytes = args[0].unwrap_byte_string()?;
                 let shift = args[1].unwrap_integer()?;
-
-                if matches!(semantics, BuiltinSemantics::E) && shift.to_i64().is_none() {
-                    return Err(Error::EvaluationFailure);
-                }
 
                 let byte_length = bytes.len();
 
@@ -1835,10 +2216,6 @@ impl DefaultFunction {
             DefaultFunction::RotateByteString => {
                 let bytes = args[0].unwrap_byte_string()?;
                 let shift = args[1].unwrap_integer()?;
-
-                if matches!(semantics, BuiltinSemantics::E) && shift.to_i64().is_none() {
-                    return Err(Error::EvaluationFailure);
-                }
 
                 let byte_length = bytes.len();
 
@@ -1932,7 +2309,7 @@ impl DefaultFunction {
                         return Err(Error::TypeMismatch(Type::Integer, constant.as_ref().into()));
                     };
 
-                    if scalar < &MSM_SCALAR_LB || scalar > &MSM_SCALAR_UB {
+                    if msm_scalar_out_of_bounds(scalar) {
                         return Err(Error::MsmScalarOutOfBounds);
                     }
 
@@ -2099,6 +2476,26 @@ impl DefaultFunction {
     }
 }
 
+/// The length of the bytestring `integerToByteString` or `replicateByte`
+/// produces, which may not exceed `INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH`.
+fn check_output_length(builtin: DefaultFunction, size: &BigInt) -> Result<usize, Error> {
+    let maximum = INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH;
+
+    match builtin {
+        _ if !size.is_negative() && size <= &BigInt::from(maximum) => {
+            Ok(usize::try_from(size).expect("size is within the output length"))
+        }
+        DefaultFunction::ReplicateByte if size.is_negative() => {
+            Err(Error::ReplicateByteNegativeSize(size.clone()))
+        }
+        DefaultFunction::ReplicateByte => {
+            Err(Error::ReplicateByteSizeTooBig(size.clone(), maximum))
+        }
+        _ if size.is_negative() => Err(Error::IntegerToByteStringNegativeSize(size.clone())),
+        _ => Err(Error::IntegerToByteStringSizeTooBig(size.clone(), maximum)),
+    }
+}
+
 /// Unlift an `Int` operand the way Plutus does: integers outside the signed
 /// 64-bit range make the builtin fail.
 fn int64_operand(builtin: DefaultFunction, integer: &BigInt) -> Result<i64, Error> {
@@ -2133,6 +2530,10 @@ fn exp_mod_integer(base: &BigInt, exponent: &BigInt, modulus: &BigInt) -> Result
     } else {
         Ok(base.modpow(exponent, modulus))
     }
+}
+
+fn msm_scalar_out_of_bounds(scalar: &BigInt) -> bool {
+    scalar < &MSM_SCALAR_LB || scalar > &MSM_SCALAR_UB
 }
 
 fn exp_mod_integer_out_of_bounds(value: &BigInt) -> bool {

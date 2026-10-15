@@ -2572,8 +2572,8 @@ impl BuiltinCosts {
                     .cpu
                     .cost(args[0].to_ex_mem(), args[1].to_ex_mem()),
             },
-            d @ DefaultFunction::IntegerToByteString => {
-                let size = args[1].cost_as_size(d)?;
+            DefaultFunction::IntegerToByteString => {
+                let size = args[1].cost_as_size()?;
 
                 ExBudget {
                     mem: self.integer_to_byte_string.mem.cost(
@@ -2649,7 +2649,7 @@ impl BuiltinCosts {
                     .cost(args[0].to_ex_mem(), args[1].to_ex_mem()),
             },
             DefaultFunction::WriteBits => {
-                let list = args[1].unwrap_list().unwrap();
+                let list = args[1].unwrap_list()?;
 
                 ExBudget {
                     mem: self.write_bits.mem.cost(
@@ -2664,8 +2664,8 @@ impl BuiltinCosts {
                     ),
                 }
             }
-            d @ DefaultFunction::ReplicateByte => {
-                let size = args[0].cost_as_size(d)?;
+            DefaultFunction::ReplicateByte => {
+                let size = args[0].cost_as_size()?;
 
                 ExBudget {
                     mem: self.replicate_byte.mem.cost(size, args[1].to_ex_mem()),

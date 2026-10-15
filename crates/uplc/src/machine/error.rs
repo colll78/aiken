@@ -87,6 +87,19 @@ pub enum Error {
         "Integer"
     )]
     IntegerOutOfInt64Range(DefaultFunction, BigInt),
+    #[error(
+        "{0} expects an integer in the unsigned 64-bit range\n{:>13} {1}",
+        "Integer"
+    )]
+    IntegerOutOfWord64Range(DefaultFunction, BigInt),
+    #[error("{0} expects an integer within [-2^262143, 2^262143 - 1] but got one of {1} bits")]
+    IntegerOutOfBounds(DefaultFunction, u64),
+    #[error("{builtin} expects a bytestring of at most {maximum} bytes but got {actual} bytes")]
+    ByteStringTooLong {
+        builtin: DefaultFunction,
+        maximum: usize,
+        actual: usize,
+    },
     #[error("replicateByte encountered negative size\n{:>13} {0}", "Size")]
     ReplicateByteNegativeSize(BigInt),
     #[error("integerToByteString encountered negative input\n{:>13} {0}", "Input")]
@@ -171,7 +184,7 @@ pub enum Error {
     Blst(blst::BLST_ERROR),
     #[error("blst::hashToGroup")]
     HashToCurveDstTooBig,
-    #[error("Scalar exceeds 512-byte bound for multiScalarMul")]
+    #[error("Scalar exceeds 512-byte bound for scalar multiplication")]
     MsmScalarOutOfBounds,
     #[cfg(not(target_family = "wasm"))]
     #[error(transparent)]

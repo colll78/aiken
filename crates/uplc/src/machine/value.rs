@@ -1,6 +1,6 @@
 use super::{
     Error,
-    runtime::{self, BuiltinRuntime, BuiltinSemantics},
+    runtime::{BuiltinRuntime, BuiltinSemantics},
 };
 use crate::{
     ast::{Constant, Data, ListSpine, NamedDeBruijn, Term, Type},
@@ -346,40 +346,20 @@ impl Value {
         matches!(self, Value::Con(b) if matches!(b.as_ref(), Constant::Bool(_)))
     }
 
-    pub fn cost_as_size(&self, func: DefaultFunction) -> Result<i64, Error> {
+    /// The size Plutus gives an integer that counts bytes when costing it
+    /// (`NumBytesCostedAsNumWords`): the number of 8-byte words that many
+    /// bytes take up, saturating. Whether the integer is a valid number of
+    /// bytes is up to the builtin, once it has been costed.
+    pub fn cost_as_size(&self) -> Result<i64, Error> {
         let size = self.unwrap_integer()?;
 
-        if size.is_negative() {
-            let error = match func {
-                DefaultFunction::IntegerToByteString => {
-                    Error::IntegerToByteStringNegativeSize(size.clone())
-                }
-                DefaultFunction::ReplicateByte => Error::ReplicateByteNegativeSize(size.clone()),
-                _ => unreachable!(),
-            };
-            return Err(error);
+        if size.is_zero() {
+            return Ok(0);
         }
 
-        if size > &BigInt::from(runtime::INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH) {
-            let error = match func {
-                DefaultFunction::IntegerToByteString => Error::IntegerToByteStringSizeTooBig(
-                    size.clone(),
-                    runtime::INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH,
-                ),
-                DefaultFunction::ReplicateByte => Error::ReplicateByteSizeTooBig(
-                    size.clone(),
-                    runtime::INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH,
-                ),
-                _ => unreachable!(),
-            };
-            return Err(error);
-        }
+        let words = (size.abs() - 1) / 8 + 1;
 
-        let arg1: i64 = u64::try_from(size).unwrap().try_into().unwrap();
-
-        let arg1_exmem = if arg1 == 0 { 0 } else { ((arg1 - 1) / 8) + 1 };
-
-        Ok(arg1_exmem)
+        Ok(i64::try_from(words).unwrap_or(i64::MAX))
     }
 
     pub fn to_ex_mem(&self) -> i64 {
