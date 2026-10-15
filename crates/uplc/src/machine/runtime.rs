@@ -75,8 +75,8 @@ pub enum BuiltinSemantics {
 }
 
 impl BuiltinSemantics {
-    /// The semantics of a ledger language under the latest supported protocol
-    /// version.
+    /// The semantics of a ledger language under protocol version 11 (Van
+    /// Rossem).
     pub fn for_language(language: &Language) -> Self {
         Self::for_language_and_protocol(language, VAN_ROSSEM_PROTOCOL_VERSION)
     }

@@ -161,7 +161,7 @@ enum Caser {
 }
 
 impl Machine {
-    /// A machine for `version` under the latest supported protocol version.
+    /// A machine for `version` under protocol version 11 (Van Rossem).
     pub fn new(
         version: Language,
         costs: CostModel,
