@@ -1,15 +1,20 @@
 use super::{
     Error,
-    runtime::{self, BuiltinRuntime, BuiltinSemantics},
+    runtime::{BuiltinRuntime, BuiltinSemantics},
 };
 use crate::{
-    ast::{Constant, Data, ListSpine, NamedDeBruijn, Term, Type},
+    ast::{Constant, Data, DebugDepth, ListSpine, NamedDeBruijn, Term, Type},
     builtins::DefaultFunction,
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use pallas_primitives::conway;
-use std::{mem::size_of, ops::Deref, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    rc::Rc,
+};
 
 /// Number of bindings per environment chunk. Extending a shared environment
 /// copies at most one chunk, so applications cost O(ENV_CHUNK) instead of
@@ -29,6 +34,12 @@ pub struct Env(Option<Rc<EnvChunk>>);
 pub struct EnvChunk {
     values: Vec<Value>,
     parent: Env,
+}
+
+impl Drop for EnvChunk {
+    fn drop(&mut self) {
+        drop_nested(&mut self.values, std::mem::take(&mut self.parent));
+    }
 }
 
 impl Clone for EnvChunk {
@@ -81,6 +92,15 @@ impl Env {
         }
     }
 
+    /// Whether both environments are the very same bindings.
+    fn same(&self, other: &Env) -> bool {
+        match (&self.0, &other.0) {
+            (Some(left), Some(right)) => Rc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Bindings from the most recent to the oldest.
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         let mut chunk = self.0.as_deref();
@@ -100,7 +120,11 @@ impl PartialEq for Env {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Values can nest as deep as an evaluation makes them (closures capturing
+/// closures, constructors holding constructors), so cloning, comparing,
+/// formatting and dropping them do not recurse (see [`Values`] and
+/// [`EnvChunk`] for dropping).
+#[derive(Clone)]
 pub enum Value {
     Con(Rc<Constant>),
     Delay(Rc<Term<NamedDeBruijn>>, Env),
@@ -117,9 +141,250 @@ pub enum Value {
     /// lookup, environment capture) is O(1) instead of a deep copy of the
     /// whole structure.
     Constr {
-        tag: usize,
-        fields: Rc<Vec<Value>>,
+        tag: u64,
+        fields: Rc<Values>,
     },
+}
+
+/// The values a value holds: the fields of a constr, or the arguments of a
+/// builtin. It dereferences to a `Vec<Value>`.
+#[derive(Clone, Default, PartialEq)]
+pub struct Values(Vec<Value>);
+
+impl Values {
+    pub fn into_vec(mut self) -> Vec<Value> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl From<Vec<Value>> for Values {
+    fn from(values: Vec<Value>) -> Self {
+        Values(values)
+    }
+}
+
+impl FromIterator<Value> for Values {
+    fn from_iter<I: IntoIterator<Item = Value>>(values: I) -> Self {
+        Values(values.into_iter().collect())
+    }
+}
+
+impl Deref for Values {
+    type Target = Vec<Value>;
+
+    fn deref(&self) -> &Vec<Value> {
+        &self.0
+    }
+}
+
+impl DerefMut for Values {
+    fn deref_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for Values {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Drop for Values {
+    fn drop(&mut self) {
+        drop_nested(&mut self.0, Env::default());
+    }
+}
+
+/// How many collections of values (environment chunks, constr fields and
+/// builtin arguments) may be dropped inside one another before deeper ones
+/// are queued instead, so that dropping a deeply nested value or a long
+/// environment uses bounded stack while dropping a shallow one costs next to
+/// nothing more.
+const MAX_NESTED_VALUE_DROPS: usize = 512;
+
+std::thread_local! {
+    /// How many collections of values are being dropped inside one another on
+    /// this thread.
+    static VALUE_DROP_DEPTH: Cell<usize> = const { Cell::new(0) };
+
+    /// Whether `DEFERRED_VALUE_DROPS` may hold anything.
+    static VALUE_DROPS_DEFERRED: Cell<bool> = const { Cell::new(false) };
+
+    /// What collections dropped too deep held, left for the outermost drop.
+    static DEFERRED_VALUE_DROPS: RefCell<Vec<(Vec<Value>, Env)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Drops what a collection being dropped holds: its values and, for an
+/// environment chunk, the environment it extends.
+#[inline]
+fn drop_nested(values: &mut Vec<Value>, parent: Env) {
+    if values.is_empty() && parent.0.is_none() {
+        return;
+    }
+
+    let depth = VALUE_DROP_DEPTH.get();
+
+    if depth >= MAX_NESTED_VALUE_DROPS {
+        defer_drop(std::mem::take(values), parent);
+
+        return;
+    }
+
+    VALUE_DROP_DEPTH.set(depth + 1);
+    values.clear();
+    drop(parent);
+
+    if depth == 0 && VALUE_DROPS_DEFERRED.get() {
+        drop_deferred();
+    }
+
+    VALUE_DROP_DEPTH.set(depth);
+}
+
+#[cold]
+fn defer_drop(values: Vec<Value>, parent: Env) {
+    // Only fails while the thread is exiting, when its locals are being
+    // destroyed; what is left is then dropped right here.
+    let _ = DEFERRED_VALUE_DROPS.try_with(|deferred| {
+        deferred.borrow_mut().push((values, parent));
+    });
+
+    VALUE_DROPS_DEFERRED.set(true);
+}
+
+#[cold]
+fn drop_deferred() {
+    while let Some(nested) = DEFERRED_VALUE_DROPS
+        .try_with(|deferred| deferred.borrow_mut().pop())
+        .ok()
+        .flatten()
+    {
+        drop(nested);
+    }
+
+    VALUE_DROPS_DEFERRED.set(false);
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+
+        // Pairs up the values of two sequences to compare next, if their
+        // lengths match.
+        fn pair_up<'a>(
+            pending: &mut Vec<(&'a Value, &'a Value)>,
+            left: impl Iterator<Item = &'a Value>,
+            mut right: impl Iterator<Item = &'a Value>,
+        ) -> bool {
+            for left in left {
+                let Some(right) = right.next() else {
+                    return false;
+                };
+
+                pending.push((left, right));
+            }
+
+            right.next().is_none()
+        }
+
+        while let Some(pair) = pending.pop() {
+            let equal = match pair {
+                (Value::Con(left), Value::Con(right)) => left == right,
+                (Value::Delay(left_body, left_env), Value::Delay(right_body, right_env)) => {
+                    (Rc::ptr_eq(left_body, right_body) || left_body == right_body)
+                        && (left_env.same(right_env)
+                            || pair_up(&mut pending, left_env.iter(), right_env.iter()))
+                }
+                (
+                    Value::Lambda {
+                        parameter_name: left_name,
+                        body: left_body,
+                        env: left_env,
+                    },
+                    Value::Lambda {
+                        parameter_name: right_name,
+                        body: right_body,
+                        env: right_env,
+                    },
+                ) => {
+                    left_name == right_name
+                        && (Rc::ptr_eq(left_body, right_body) || left_body == right_body)
+                        && (left_env.same(right_env)
+                            || pair_up(&mut pending, left_env.iter(), right_env.iter()))
+                }
+                (
+                    Value::Builtin {
+                        fun: left_fun,
+                        runtime: left,
+                    },
+                    Value::Builtin {
+                        fun: right_fun,
+                        runtime: right,
+                    },
+                ) => {
+                    left_fun == right_fun
+                        && left.fun == right.fun
+                        && left.forces == right.forces
+                        && pair_up(&mut pending, left.args().iter(), right.args().iter())
+                }
+                (
+                    Value::Constr {
+                        tag: left_tag,
+                        fields: left,
+                    },
+                    Value::Constr {
+                        tag: right_tag,
+                        fields: right,
+                    },
+                ) => {
+                    left_tag == right_tag
+                        && (Rc::ptr_eq(left, right)
+                            || pair_up(&mut pending, left.iter(), right.iter()))
+                }
+                _ => false,
+            };
+
+            if !equal {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(_depth) = DebugDepth::enter() else {
+            return f.write_str("..");
+        };
+
+        match self {
+            Value::Con(constant) => f.debug_tuple("Con").field(constant).finish(),
+            Value::Delay(body, env) => f.debug_tuple("Delay").field(body).field(env).finish(),
+            Value::Lambda {
+                parameter_name,
+                body,
+                env,
+            } => f
+                .debug_struct("Lambda")
+                .field("parameter_name", parameter_name)
+                .field("body", body)
+                .field("env", env)
+                .finish(),
+            Value::Builtin { fun, runtime } => f
+                .debug_struct("Builtin")
+                .field("fun", fun)
+                .field("runtime", runtime)
+                .finish(),
+            Value::Constr { tag, fields } => f
+                .debug_struct("Constr")
+                .field("tag", tag)
+                .field("fields", fields)
+                .finish(),
+        }
+    }
 }
 
 impl Value {
@@ -223,6 +488,16 @@ impl Value {
         };
 
         Ok((t, list))
+    }
+
+    pub(super) fn unwrap_array(&self) -> Result<(&Type, &ListSpine), Error> {
+        let inner = self.unwrap_constant()?;
+
+        let Constant::ProtoArray(t, items) = inner else {
+            return Err(Error::ArrayTypeMismatch(inner.into()));
+        };
+
+        Ok((t, items))
     }
 
     pub(super) fn unwrap_data(&self) -> Result<&Data, Error> {
@@ -336,40 +611,17 @@ impl Value {
         matches!(self, Value::Con(b) if matches!(b.as_ref(), Constant::Bool(_)))
     }
 
-    pub fn cost_as_size(&self, func: DefaultFunction) -> Result<i64, Error> {
-        let size = self.unwrap_integer()?;
+    /// The size Plutus gives an integer that counts bytes when costing it
+    /// (`NumBytesCostedAsNumWords`): the number of 8-byte words that many
+    /// bytes take up, saturating. Whether the integer is a valid number of
+    /// bytes is up to the builtin, once it has been costed.
+    pub fn cost_as_size(&self) -> Result<i64, Error> {
+        let bytes = self.unwrap_integer()?.magnitude();
 
-        if size.is_negative() {
-            let error = match func {
-                DefaultFunction::IntegerToByteString => {
-                    Error::IntegerToByteStringNegativeSize(size.clone())
-                }
-                DefaultFunction::ReplicateByte => Error::ReplicateByteNegativeSize(size.clone()),
-                _ => unreachable!(),
-            };
-            return Err(error);
-        }
-
-        if size > &BigInt::from(runtime::INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH) {
-            let error = match func {
-                DefaultFunction::IntegerToByteString => Error::IntegerToByteStringSizeTooBig(
-                    size.clone(),
-                    runtime::INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH,
-                ),
-                DefaultFunction::ReplicateByte => Error::ReplicateByteSizeTooBig(
-                    size.clone(),
-                    runtime::INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH,
-                ),
-                _ => unreachable!(),
-            };
-            return Err(error);
-        }
-
-        let arg1: i64 = u64::try_from(size).unwrap().try_into().unwrap();
-
-        let arg1_exmem = if arg1 == 0 { 0 } else { ((arg1 - 1) / 8) + 1 };
-
-        Ok(arg1_exmem)
+        Ok(match bytes.to_u64() {
+            Some(bytes) => bytes.div_ceil(8) as i64,
+            None => ((bytes - 1u8) / 8u8 + 1u8).to_i64().unwrap_or(i64::MAX),
+        })
     }
 
     pub fn to_ex_mem(&self) -> i64 {
@@ -405,6 +657,8 @@ impl Value {
                 Constant::ProtoList(_, items) => {
                     stack.extend(items.iter().map(|item| item.as_ref()))
                 }
+                // Plutus sizes an array by its length alone.
+                Constant::ProtoArray(_, items) => total += items.len() as i64,
                 Constant::ProtoPair(_, _, l, r) => {
                     stack.push(l.as_ref());
                     stack.push(r.as_ref());
@@ -665,6 +919,33 @@ mod tests {
     use pallas_primitives::{PlutusData, conway};
     use proptest::prelude::*;
     use std::rc::Rc;
+
+    #[test]
+    fn sizes_cost_as_words_of_their_magnitude() {
+        let two_to = |n: usize| BigInt::from(1) << n;
+
+        for (size, words) in [
+            (BigInt::from(0), 0),
+            (BigInt::from(1), 1),
+            (BigInt::from(8), 1),
+            (BigInt::from(9), 2),
+            (BigInt::from(-9), 2),
+            (BigInt::from(u64::MAX), 1 << 61),
+            (two_to(64), 1 << 61),
+            (two_to(64) + 1, (1 << 61) + 1),
+            (two_to(65), 1 << 62),
+            (two_to(66) - 8, i64::MAX),
+            // Saturating.
+            (two_to(66), i64::MAX),
+            (-two_to(70), i64::MAX),
+        ] {
+            assert_eq!(
+                Value::integer(size.clone()).cost_as_size().unwrap(),
+                words,
+                "{size}"
+            );
+        }
+    }
 
     #[test]
     fn to_ex_mem_bigint() {

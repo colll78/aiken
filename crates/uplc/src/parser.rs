@@ -31,10 +31,11 @@ pub fn term(src: &str) -> Result<Term<Name>, ParseError<LineCol>> {
     Ok(term)
 }
 
-// Returns the inner type of a list, provided that the given type is a list.
+// Returns the inner type of a list or array, provided that the given type is
+// one; both are written as `[x, y, ...]`.
 fn list_sub_type(type_info: Option<&Type>) -> Option<&Type> {
     match type_info {
-        Some(Type::List(t)) => Some(t),
+        Some(Type::List(t)) | Some(Type::Array(t)) => Some(t),
         _ => None,
     }
 }
@@ -44,6 +45,138 @@ fn pair_sub_type(type_info: Option<&Type>) -> Option<(&Type, &Type)> {
     match type_info {
         Some(Type::Pair(l, r)) => Some((l, r)),
         _ => None,
+    }
+}
+
+/// Characters a Haskell character escape may name mnemonically, as recognised
+/// by `readLitChar`. `SOH` is listed before `SO` because it takes precedence.
+const ASCII_MNEMONICS: &[(&str, char)] = &[
+    ("NUL", '\x00'),
+    ("SOH", '\x01'),
+    ("STX", '\x02'),
+    ("ETX", '\x03'),
+    ("EOT", '\x04'),
+    ("ENQ", '\x05'),
+    ("ACK", '\x06'),
+    ("BEL", '\x07'),
+    ("BS", '\x08'),
+    ("HT", '\x09'),
+    ("LF", '\x0A'),
+    ("VT", '\x0B'),
+    ("FF", '\x0C'),
+    ("CR", '\x0D'),
+    ("SO", '\x0E'),
+    ("SI", '\x0F'),
+    ("DLE", '\x10'),
+    ("DC1", '\x11'),
+    ("DC2", '\x12'),
+    ("DC3", '\x13'),
+    ("DC4", '\x14'),
+    ("NAK", '\x15'),
+    ("SYN", '\x16'),
+    ("ETB", '\x17'),
+    ("CAN", '\x18'),
+    ("EM", '\x19'),
+    ("SUB", '\x1A'),
+    ("ESC", '\x1B'),
+    ("FS", '\x1C'),
+    ("GS", '\x1D'),
+    ("RS", '\x1E'),
+    ("US", '\x1F'),
+    ("SP", '\x20'),
+    ("DEL", '\x7F'),
+];
+
+/// How far ahead the reference parser looks when reading one character: it
+/// hands at most this many characters to `readLitChar`.
+const CHAR_LITERAL_WINDOW: usize = 10;
+
+/// Decode the body of a string constant the way the reference parser does:
+/// each character is read with Megaparsec's `charLiteral`, i.e. Haskell's
+/// `readLitChar` over a 10-character window, and the result goes through
+/// `Text.pack`, which replaces surrogate code points with U+FFFD.
+fn read_string_literal(body: &str) -> Result<String, &'static str> {
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(chars.len());
+    let mut i = 0;
+
+    while i < chars.len() {
+        let window = &chars[i..chars.len().min(i + CHAR_LITERAL_WINDOW)];
+        let (c, mut used) = read_lit_char(window).ok_or("invalid character escape")?;
+
+        // `readLitChar` also swallows any `\&` (empty string) escapes that
+        // follow the character, provided they lie within the window.
+        while window[used..].starts_with(&['\\', '&']) {
+            used += 2;
+        }
+
+        out.push(c);
+        i += used;
+    }
+
+    Ok(out)
+}
+
+/// One step of Haskell's `lexCharE`: returns the character and how many input
+/// characters it spans.
+fn read_lit_char(window: &[char]) -> Option<(char, usize)> {
+    let (&first, rest) = window.split_first()?;
+
+    if first != '\\' {
+        return Some((first, 1));
+    }
+
+    let (&kind, digits) = rest.split_first()?;
+
+    let simple = match kind {
+        'a' => Some('\x07'),
+        'b' => Some('\x08'),
+        'f' => Some('\x0C'),
+        'n' => Some('\n'),
+        'r' => Some('\r'),
+        't' => Some('\t'),
+        'v' => Some('\x0B'),
+        '\\' | '"' | '\'' => Some(kind),
+        _ => None,
+    };
+
+    if let Some(c) = simple {
+        return Some((c, 2));
+    }
+
+    let numeric = |radix: u32, digits: &[char], prefix: usize| {
+        let count = digits.iter().take_while(|c| c.is_digit(radix)).count();
+        if count == 0 {
+            return None;
+        }
+
+        let code = digits[..count].iter().try_fold(0_u32, |acc, c| {
+            acc.checked_mul(radix)?.checked_add(c.to_digit(radix)?)
+        })?;
+
+        if code > u32::from(char::MAX) {
+            return None;
+        }
+
+        Some((
+            char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER),
+            prefix + count,
+        ))
+    };
+
+    match kind {
+        '^' => match digits.first() {
+            Some(&c @ '@'..='_') => Some(((c as u8 - b'@') as char, 3)),
+            _ => None,
+        },
+        'x' => numeric(16, digits, 2),
+        'o' => numeric(8, digits, 2),
+        '0'..='9' => numeric(10, rest, 1),
+        _ => ASCII_MNEMONICS.iter().find_map(|(name, c)| {
+            let matches = rest.len() >= name.len()
+                && rest.iter().copied().zip(name.chars()).all(|(a, b)| a == b);
+            matches.then_some((*c, 1 + name.len()))
+        }),
     }
 }
 
@@ -65,8 +198,10 @@ pub fn escape(string: &str) -> String {
 peg::parser! {
     grammar uplc() for str {
         pub rule program(interner: &mut Interner) -> Program<Name>
-          = _* "(" _* "program" _+ v:version() _+ t:term(interner) _* ")" _* {
-            Program {version: v, term: t}
+          = _* "(" _* "program" _+ v:version() _+ t:term(interner) _* ")" _* {?
+            let program = Program {version: v, term: t};
+            program.check_version_features().or(Err("constr and case require UPLC 1.1.0"))?;
+            Ok(program)
           }
 
         rule comma() = _* "," _*
@@ -100,6 +235,7 @@ peg::parser! {
             / constant_g1_element()
             / constant_g2_element()
             / constant_list()
+            / constant_array()
             / constant_pair()
             ) _* ")" {
             Term::Constant(con.into())
@@ -138,7 +274,7 @@ peg::parser! {
           = "(" _* "error" _* ")" { Term::Error }
 
         rule constr(interner: &mut Interner) -> Term<Name>
-          = "(" _* "constr" _+ tag:decimal() _* fields:(t:term(interner) _* { t })* _* ")" {
+          = "(" _* "constr" _+ tag:word64() _* fields:(t:term(interner) _* { t })* _* ")" {
             Term::Constr { tag, fields }
           }
 
@@ -179,6 +315,11 @@ peg::parser! {
             Constant::ProtoList(t, ls.into_iter().map(Rc::new).collect())
           }
 
+        rule constant_array() -> Constant
+          = "(" _* "array" _* t:type_info() _* ")" _+ ls:list(Some(&t)) {
+            Constant::ProtoArray(t, ls.into_iter().map(Rc::new).collect())
+          }
+
         rule constant_pair() -> Constant
           = "(" _* "pair" _+ l:type_info() _+ r:type_info() _* ")" _+ p:pair(Some((&l, &r))) {
             Constant::ProtoPair(l, r, p.0.into(), p.1.into())
@@ -213,6 +354,9 @@ peg::parser! {
         rule decimal() -> usize
           = n:$(['0'..='9']+) {? n.parse().or(Err("usize")) }
 
+        rule word64() -> u64
+          = n:$(['0'..='9']+) {? n.parse().or(Err("constr tag that fits in 64 bits")) }
+
         rule number() -> isize
           = n:$(("-"/"+")* ['0'..='9']+) {? n.parse().or(Err("isize")) }
 
@@ -243,28 +387,11 @@ peg::parser! {
         }
 
         rule string() -> String
-          = "\"" s:character()* "\"" { String::from_iter(s) }
-
-        rule character() -> char
-          = "\\n"  { '\n' } // newline (line feed)
-          / "\\r"  { '\r' } // carriage return
-          / "\\t"  { '\t' } // horizontal tab
-          / "\\\"" { '\"' } // double quote
-          / "\\'"  { '\'' } // single quote
-          / "\\\\" { '\\' } // backslash
-          / "\\x" i:character() i2:character() {? match hex::decode([i,i2].iter().collect::<String>()) {
-              Ok(res) => {Ok(res[0].into())},
-              Err(_) => {Err("Invalid hex encoding of escaped byte")},
-          } } // hex encoded byte
-          / [ ^ '"' ]
-          / expected!("or any valid ascii character")
+          = "\"" body:$(("\\" [_] / [^ '"' | '\\'])*) "\"" {? read_string_literal(body) }
 
         rule data() -> Data
-          = _* "Constr" _+ t:decimal() _+ fs:plutus_list() {?
-            Ok(Data::constr(
-                u64::try_from(t).or(Err("tag"))?,
-                fs,
-            ))
+          = _* "Constr" _+ t:big_number() _+ fs:plutus_list() {
+            Data::constr_with_index(&t, fs)
           }
           / _* "Map" _+ kvps:plutus_key_value_pairs() {
             Data::map(kvps)
@@ -356,6 +483,10 @@ peg::parser! {
                         t.as_ref().clone(),
                         ls.into_iter().map(Rc::new).collect(),
                     )),
+                    Some(Type::Array(t)) => Ok(Constant::ProtoArray(
+                        t.as_ref().clone(),
+                        ls.into_iter().map(Rc::new).collect(),
+                    )),
                     _ => Err("found 'List' instead of expected type")
                 }
             }
@@ -386,6 +517,9 @@ peg::parser! {
           / _* "bls12_381_G2_element" { Type::Bls12_381G2Element }
           / _* "(" _* "list" _+ t:type_info() _* ")" {
               Type::List(t.into())
+            }
+          / _* "(" _* "array" _+ t:type_info() _* ")" {
+              Type::Array(t.into())
             }
           / _* "(" _* "pair" _+ l:type_info() _+ r:type_info() _* ")" {
               Type::Pair(l.into(), r.into())
@@ -489,12 +623,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_numeric_character_escapes_literally() {
-        let uplc = "(program 1.0.0 (con string \"\\83 \\o143\"))";
-        assert_eq!(
-            super::program(uplc).unwrap().term,
-            Term::Constant(Constant::String("\\83 \\o143".to_string()).into())
-        );
+    fn parse_haskell_character_escapes() {
+        let cases = [
+            (r#""\83\o143\x65""#, "Sce"),
+            (r#""\SOH\SO\&H\DEL""#, "\x01\x0EH\x7F"),
+            (r#""\^@\^A\^_""#, "\x00\x01\x1F"),
+            (r#""\a\b\f\v\'""#, "\x07\x08\x0C\x0B'"),
+            (r#""\1114111\xD800""#, "\u{10FFFF}\u{FFFD}"),
+            // The reference parser reads at most 10 characters per escape.
+            (r#""\x000000041""#, "\x041"),
+            (r#""a\&b""#, "ab"),
+        ];
+
+        for (literal, expected) in cases {
+            let uplc = format!("(program 1.0.0 (con string {literal}))");
+            assert_eq!(
+                super::program(&uplc).unwrap().term,
+                Term::Constant(Constant::String(expected.to_string()).into()),
+                "{literal}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_invalid_character_escapes() {
+        for literal in [r#""\q""#, r#""\&""#, r#""\1114112""#, r#""\x""#, r#""\^a""#] {
+            let uplc = format!("(program 1.0.0 (con string {literal}))");
+            assert!(super::program(&uplc).is_err(), "{literal}");
+        }
     }
 
     #[test]
@@ -507,15 +663,57 @@ mod tests {
     }
 
     #[test]
-    fn parse_allows_constr_before_uplc_1_1() {
-        let uplc = "(program 1.0.0 (constr 0))";
+    fn parse_data_constr_with_any_integer_index() {
+        // As Plutus' parser reads them; only `constrData` builds the indices
+        // outside 64 bits on chain.
+        for index in ["0", "18446744073709551615", "18446744073709551616", "-1"] {
+            let uplc = format!("(program 1.0.0 (con data (Constr {index} [I 1])))");
+            let index = index.parse::<num_bigint::BigInt>().unwrap();
+
+            assert_eq!(
+                super::program(&uplc).unwrap().term,
+                Term::Constant(
+                    Constant::Data(Data::constr_with_index(
+                        &index,
+                        vec![Data::integer(1.into())]
+                    ))
+                    .into()
+                ),
+                "{index}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_constr_and_case_before_uplc_1_1() {
+        for term in [
+            "(constr 0)",
+            "(case (con integer 1))",
+            "(lam x [x (constr 0)])",
+        ] {
+            assert!(
+                super::program(&format!("(program 1.0.0 {term})")).is_err(),
+                "{term}"
+            );
+            assert!(
+                super::program(&format!("(program 1.1.0 {term})")).is_ok(),
+                "{term}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_constr_tag_up_to_word64_max() {
+        let program = super::program("(program 1.1.0 (constr 18446744073709551615))").unwrap();
         assert_eq!(
-            super::program(uplc).unwrap().term,
+            program.term,
             Term::Constr {
-                tag: 0,
+                tag: u64::MAX,
                 fields: vec![]
             }
         );
+
+        assert!(super::program("(program 1.1.0 (constr 18446744073709551616))").is_err());
     }
 
     #[test]

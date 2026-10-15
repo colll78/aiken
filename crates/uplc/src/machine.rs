@@ -1,6 +1,13 @@
 use std::{fmt::Display, ptr::NonNull, rc::Rc};
 
-use crate::ast::{Constant, NamedDeBruijn, Term, Type};
+use crate::{
+    ast::{Constant, NamedDeBruijn, Program, Term, Type},
+    data::Data,
+    protocol::{
+        self, DIJKSTRA_PROTOCOL_VERSION, MAX_CONSTANT_TYPE_SIZE, MAX_CONSTR_FIELDS,
+        VAN_ROSSEM_PROTOCOL_VERSION,
+    },
+};
 use num_traits::ToPrimitive;
 
 pub mod cost_model;
@@ -23,7 +30,7 @@ use self::{
 enum MachineState {
     Return(Value),
     Compute(Env, TermRef),
-    Done(Term<NamedDeBruijn>),
+    Done(Value),
 }
 
 /// A pending continuation. The machine keeps them on a stack, with the next
@@ -92,6 +99,10 @@ pub const TERM_COUNT: usize = 9;
 // Builtin tags are sparse; this is the highest tag plus one for debug counters.
 pub const BUILTIN_COUNT: usize = 101;
 
+/// The memory and CPU spent on each step kind, then on each builtin, in
+/// that order.
+pub type SpendCounter = [i64; (TERM_COUNT + BUILTIN_COUNT) * 2];
+
 #[derive(Debug, Clone)]
 pub enum Trace {
     Log(String),
@@ -129,30 +140,42 @@ pub struct Machine {
     slippage: u32,
     unbudgeted_steps: [u32; 10],
     pub traces: Vec<Trace>,
-    pub spend_counter: Option<[i64; (TERM_COUNT + BUILTIN_COUNT) * 2]>,
+    pub spend_counter: Option<SpendCounter>,
     semantics: BuiltinSemantics,
+    caser: Caser,
+    language: Language,
+    protocol_major_version: u16,
     frames: Vec<Frame>,
 }
 
+/// What `case` may scrutinise besides `constr` values (Plutus'
+/// `defaultCaserBuiltinFor`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Caser {
+    /// Nothing else: before protocol version 11 (Van Rossem).
+    ConstrOnly,
+    /// Unit, booleans, integers, lists and pairs.
+    BuiltinsButData,
+    /// Data too: from protocol version 12 (Dijkstra), in UPLC 1.2.0 programs.
+    Builtins,
+}
+
 impl Machine {
+    /// A machine for `version` under protocol version 11 (Van Rossem).
     pub fn new(
         version: Language,
         costs: CostModel,
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
-        let semantics = BuiltinSemantics::for_language(&version);
-
-        Machine {
+        Self::build(
+            version,
+            VAN_ROSSEM_PROTOCOL_VERSION,
             costs,
-            ex_budget: initial_budget,
+            initial_budget,
             slippage,
-            unbudgeted_steps: [0; 10],
-            traces: vec![],
-            spend_counter: None,
-            semantics,
-            frames: vec![],
-        }
+            None,
+        )
     }
 
     pub fn new_with_protocol(
@@ -162,19 +185,14 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
-        let semantics =
-            BuiltinSemantics::for_language_and_protocol(&version, protocol_major_version);
-
-        Machine {
+        Self::build(
+            version,
+            protocol_major_version,
             costs,
-            ex_budget: initial_budget,
+            initial_budget,
             slippage,
-            unbudgeted_steps: [0; 10],
-            traces: vec![],
-            spend_counter: None,
-            semantics,
-            frames: vec![],
-        }
+            None,
+        )
     }
 
     pub fn new_debug(
@@ -183,18 +201,14 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
-        let semantics = BuiltinSemantics::for_language(&version);
-
-        Machine {
+        Self::build(
+            version,
+            VAN_ROSSEM_PROTOCOL_VERSION,
             costs,
-            ex_budget: initial_budget,
+            initial_budget,
             slippage,
-            unbudgeted_steps: [0; 10],
-            traces: vec![],
-            spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
-            semantics,
-            frames: vec![],
-        }
+            Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
+        )
     }
 
     pub fn new_debug_with_protocol(
@@ -204,8 +218,32 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
+        Self::build(
+            version,
+            protocol_major_version,
+            costs,
+            initial_budget,
+            slippage,
+            Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
+        )
+    }
+
+    fn build(
+        language: Language,
+        protocol_major_version: u16,
+        costs: CostModel,
+        initial_budget: ExBudget,
+        slippage: u32,
+        spend_counter: Option<SpendCounter>,
+    ) -> Machine {
         let semantics =
-            BuiltinSemantics::for_language_and_protocol(&version, protocol_major_version);
+            BuiltinSemantics::for_language_and_protocol(&language, protocol_major_version);
+
+        let caser = if protocol_major_version < VAN_ROSSEM_PROTOCOL_VERSION {
+            Caser::ConstrOnly
+        } else {
+            Caser::BuiltinsButData
+        };
 
         Machine {
             costs,
@@ -213,16 +251,61 @@ impl Machine {
             slippage,
             unbudgeted_steps: [0; 10],
             traces: vec![],
-            spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
+            spend_counter,
             semantics,
+            caser,
+            language,
+            protocol_major_version,
             frames: vec![],
         }
     }
 
+    /// Evaluates a program. From protocol version 12 (Dijkstra), `case` may
+    /// scrutinise Data in programs of UPLC version 1.2.0 or later (Plutus'
+    /// `defaultCaserBuiltinFor`).
+    ///
+    /// The ledger only runs programs whose UPLC version the ledger language
+    /// has at the protocol version (see
+    /// [`protocol::is_uplc_version_available`]); this does not check that.
+    ///
+    /// The value the program returns is discharged into a term, which can be
+    /// exponentially larger; [`Program::eval`] and the like only discharge it
+    /// when asked to.
+    pub fn run_program(
+        &mut self,
+        program: Program<NamedDeBruijn>,
+    ) -> Result<Term<NamedDeBruijn>, Error> {
+        self.evaluate_program(program)
+            .map(|value| discharge::value_as_term(&value))
+    }
+
+    /// Evaluates a term, as [`Machine::run_program`] evaluates the term of a
+    /// program of UPLC version 1.1.0.
     pub fn run(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
-        if !self.semantics.supports_values() {
-            Self::assert_no_values(&term)?;
+        self.evaluate_term(term)
+            .map(|value| discharge::value_as_term(&value))
+    }
+
+    /// Evaluates a program, as [`Machine::run_program`] does, to the value
+    /// it returns.
+    pub(crate) fn evaluate_program(
+        &mut self,
+        program: Program<NamedDeBruijn>,
+    ) -> Result<Value, Error> {
+        if self.protocol_major_version >= DIJKSTRA_PROTOCOL_VERSION && program.version >= (1, 2, 0)
+        {
+            self.caser = Caser::Builtins;
         }
+
+        self.evaluate_term(program.term)
+    }
+
+    fn evaluate_term(&mut self, term: Term<NamedDeBruijn>) -> Result<Value, Error> {
+        if self.protocol_major_version < protocol::language_introduced_in(&self.language) {
+            return Err(Error::LanguageNotAvailable(self.language.clone()));
+        }
+
+        self.check_term(&term)?;
 
         let startup_budget = self.costs.machine_costs.get(StepKind::StartUp);
 
@@ -237,7 +320,7 @@ impl Machine {
         result
     }
 
-    fn evaluate(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
+    fn evaluate(&mut self, term: Term<NamedDeBruijn>) -> Result<Value, Error> {
         use MachineState::*;
 
         let mut state = Compute(Env::default(), Rc::new(term).into());
@@ -246,48 +329,81 @@ impl Machine {
             state = match state {
                 Compute(env, t) => self.compute(env, t)?,
                 Return(value) => self.return_compute(value)?,
-                Done(t) => {
-                    return Ok(t);
+                Done(value) => {
+                    return Ok(value);
                 }
             };
         }
     }
 
-    /// The CIP-0153 value builtins and native `Value` constants only exist for
-    /// Plutus V3 from protocol version 11 (Van Rossem) onwards. Availability is
-    /// a whole-program well-formedness rule: occurrences in latent code (under
-    /// lambdas, delays or untaken branches) are rejected too, so the entire
-    /// term is validated up-front before evaluation starts.
-    fn assert_no_values(term: &Term<NamedDeBruijn>) -> Result<(), Error> {
-        let mut stack = vec![term];
+    /// Reject, before any budget is spent, terms the ledger would refuse to
+    /// evaluate. The ledger refuses to decode (Plutus' `deserialiseScript`):
+    ///
+    /// - builtins the ledger language does not have yet at the protocol
+    ///   version (see `DefaultFunction::introduced_in`);
+    /// - `constr` terms with more than 1024 fields;
+    /// - constants whose type takes more than 32 tags to encode.
+    ///
+    /// It also refuses to evaluate open terms (`mkTermToEvaluate`), although
+    /// before protocol version 12 (Dijkstra) its scope check does not look
+    /// inside `constr` and `case` (Plutus' `checkScope NoCaseConstr`), so a
+    /// free variable there only fails the program if it is evaluated.
+    ///
+    /// These are whole-program rules: occurrences in latent code (under
+    /// lambdas, delays or untaken branches) count too.
+    fn check_term(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
+        let check_availability = self.protocol_major_version < VAN_ROSSEM_PROTOCOL_VERSION;
+        let scope_case_constr = self.protocol_major_version >= DIJKSTRA_PROTOCOL_VERSION;
 
-        while let Some(term) = stack.pop() {
+        // Each term is paired with the number of lambdas enclosing it, or with
+        // `None` when its variables are not scope-checked.
+        let mut stack = vec![(term, Some(0_u64))];
+
+        while let Some((term, depth)) = stack.pop() {
             match term {
-                Term::Delay(body) | Term::Lambda { body, .. } | Term::Force(body) => {
-                    stack.push(body.as_ref());
+                Term::Var(name) => {
+                    let index = name.index.word();
+
+                    if depth.is_some_and(|depth| index == 0 || index > depth) {
+                        return Err(Error::OpenTermEvaluated(term.clone()));
+                    }
                 }
+                Term::Lambda { body, .. } => {
+                    stack.push((body.as_ref(), depth.map(|depth| depth + 1)))
+                }
+                Term::Delay(body) | Term::Force(body) => stack.push((body.as_ref(), depth)),
                 Term::Apply { function, argument } => {
-                    stack.push(function.as_ref());
-                    stack.push(argument.as_ref());
+                    stack.push((function.as_ref(), depth));
+                    stack.push((argument.as_ref(), depth));
+                }
+                Term::Constr { fields, .. } => {
+                    if fields.len() > MAX_CONSTR_FIELDS {
+                        return Err(Error::ConstrTooManyFields(fields.len()));
+                    }
+
+                    let depth = depth.filter(|_| scope_case_constr);
+
+                    stack.extend(fields.iter().map(|field| (field, depth)));
+                }
+                Term::Case { constr, branches } => {
+                    let depth = depth.filter(|_| scope_case_constr);
+
+                    stack.push((constr.as_ref(), depth));
+                    stack.extend(branches.iter().map(|branch| (branch, depth)));
                 }
                 Term::Constant(constant) => {
-                    if Constant::contains_value(constant) {
-                        return Err(Error::ValueConstantNotAvailable);
+                    if !constant_type_fits(constant) {
+                        return Err(Error::ConstantTypeTooLarge(Type::from(constant.as_ref())));
                     }
                 }
                 Term::Builtin(fun) => {
-                    if fun.is_value_builtin() {
+                    if check_availability
+                        && !fun.is_available_in(&self.language, self.protocol_major_version)
+                    {
                         return Err(Error::BuiltinNotAvailable(*fun));
                     }
                 }
-                Term::Constr { fields, .. } => {
-                    stack.extend(fields.iter());
-                }
-                Term::Case { constr, branches } => {
-                    stack.push(constr.as_ref());
-                    stack.extend(branches.iter());
-                }
-                Term::Var(_) | Term::Error => {}
+                Term::Error => {}
             }
         }
 
@@ -364,7 +480,7 @@ impl Machine {
                     }
                     None => Ok(MachineState::Return(Value::Constr {
                         tag: *tag,
-                        fields: Rc::new(vec![]),
+                        fields: Rc::default(),
                     })),
                 }
             }
@@ -387,9 +503,7 @@ impl Machine {
                 self.spend_unbudgeted_steps()?;
             }
 
-            let term = discharge::value_as_term(value);
-
-            return Ok(MachineState::Done(term));
+            return Ok(MachineState::Done(value));
         };
 
         match frame {
@@ -421,7 +535,7 @@ impl Machine {
                     }
                     None => Ok(MachineState::Return(Value::Constr {
                         tag: *tag,
-                        fields: Rc::new(resolved_fields),
+                        fields: Rc::new(resolved_fields.into()),
                     })),
                 }
             }
@@ -441,11 +555,19 @@ impl Machine {
         };
 
         match value {
-            Value::Constr { tag, fields } => match branches.get(tag) {
-                Some(_) => {
-                    self.transfer_arg_stack(Rc::unwrap_or_clone(fields));
+            // A tag beyond the platform's index range has no branch, as in
+            // the reference machine (which checks it against Int's maxBound).
+            Value::Constr { tag, fields } => match usize::try_from(tag)
+                .ok()
+                .filter(|&index| index < branches.len())
+            {
+                Some(index) => {
+                    match Rc::try_unwrap(fields) {
+                        Ok(fields) => self.transfer_arg_stack(fields.into_vec().into_iter()),
+                        Err(fields) => self.transfer_arg_stack(fields.iter().cloned()),
+                    }
 
-                    Ok(MachineState::Compute(env, term.child(tag)))
+                    Ok(MachineState::Compute(env, term.child(index)))
                 }
                 None => Err(Error::MissingCaseBranch(
                     branches.to_vec(),
@@ -453,7 +575,7 @@ impl Machine {
                 )),
             },
             Value::Con(constant) => {
-                if !matches!(self.semantics, BuiltinSemantics::E) {
+                if self.caser == Caser::ConstrOnly {
                     return Err(Error::NonConstrScrutinized(Value::Con(constant)));
                 }
 
@@ -486,6 +608,18 @@ impl Machine {
                         vec![Value::Con(first.clone()), Value::Con(second.clone())],
                         1,
                     ),
+                    Constant::Data(Data::Constr(constr)) if self.caser == Caser::Builtins => {
+                        // An index beyond `usize` has no branch either.
+                        let tag = constr
+                            .constr_index()
+                            .as_u64()
+                            .and_then(|tag| usize::try_from(tag).ok())
+                            .unwrap_or(usize::MAX);
+                        let fields =
+                            Constant::ProtoList(Type::Data, constr.fields.as_data_list().clone());
+
+                        (tag, vec![Value::Con(fields.into())], usize::MAX)
+                    }
                     _ => return Err(Error::NonConstrScrutinized(Value::Con(constant))),
                 };
 
@@ -498,7 +632,7 @@ impl Machine {
 
                 match branches.get(tag) {
                     Some(_) => {
-                        self.transfer_arg_stack(fields);
+                        self.transfer_arg_stack(fields.into_iter());
 
                         Ok(MachineState::Compute(env, term.child(tag)))
                     }
@@ -528,9 +662,10 @@ impl Machine {
 
                     Ok(MachineState::Return(res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
-
-                    Err(Error::BuiltinTermArgumentExpected(term))
+                    Err(Error::BuiltinTermArgumentExpected(Value::Builtin {
+                        fun,
+                        runtime,
+                    }))
                 }
             }
             rest => Err(Error::NonPolymorphicInstantiation(rest)),
@@ -559,9 +694,10 @@ impl Machine {
 
                     Ok(MachineState::Return(res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
-
-                    Err(Error::UnexpectedBuiltinTermArgument(term))
+                    Err(Error::UnexpectedBuiltinTermArgument(Value::Builtin {
+                        fun,
+                        runtime,
+                    }))
                 }
             }
             rest => Err(Error::NonFunctionalApplication(rest, argument)),
@@ -569,6 +705,8 @@ impl Machine {
     }
 
     fn eval_builtin_app(&mut self, runtime: BuiltinRuntime) -> Result<Value, Error> {
+        runtime.unlift_arguments(self.semantics)?;
+
         let cost = runtime.to_ex_budget(&self.costs.builtin_costs, self.semantics)?;
 
         self.spend_budget(cost)?;
@@ -576,8 +714,8 @@ impl Machine {
         if let Some(counter) = &mut self.spend_counter {
             let i = (runtime.fun as usize + TERM_COUNT) * 2;
 
-            counter[i] += cost.mem;
-            counter[i + 1] += cost.cpu;
+            counter[i] = counter[i].saturating_add(cost.mem);
+            counter[i + 1] = counter[i + 1].saturating_add(cost.cpu);
         }
 
         runtime.call(self.semantics, &mut self.traces)
@@ -591,9 +729,8 @@ impl Machine {
 
     /// Pushes the fields of a scrutinised constructor as pending arguments,
     /// the first field on top.
-    fn transfer_arg_stack(&mut self, args: Vec<Value>) {
-        self.frames
-            .extend(args.into_iter().rev().map(Frame::AwaitFunValue));
+    fn transfer_arg_stack(&mut self, args: impl DoubleEndedIterator<Item = Value>) {
+        self.frames.extend(args.rev().map(Frame::AwaitFunValue));
     }
 
     fn step_and_maybe_spend(&mut self, step: StepKind) -> Result<(), Error> {
@@ -620,8 +757,8 @@ impl Machine {
             self.unbudgeted_steps[i] = 0;
 
             if let Some(counter) = &mut self.spend_counter {
-                counter[i * 2] += unspent_step_budget.mem;
-                counter[i * 2 + 1] += unspent_step_budget.cpu;
+                counter[i * 2] = counter[i * 2].saturating_add(unspent_step_budget.mem);
+                counter[i * 2 + 1] = counter[i * 2 + 1].saturating_add(unspent_step_budget.cpu);
             }
         }
 
@@ -631,14 +768,40 @@ impl Machine {
     }
 
     fn spend_budget(&mut self, spend_budget: ExBudget) -> Result<(), Error> {
-        self.ex_budget.mem -= spend_budget.mem;
-        self.ex_budget.cpu -= spend_budget.cpu;
+        // Saturate like the reference `SatInt` budgeting: a builtin costed at
+        // `maxBound` must exhaust the budget rather than overflow it.
+        self.ex_budget.mem = self.ex_budget.mem.saturating_sub(spend_budget.mem);
+        self.ex_budget.cpu = self.ex_budget.cpu.saturating_sub(spend_budget.cpu);
 
         if self.ex_budget.mem < 0 || self.ex_budget.cpu < 0 {
             Err(Error::OutOfExError(self.ex_budget))
         } else {
             Ok(())
         }
+    }
+}
+
+/// Whether a constant's type is within the ledger's limit on the size of the
+/// type tags that encode it (Plutus' `maxHeaderSize`, measured by
+/// `defaultUniSize`): one per type and one per type application, so `list a`
+/// takes two more than `a`, and `pair a b` three more than `a` and `b`.
+fn constant_type_fits(constant: &Constant) -> bool {
+    fn size(ty: &Type, budget: usize) -> Option<usize> {
+        match ty {
+            Type::List(item) | Type::Array(item) => size(item, budget.checked_sub(2)?),
+            Type::Pair(first, second) => size(second, size(first, budget.checked_sub(3)?)?),
+            _ => budget.checked_sub(1),
+        }
+    }
+
+    match constant {
+        Constant::ProtoList(item, _) | Constant::ProtoArray(item, _) => {
+            size(item, MAX_CONSTANT_TYPE_SIZE - 2).is_some()
+        }
+        Constant::ProtoPair(first, second, _, _) => size(first, MAX_CONSTANT_TYPE_SIZE - 3)
+            .and_then(|budget| size(second, budget))
+            .is_some(),
+        _ => true,
     }
 }
 
@@ -655,6 +818,7 @@ impl From<&Constant> for Type {
                 Type::Pair(Rc::new(t1.clone()), Rc::new(t2.clone()))
             }
             Constant::Data(_) => Type::Data,
+            Constant::ProtoArray(t, _) => Type::Array(Rc::new(t.clone())),
             Constant::Value(_) => Type::Value,
             Constant::Bls12_381G1Element(_) => Type::Bls12_381G1Element,
             Constant::Bls12_381G2Element(_) => Type::Bls12_381G2Element,
@@ -666,7 +830,6 @@ impl From<&Constant> for Type {
 #[cfg(test)]
 mod tests {
     use num_bigint::BigInt;
-    use std::rc::Rc;
 
     use super::{
         Error, Machine,
@@ -674,100 +837,928 @@ mod tests {
         runtime::Compressable,
     };
     use crate::{
-        ast::{Constant, NamedDeBruijn, Program, Term},
+        ast::{Constant, NamedDeBruijn, Program, Term, Type},
         builtins::DefaultFunction,
+        data::Data,
+        machine::eval_result::EvalResult,
+        protocol::{
+            ALONZO_PROTOCOL_VERSION, CHANG_PROTOCOL_VERSION, DIJKSTRA_PROTOCOL_VERSION,
+            MAX_CONSTR_FIELDS, PLOMIN_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION,
+            VASIL_PROTOCOL_VERSION, language_introduced_in,
+        },
     };
     use pallas_primitives::conway::Language;
+    use strum::IntoEnumIterator;
 
     #[test]
-    fn value_builtins_unavailable_before_van_rossem_or_outside_v3() {
-        let program = |term: Term<NamedDeBruijn>| Program {
-            version: (1, 1, 0),
-            term,
-        };
+    fn scope_checked_as_the_ledger_does() {
+        use crate::ast::DeBruijn;
 
-        let builtin = Term::Builtin(DefaultFunction::LookupCoin);
-        let constant: Term<NamedDeBruijn> =
-            Term::Constant(Constant::Value(crate::ast::Value::empty()).into());
-        // Availability is a whole-program rule: latent occurrences that
-        // evaluation never reaches must be rejected too.
-        let latent: Term<NamedDeBruijn> = Term::Lambda {
+        let var = |index: u64| {
+            Term::Var(
+                NamedDeBruijn {
+                    text: "x".to_string(),
+                    index: DeBruijn::from_word(index),
+                }
+                .into(),
+            )
+        };
+        let lambda = |body: Term<NamedDeBruijn>| Term::Lambda {
             parameter_name: NamedDeBruijn {
-                text: "x".to_string(),
-                index: 0.into(),
+                text: "y".to_string(),
+                index: DeBruijn::new(0),
             }
             .into(),
-            body: Term::Builtin(DefaultFunction::ScaleValue).into(),
+            body: body.into(),
         };
-        // Public AST callers can construct type-inconsistent constants even
-        // though Flat decoding cannot. Inspect both declared types and actual
-        // elements so this cannot bypass protocol availability checks.
-        let inconsistent: Term<NamedDeBruijn> = Term::Constant(
-            Constant::ProtoList(
-                crate::ast::Type::Integer,
-                vec![Rc::new(Constant::Value(crate::ast::Value::empty()))].into(),
-            )
+        let unit = || Term::Constant(Constant::Unit.into());
+        let untaken_branch = |branch: Term<NamedDeBruijn>| Term::Case {
+            constr: Term::Constr {
+                tag: 0,
+                fields: vec![],
+            }
             .into(),
-        );
+            branches: vec![unit(), branch],
+        };
+        let eval = |term: Term<NamedDeBruijn>, protocol_major_version: u16| {
+            Program {
+                version: (1, 1, 0),
+                term,
+            }
+            .eval_version_with_protocol(
+                ExBudget::max(),
+                &Language::PlutusV3,
+                protocol_major_version,
+            )
+            .result()
+        };
 
-        for (language, protocol) in [
-            (Language::PlutusV3, 10),
-            (Language::PlutusV2, 11),
-            (Language::PlutusV1, 11),
+        // A free variable that evaluation would never reach, outside of any
+        // constr or case: under a delay that is not forced, in an unused
+        // argument, or under a lambda that is never applied.
+        for term in [
+            Term::Delay(var(1).into()),
+            lambda(unit()).apply(Term::Delay(var(1).into())),
+            lambda(var(1).apply(var(2))),
+            lambda(var(1).apply(var(1 << 32))),
         ] {
-            let result = program(builtin.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::BuiltinNotAvailable(_))),
-                "expected lookupCoin to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
+            for protocol_major_version in [VAN_ROSSEM_PROTOCOL_VERSION, DIJKSTRA_PROTOCOL_VERSION] {
+                assert!(
+                    matches!(
+                        eval(term.clone(), protocol_major_version),
+                        Err(Error::OpenTermEvaluated(_))
+                    ),
+                    "{} at {protocol_major_version}",
+                    term.to_pretty()
+                );
+            }
+        }
 
-            let result = program(constant.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::ValueConstantNotAvailable)),
-                "expected Value constant to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-
-            let result = program(inconsistent.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::ValueConstantNotAvailable)),
-                "expected nested Value constant to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-
-            let result = program(latent.clone())
-                .eval_version_with_protocol(ExBudget::default(), &language, protocol)
-                .result();
-            assert!(
-                matches!(result, Err(Error::BuiltinNotAvailable(_))),
-                "expected latent scaleValue to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
-            );
-
-            // Direct calls through the public runtime API are gated too.
-            let semantics =
-                super::runtime::BuiltinSemantics::for_language_and_protocol(&language, protocol);
-            let result = DefaultFunction::UnValueData.call(
-                semantics,
-                &[super::value::Value::Con(
-                    Constant::Data(crate::ast::Data::map(vec![])).into(),
-                )],
-                &mut vec![],
+        // Before Dijkstra the ledger does not scope-check inside constr and
+        // case, so a free variable there, with any index, only fails the
+        // program if evaluation reaches it (as checked against the Haskell
+        // ledger API at plutus 1b03c165).
+        for term in [
+            untaken_branch(var(1)),
+            untaken_branch(var(0)),
+            untaken_branch(var(1 << 32)),
+            untaken_branch(var(u64::MAX)),
+            Term::Case {
+                constr: Term::Constr {
+                    tag: 0,
+                    fields: vec![lambda(var(2))],
+                }
+                .into(),
+                branches: vec![lambda(unit())],
+            },
+            lambda(unit()).apply(lambda(Term::Constr {
+                tag: 0,
+                fields: vec![var(4)],
+            })),
+        ] {
+            assert_eq!(
+                eval(term.clone(), VAN_ROSSEM_PROTOCOL_VERSION),
+                Ok(unit()),
+                "{}",
+                term.to_pretty()
             );
             assert!(
-                matches!(result, Err(Error::BuiltinNotAvailable(_))),
-                "expected direct unValueData call to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
+                matches!(
+                    eval(term.clone(), DIJKSTRA_PROTOCOL_VERSION),
+                    Err(Error::OpenTermEvaluated(_))
+                ),
+                "{}",
+                term.to_pretty()
             );
         }
 
-        for term in [builtin, constant, latent] {
-            let result = program(term)
-                .eval_version_with_protocol(ExBudget::default(), &Language::PlutusV3, 11)
-                .result();
-            assert!(result.is_ok(), "{result:?}");
+        // Evaluating one fails all the same.
+        for term in [
+            Term::Case {
+                constr: Term::Constr {
+                    tag: 1,
+                    fields: vec![],
+                }
+                .into(),
+                branches: vec![unit(), var(1 << 32)],
+            },
+            Term::Case {
+                constr: var(1).into(),
+                branches: vec![unit()],
+            },
+        ] {
+            assert!(
+                matches!(
+                    eval(term.clone(), VAN_ROSSEM_PROTOCOL_VERSION),
+                    Err(Error::OpenTermEvaluated(_))
+                ),
+                "{}",
+                term.to_pretty()
+            );
+        }
+
+        // Closed, for comparison.
+        assert!(eval(lambda(var(1)), DIJKSTRA_PROTOCOL_VERSION).is_ok());
+    }
+
+    #[test]
+    fn builtins_unavailable_before_they_are_introduced() {
+        // A builtin that evaluation never reaches is rejected all the same.
+        let latent = |fun| Program::<NamedDeBruijn> {
+            version: (1, 0, 0),
+            term: Term::Builtin(fun).delay(),
+        };
+
+        for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            for fun in DefaultFunction::iter() {
+                let introduced_in = fun.introduced_in(&language);
+                let eval = |protocol_major_version| {
+                    latent(fun)
+                        .eval_version_with_protocol(
+                            ExBudget::default(),
+                            &language,
+                            protocol_major_version,
+                        )
+                        .result()
+                };
+
+                if introduced_in > language_introduced_in(&language) {
+                    assert_eq!(
+                        eval(introduced_in - 1),
+                        Err(Error::BuiltinNotAvailable(fun)),
+                        "{fun} in {language:?}"
+                    );
+                }
+                assert!(eval(introduced_in).is_ok(), "{fun} in {language:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn constants_of_any_type_available_in_every_language() {
+        // Unlike builtins, constant types are not tied to protocol versions:
+        // the ledger decodes array and Value constants whenever it decodes
+        // scripts of the language at all (plutus 1b03c165).
+        for constant in [
+            "(con (array integer) [1, 2])",
+            "(con value [(#aa, [(#aa, 1)])])",
+        ] {
+            // Steps cost more in semantics variant A than in C.
+            for (language, protocol_major_version, cpu) in [
+                (Language::PlutusV1, ALONZO_PROTOCOL_VERSION, 23100),
+                (Language::PlutusV2, VASIL_PROTOCOL_VERSION, 23100),
+                (Language::PlutusV3, CHANG_PROTOCOL_VERSION, 16100),
+            ] {
+                let program =
+                    crate::parser::program(&format!("(program 1.0.0 {constant})")).unwrap();
+                let result = Program::<NamedDeBruijn>::try_from(program)
+                    .unwrap()
+                    .eval_version_with_protocol(
+                        ExBudget::default(),
+                        &language,
+                        protocol_major_version,
+                    );
+
+                assert!(result.result().is_ok(), "{constant} in {language:?}");
+                assert_eq!(result.cost(), ExBudget { mem: 200, cpu });
+            }
+        }
+    }
+    #[test]
+    fn exp_mod_integer_modulus_bound_matches_plutus() {
+        let modulus = |m: BigInt| {
+            let program = crate::parser::program(&format!(
+                "(program 1.1.0 [(builtin expModInteger) (con integer 2) (con integer 3) (con integer {m})])"
+            ))
+            .unwrap();
+
+            Program::<NamedDeBruijn>::try_from(program)
+                .unwrap()
+                .eval_version_with_protocol(
+                    ExBudget::max(),
+                    &Language::PlutusV3,
+                    VAN_ROSSEM_PROTOCOL_VERSION,
+                )
+        };
+        let two = BigInt::from(2);
+
+        // Expected results and costs from the reference evaluator (plutus
+        // 1b03c165, semantics variant E). A modulus beyond 2^8191 - 1 fails, but
+        // only after being charged for: the cost comes before the denotation.
+        let largest = modulus(two.pow(8191) - 1);
+        assert_eq!(
+            largest.result().unwrap(),
+            Term::Constant(Constant::Integer(8.into()).into())
+        );
+        assert_eq!(
+            largest.cost(),
+            ExBudget {
+                mem: 928,
+                cpu: 901_087_765
+            }
+        );
+
+        for (m, cost) in [
+            (
+                two.pow(8191),
+                ExBudget {
+                    mem: 228,
+                    cpu: 900_975_765,
+                },
+            ),
+            (
+                two.pow(8192),
+                ExBudget {
+                    mem: 229,
+                    cpu: 914_865_470,
+                },
+            ),
+        ] {
+            let result = modulus(m);
+            assert!(
+                matches!(result.result(), Err(Error::OutsideNaturalBounds(..))),
+                "{:?}",
+                result.result()
+            );
+            assert_eq!(result.cost(), cost);
+        }
+    }
+
+    #[test]
+    fn data_like_the_ledger_before_and_at_van_rossem() {
+        use crate::{ast::DeBruijn, protocol::PLOMIN_PROTOCOL_VERSION};
+
+        // Plutus V3 programs (flat, without the CBOR wrapper) with what the
+        // Haskell ledger API makes of them at protocol versions 10 and 11: the
+        // result, or none if evaluation fails, and the cost (plutus 1b03c165,
+        // `mkTermToEvaluate` and `evaluateTerm counting`).
+        //
+        // Before protocol version 11, `constrData` takes any integer as the
+        // index, which the Data builtins then handle like any other; from it,
+        // only a 64-bit word. `serialiseData` encodes the value, choosing tags
+        // and integer encodings afresh, and `equalsData` compares integers by
+        // value, however the Data constants they are given are encoded.
+        let cases = [
+            (
+                "constrData 2^64",
+                "0101003374a904040404040404040400225eb801",
+                [
+                    (
+                        Some("(con data (Constr 18446744073709551616 []))"),
+                        102251,
+                        632,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "constrData -1",
+                "0101003374a9000a5eb801",
+                [
+                    (Some("(con data (Constr -1 []))"), 102251, 632),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "constrData 2^64-1",
+                "0101003374a907f7fffffffffffffff81a5eb801",
+                [
+                    (
+                        Some("(con data (Constr 18446744073709551615 []))"),
+                        102251,
+                        632,
+                    ),
+                    (
+                        Some("(con data (Constr 18446744073709551615 []))"),
+                        102251,
+                        632,
+                    ),
+                ],
+            ),
+            (
+                "serialiseData constrData 2^64",
+                "010100376666e9520808080808080808080044bd7001",
+                [
+                    (
+                        Some("(con bytestring #d86682c24901000000000000000080)"),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData -1",
+                "010100376666e9520014bd7001",
+                [
+                    (Some("(con bytestring #d866822080)"), 1943005, 840),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData -2^64",
+                "010100376666e9520ffffffffffffffffff034bd7001",
+                [
+                    (
+                        Some("(con bytestring #d866823bffffffffffffffff80)"),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData -2^64-1",
+                "010100376666e9520818080808080808080044bd7001",
+                [
+                    (
+                        Some("(con bytestring #d86682c34901000000000000000080)"),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData 2^200 [I 1]",
+                "010100376666e952080808080808080808080808080808080808080808080808080808080204bd708101010001",
+                [
+                    (
+                        Some(
+                            "(con bytestring #d86682c2581a01000000000000000000000000000000000000000000000000009f01ff)",
+                        ),
+                        3009565,
+                        850,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData constrData 2^520",
+                "010100376666e95208080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080808080084bd7001",
+                [
+                    (
+                        Some(
+                            "(con bytestring #d86682c2584201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080)",
+                        ),
+                        1943005,
+                        840,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "serialiseData listData [constrData 2^64]",
+                "01010037666e9ccd5d019ba5482020202020202020200112f5c097ae01",
+                [
+                    (
+                        Some("(con bytestring #9fd86682c24901000000000000000080ff)"),
+                        3014467,
+                        1612,
+                    ),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "fstPair unConstrData constrData 2^64",
+                "01010035573a6ea8cdd2a410101010101010101000897ae001",
+                [
+                    (Some("(con integer 18446744073709551616)"), 364734, 1296),
+                    (None, 100, 100),
+                ],
+            ),
+            (
+                "fstPair unConstrData constrData -5",
+                "01010035573a6ea8cdd2a401297ae001",
+                [(Some("(con integer -5)"), 364734, 1296), (None, 100, 100)],
+            ),
+            (
+                "equalsData constrData 2^64 itself",
+                "0101003375e66e9520808080808080808080044bd7019ba5482020202020202020200112f5c1",
+                [(Some("(con bool True)"), 1259666, 1465), (None, 100, 100)],
+            ),
+            (
+                "equalsData constrData 2^64 vs 0",
+                "0101003375e66e9520808080808080808080044bd7019ba5480012f5c1",
+                [(Some("(con bool False)"), 1259666, 1465), (None, 100, 100)],
+            ),
+            (
+                "equalsData constrData -1 vs 2^64-1",
+                "0101003375e66e9520014bd7019ba5483fbfffffffffffffffc0d2f5c1",
+                [(Some("(con bool False)"), 1259666, 1465), (None, 100, 100)],
+            ),
+            (
+                "chooseData constrData 2^64",
+                "010100333333574866e9520808080808080808080044bd702400490022400c9004240141",
+                [(Some("(con integer 1)"), 404626, 1964), (None, 100, 100)],
+            ),
+            (
+                "serialiseData constrData 127",
+                "010100376666e9520fe014bd7001",
+                [
+                    (Some("(con bytestring #d9057880)"), 1943005, 840),
+                    (Some("(con bytestring #d9057880)"), 1943005, 840),
+                ],
+            ),
+            (
+                "serialiseData constrData 128",
+                "010100376666e952080024bd7001",
+                [
+                    (Some("(con bytestring #d86682188080)"), 1943005, 840),
+                    (Some("(con bytestring #d86682188080)"), 1943005, 840),
+                ],
+            ),
+            (
+                "serialiseData 102-form index 0",
+                "0101003766980105d8668200800001",
+                [
+                    (Some("(con bytestring #d87980)"), 1856854, 408),
+                    (Some("(con bytestring #d87980)"), 1856854, 408),
+                ],
+            ),
+            (
+                "serialiseData 102-form index 6",
+                "0101003766980105d8668206800001",
+                [
+                    (Some("(con bytestring #d87f80)"), 1856854, 408),
+                    (Some("(con bytestring #d87f80)"), 1856854, 408),
+                ],
+            ),
+            (
+                "serialiseData 102-form index 127",
+                "0101003766980106d86682187f800001",
+                [
+                    (Some("(con bytestring #d9057880)"), 1856854, 408),
+                    (Some("(con bytestring #d9057880)"), 1856854, 408),
+                ],
+            ),
+            (
+                "serialiseData bignum 1",
+                "0101003766980103c241010001",
+                [
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData bignum 1 padded",
+                "0101003766980104c24200010001",
+                [
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData bignum 0 empty",
+                "0101003766980102c2400001",
+                [
+                    (Some("(con bytestring #00)"), 2070166, 410),
+                    (Some("(con bytestring #00)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData negative bignum -1",
+                "0101003766980103c341000001",
+                [
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData negative bignum -1 empty",
+                "0101003766980102c3400001",
+                [
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                    (Some("(con bytestring #20)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData bignum 2^64",
+                "010100376698010bc2490100000000000000000001",
+                [
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                ],
+            ),
+            (
+                "serialiseData bignum 2^64 padded",
+                "010100376698010cc24a000100000000000000000001",
+                [
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                    (
+                        Some("(con bytestring #c249010000000000000000)"),
+                        2283478,
+                        412,
+                    ),
+                ],
+            ),
+            (
+                "serialiseData bignum 2^64-1",
+                "010100376698010ac248ffffffffffffffff0001",
+                [
+                    (Some("(con bytestring #1bffffffffffffffff)"), 2070166, 410),
+                    (Some("(con bytestring #1bffffffffffffffff)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData int 1",
+                "0101003766980101010001",
+                [
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                    (Some("(con bytestring #01)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData bytes #01",
+                "010100376698010241010001",
+                [
+                    (Some("(con bytestring #4101)"), 2070166, 410),
+                    (Some("(con bytestring #4101)"), 2070166, 410),
+                ],
+            ),
+            (
+                "serialiseData indefinite map",
+                "0101003766980104bf0102ff0001",
+                [
+                    (Some("(con bytestring #a10102)"), 3989974, 428),
+                    (Some("(con bytestring #a10102)"), 3989974, 428),
+                ],
+            ),
+            (
+                "equalsData bignum -1 vs -1",
+                "0101003375e98103c34100004c0101200001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum -1 empty vs -1",
+                "0101003375e98102c340004c0101200001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum -6 vs -5",
+                "0101003375e98103c34105004c0101240001",
+                [
+                    (Some("(con bool False)"), 1114643, 601),
+                    (Some("(con bool False)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum -6 vs -6",
+                "0101003375e98103c34105004c0101250001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData bignum 1 padded vs 1",
+                "0101003375e98104c2420001004c0101010001",
+                [
+                    (Some("(con bool True)"), 1114643, 601),
+                    (Some("(con bool True)"), 1114643, 601),
+                ],
+            ),
+            (
+                "equalsData 102-form 0 vs 121",
+                "0101003375e98105d866820080004c0103d879800001",
+                [
+                    (Some("(con bool True)"), 1087364, 601),
+                    (Some("(con bool True)"), 1087364, 601),
+                ],
+            ),
+            (
+                "unIData negative bignum -1 empty",
+                "010100375a980102c3400001",
+                [
+                    (Some("(con integer -1)"), 68844, 432),
+                    (Some("(con integer -1)"), 68844, 432),
+                ],
+            ),
+        ];
+
+        for (name, flat, outcomes) in cases {
+            let bytes = hex::decode(flat).unwrap();
+            let program =
+                Program::<NamedDeBruijn>::from(Program::<DeBruijn>::from_flat(&bytes).unwrap());
+
+            for (protocol_version, (expected, cpu, mem)) in
+                [PLOMIN_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION]
+                    .into_iter()
+                    .zip(outcomes)
+            {
+                let result = program.clone().eval_version_with_protocol(
+                    ExBudget::max(),
+                    &Language::PlutusV3,
+                    protocol_version,
+                );
+                let cost = result.cost();
+
+                match expected {
+                    Some(expected) => {
+                        let expected =
+                            crate::parser::program(&format!("(program 1.1.0 {expected})")).unwrap();
+                        let expected = Program::<NamedDeBruijn>::try_from(expected).unwrap().term;
+
+                        assert_eq!(
+                            result.result(),
+                            Ok(expected),
+                            "{name} at {protocol_version}"
+                        );
+                    }
+                    None => assert!(
+                        matches!(
+                            result.result(),
+                            Err(Error::IntegerOutOfWord64Range(
+                                DefaultFunction::ConstrData,
+                                _
+                            ))
+                        ),
+                        "{name} at {protocol_version}"
+                    ),
+                }
+                assert_eq!(
+                    (cost.cpu, cost.mem),
+                    (cpu, mem),
+                    "{name} at {protocol_version}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builtin_arguments_unlift_like_plutus() {
+        let eval = |language: &Language, term: &str| {
+            let version = match language {
+                Language::PlutusV3 => "1.1.0",
+                _ => "1.0.0",
+            };
+            let program = crate::parser::program(&format!("(program {version} {term})")).unwrap();
+
+            Program::<NamedDeBruijn>::try_from(program)
+                .unwrap()
+                .eval_version_with_protocol(ExBudget::max(), language, VAN_ROSSEM_PROTOCOL_VERSION)
+        };
+        let bound = BigInt::from(2).pow(262143);
+        let scalar_bound = BigInt::from(2).pow(4095);
+        let bytes = |n: usize| format!("#{}", "00".repeat(n));
+        let miller_loop = "[(builtin bls12_381_millerLoop) (con bls12_381_G1_element 0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb) (con bls12_381_G2_element 0x93e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049334cf11213945d57e5ac7d055d042b7e024aa2b2f08f0a91260805272dc51051c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8)]";
+        let g1 = "(con bls12_381_G1_element 0x97f1d3a73197d7942695638c4fa9ac0fc3688c4f9774b905a14e3a3f171bac586c55e83ff97a1aeffb3af00adb22c6bb)";
+
+        // Expected outcomes (`Err` naming the error) and costs from the
+        // reference evaluator (plutus 1b03c165): semantics variant E for
+        // PlutusV3 and D for PlutusV2. An argument that does not unlift fails
+        // the application once the builtin is saturated, before it is costed;
+        // a costing of 100/100 is the machine's startup cost alone.
+        let v3 = Language::PlutusV3;
+        let v2 = Language::PlutusV2;
+        type Case<'a> = (&'a Language, String, Result<(), &'a str>, i64, i64);
+
+        let cases: Vec<Case> = vec![
+            (
+                &v3,
+                format!("[(builtin addInteger) (con integer {}) (con integer 1)]", &bound - 1),
+                Ok(()),
+                1_901_208,
+                4697,
+            ),
+            (
+                &v3,
+                format!("[(builtin addInteger) (con integer {bound}) (con integer 1)]"),
+                Err("IntegerOutOfBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin lessThanInteger) (con integer {}) (con integer 1)]", -&bound - 1),
+                Err("IntegerOutOfBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin equalsInteger) (con integer {bound}) (con integer 1)]"),
+                Ok(()),
+                132_433,
+                601,
+            ),
+            (
+                &v2,
+                format!("[(builtin addInteger) (con integer {bound}) (con integer 1)]"),
+                Err("IntegerOutOfBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin appendByteString) (con bytestring {}) (con bytestring #)]", bytes(65536)),
+                Ok(()),
+                1_498_489,
+                8793,
+            ),
+            (
+                &v3,
+                format!("[(builtin appendByteString) (con bytestring {}) (con bytestring #)]", bytes(65537)),
+                Err("ByteStringTooLong"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin lengthOfByteString) (con bytestring {})]", bytes(65537)),
+                Ok(()),
+                70_200,
+                410,
+            ),
+            (
+                &v3,
+                "[(builtin consByteString) (con integer 256) (con bytestring #)]".to_string(),
+                Err("ByteStringConsNotAByte"),
+                100,
+                100,
+            ),
+            (
+                &v2,
+                "[(builtin consByteString) (con integer 256) (con bytestring #)]".to_string(),
+                Ok(()),
+                152_288,
+                602,
+            ),
+            (
+                &v3,
+                "[(builtin sliceByteString) (con integer 9223372036854775808) (con integer 1) (con bytestring #00)]".to_string(),
+                Err("IntegerOutOfInt64Range"),
+                100,
+                100,
+            ),
+            (
+                &v2,
+                "[(builtin shiftByteString) (con bytestring #00) (con integer 9223372036854775808)]".to_string(),
+                Err("IntegerOutOfInt64Range"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(force (builtin indexArray)) (con (array integer) [1]) (con integer 9223372036854775808)]".to_string(),
+                Err("IntegerOutOfInt64Range"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(builtin constrData) (con integer 18446744073709551615) (con (list data) [])]".to_string(),
+                Ok(()),
+                102_251,
+                632,
+            ),
+            (
+                &v3,
+                "[(builtin constrData) (con integer 18446744073709551616) (con (list data) [])]".to_string(),
+                Err("IntegerOutOfWord64Range"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(builtin replicateByte) (con integer 1) (con integer 256)]".to_string(),
+                Err("OutsideByteBounds"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                "[(builtin integerToByteString) (con bool True) (con integer -1) (con integer 0)]".to_string(),
+                Err("IntegerToByteStringNegativeSize"),
+                1_322_707,
+                101,
+            ),
+            (
+                &v3,
+                format!("[(builtin writeBits) (con bytestring {}) (con (list integer) [0]) (con bool True)]", bytes(4096)),
+                Ok(()),
+                412_093,
+                1312,
+            ),
+            (
+                &v3,
+                format!("[(builtin writeBits) (con bytestring {}) (con (list integer) [0]) (con bool True)]", bytes(4097)),
+                Err("ByteStringTooLong"),
+                300_093,
+                613,
+            ),
+            (
+                &v3,
+                "[(builtin writeBits) (con bytestring #00) (con (list bool) []) (con bool True)]".to_string(),
+                Err("TypeMismatch"),
+                100,
+                100,
+            ),
+            (
+                &v3,
+                format!("[(builtin bls12_381_G1_scalarMul) (con integer {}) {g1}]", &scalar_bound - 1),
+                Ok(()),
+                77_080_658,
+                618,
+            ),
+            (
+                &v3,
+                format!("[(builtin bls12_381_G1_scalarMul) (con integer {scalar_bound}) {g1}]"),
+                Err("MsmScalarOutOfBounds"),
+                77_000_658,
+                118,
+            ),
+            // The second argument is evaluated, and charged for, before the
+            // first one fails to unlift.
+            (
+                &v3,
+                format!("[(builtin bls12_381_mulMlResult) (con unit ()) {miller_loop}]"),
+                Err("TypeMismatch"),
+                254_006_373,
+                172,
+            ),
+            (
+                &v3,
+                "[(builtin addInteger) (lam x x) (con integer 1)]".to_string(),
+                Err("NotAConstant"),
+                100,
+                100,
+            ),
+            // A partial application is never unlifted.
+            (
+                &v3,
+                "[(lam f (con integer 1)) [(builtin addInteger) (con string \"x\")]]".to_string(),
+                Ok(()),
+                96_100,
+                700,
+            ),
+            // Polymorphic constants are checked by the builtin, once costed.
+            (
+                &v3,
+                "[(force (builtin headList)) (con integer 1)]".to_string(),
+                Err("ListTypeMismatch"),
+                83_250,
+                132,
+            ),
+            (
+                &v3,
+                "[(force (builtin indexArray)) (con (list integer) [1]) (con integer 0)]".to_string(),
+                Err("ArrayTypeMismatch"),
+                232_110,
+                132,
+            ),
+        ];
+
+        for (language, term, expected, cpu, mem) in cases {
+            let term_prefix = &term[..term.len().min(80)];
+            let result = eval(language, &term);
+
+            match (expected, result.result()) {
+                (Ok(()), Ok(_)) => {}
+                (Err(name), Err(e)) if format!("{e:?}").starts_with(name) => {}
+                (expected, actual) => {
+                    panic!("{term_prefix}: expected {expected:?}, got {actual:?}")
+                }
+            }
+            assert_eq!(result.cost(), ExBudget { mem, cpu }, "{term_prefix}");
         }
     }
 
@@ -846,7 +1837,7 @@ mod tests {
     #[test]
     fn case_constr_case_0() {
         let make_program =
-            |fun: DefaultFunction, tag: usize, n: i32, m: i32| Program::<NamedDeBruijn> {
+            |fun: DefaultFunction, tag: u64, n: i32, m: i32| Program::<NamedDeBruijn> {
                 version: (0, 0, 0),
                 term: Term::Case {
                     constr: Term::Constr {
@@ -877,8 +1868,33 @@ mod tests {
     }
 
     #[test]
+    fn case_constr_tag_beyond_branches_is_missing_branch() {
+        for tag in [3, u32::MAX as u64 + 1, i64::MAX as u64 + 1, u64::MAX] {
+            let program = Program::<NamedDeBruijn> {
+                version: (1, 1, 0),
+                term: Term::Case {
+                    constr: Term::Constr {
+                        tag,
+                        fields: vec![],
+                    }
+                    .into(),
+                    branches: vec![Term::integer(5.into()); 3],
+                },
+            };
+
+            assert!(
+                matches!(
+                    program.eval(ExBudget::max()).result(),
+                    Err(Error::MissingCaseBranch(..))
+                ),
+                "{tag}"
+            );
+        }
+    }
+
+    #[test]
     fn case_constr_case_1() {
-        let make_program = |tag: usize| Program::<NamedDeBruijn> {
+        let make_program = |tag: u64| Program::<NamedDeBruijn> {
             version: (0, 0, 0),
             term: Term::Case {
                 constr: Term::Constr {
@@ -1098,5 +2114,393 @@ mod tests {
             ),
             int(2)
         );
+    }
+
+    /// Evaluates a textual program at a protocol version, with the default
+    /// cost model.
+    fn eval_at(language: Language, protocol_major_version: u16, source: &str) -> EvalResult {
+        let program = crate::parser::program(source).unwrap();
+
+        Program::<NamedDeBruijn>::try_from(program)
+            .unwrap()
+            .eval_version_with_protocol(ExBudget::default(), &language, protocol_major_version)
+    }
+
+    fn program(
+        version: (usize, usize, usize),
+        term: Term<NamedDeBruijn>,
+    ) -> Program<NamedDeBruijn> {
+        Program { version, term }
+    }
+
+    // The expected outcomes below are the Haskell evaluator's
+    // (`deserialiseScript` -> `evaluateTerm`) at plutus 1b03c165.
+
+    #[test]
+    fn case_on_builtin_types_from_van_rossem() {
+        let source = "(program 1.1.0 (case (con bool True) (con integer 0) (con integer 1)))";
+
+        assert!(matches!(
+            eval_at(Language::PlutusV3, PLOMIN_PROTOCOL_VERSION, source).result(),
+            Err(Error::NonConstrScrutinized(_))
+        ));
+
+        for language in [Language::PlutusV1, Language::PlutusV3] {
+            let result = eval_at(language, VAN_ROSSEM_PROTOCOL_VERSION, source);
+
+            assert_eq!(result.result().unwrap(), Term::integer(1.into()));
+            assert_eq!(
+                result.cost(),
+                ExBudget {
+                    mem: 400,
+                    cpu: 48100
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn case_on_data_from_dijkstra_and_uplc_1_2() {
+        let case = |version: &str, scrutinee: &str, branches: &str| {
+            format!("(program {version} (case (con data {scrutinee}) {branches}))")
+        };
+        let source = case(
+            "1.2.0",
+            "(Constr 1 [I 5])",
+            "(lam x (con integer 0)) (lam x x)",
+        );
+
+        for language in [Language::PlutusV1, Language::PlutusV3] {
+            let result = eval_at(language, DIJKSTRA_PROTOCOL_VERSION, &source);
+
+            assert_eq!(
+                result.result().unwrap(),
+                Term::Constant(
+                    Constant::ProtoList(
+                        Type::Data,
+                        vec![Constant::Data(Data::integer(5.into())).into()].into(),
+                    )
+                    .into()
+                )
+            );
+            assert_eq!(
+                result.cost(),
+                ExBudget {
+                    mem: 500,
+                    cpu: 64100
+                }
+            );
+        }
+
+        for (protocol_major_version, source) in [
+            // Before Dijkstra, or before UPLC 1.2.0, Data is not a scrutinee.
+            (VAN_ROSSEM_PROTOCOL_VERSION, source.clone()),
+            (DIJKSTRA_PROTOCOL_VERSION, source.replace("1.2.0", "1.1.0")),
+            // A constructor without a branch, and Data other than a constructor.
+            (
+                DIJKSTRA_PROTOCOL_VERSION,
+                case("1.2.0", "(Constr 2 [])", "(lam x x) (lam x x)"),
+            ),
+            (
+                DIJKSTRA_PROTOCOL_VERSION,
+                case("1.2.0", "(I 0)", "(lam x x)"),
+            ),
+        ] {
+            let result = eval_at(Language::PlutusV3, protocol_major_version, &source);
+
+            assert!(
+                result.result().is_err(),
+                "{source} at {protocol_major_version}"
+            );
+            assert_eq!(result.cost(), ExBudget { mem: 100, cpu: 100 });
+        }
+    }
+
+    #[test]
+    fn constr_fields_limited_as_the_ledger_does() {
+        let constr =
+            |fields: usize| program((1, 1, 0), Term::constr(0, vec![Term::unit(); fields]));
+
+        let result =
+            constr(MAX_CONSTR_FIELDS).eval_version(ExBudget::default(), &Language::PlutusV3);
+        assert!(result.result().is_ok());
+        assert_eq!(
+            result.cost(),
+            ExBudget {
+                mem: 102600,
+                cpu: 16400100
+            }
+        );
+
+        // Rejected wherever it is, as the ledger refuses to decode it.
+        let latent = program(
+            (1, 1, 0),
+            Term::Delay(Term::constr(0, vec![Term::unit(); MAX_CONSTR_FIELDS + 1]).into()),
+        );
+        for program in [constr(MAX_CONSTR_FIELDS + 1), latent] {
+            assert_eq!(
+                program
+                    .eval_version(ExBudget::default(), &Language::PlutusV3)
+                    .result(),
+                Err(Error::ConstrTooManyFields(MAX_CONSTR_FIELDS + 1))
+            );
+        }
+    }
+
+    #[test]
+    fn output_lengths_beyond_the_signed_64_bit_range_rejected() {
+        // Sizes from 2^63 used to wrap to a negative length that passed the
+        // maximum, and then failed to allocate given a budget large enough
+        // for their cost.
+        for size in ["9223372036854775808", "18446744073709551615"] {
+            for source in [
+                format!(
+                    "[(builtin integerToByteString) (con bool True) (con integer {size}) (con integer 0)]"
+                ),
+                format!("[(builtin replicateByte) (con integer {size}) (con integer 0)]"),
+            ] {
+                let program: Program<NamedDeBruijn> =
+                    crate::parser::program(&format!("(program 1.1.0 {source})"))
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+
+                let budget = ExBudget {
+                    mem: i64::MAX,
+                    cpu: i64::MAX,
+                };
+
+                assert!(program.eval(budget).result().is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn constant_types_limited_as_the_ledger_does() {
+        let lists = |depth: usize, element: &str| {
+            (0..depth).fold(element.to_string(), |t, _| format!("(list {t})"))
+        };
+
+        // A list type takes 2 more tags than its element type, and a pair type
+        // 3 more than its two; the ledger allows 32.
+        for (r#type, value, fits) in [
+            (lists(15, "integer"), "[]".to_string(), true),
+            (lists(16, "integer"), "[]".to_string(), false),
+            (
+                format!("(pair {} unit)", lists(13, "integer")),
+                "([], ())".to_string(),
+                true,
+            ),
+            (
+                format!("(pair {} (list unit))", lists(13, "integer")),
+                "([], [])".to_string(),
+                false,
+            ),
+        ] {
+            let source = format!("(program 1.1.0 (con {type} {value}))");
+            let result = eval_at(Language::PlutusV3, VAN_ROSSEM_PROTOCOL_VERSION, &source);
+
+            if fits {
+                assert!(result.result().is_ok(), "{type}");
+            } else {
+                assert!(
+                    matches!(result.result(), Err(Error::ConstantTypeTooLarge(_))),
+                    "{type}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn languages_unavailable_before_they_are_introduced() {
+        for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            let introduced_in = language_introduced_in(&language);
+            let source = "(program 1.0.0 (con unit ()))";
+
+            assert_eq!(
+                eval_at(language.clone(), introduced_in - 1, source).result(),
+                Err(Error::LanguageNotAvailable(language.clone()))
+            );
+            assert!(eval_at(language, introduced_in, source).result().is_ok());
+        }
+    }
+
+    fn var(index: usize) -> Term<NamedDeBruijn> {
+        Term::Var(
+            NamedDeBruijn {
+                text: "x".to_string(),
+                index: index.into(),
+            }
+            .into(),
+        )
+    }
+
+    fn lambda(body: Term<NamedDeBruijn>) -> Term<NamedDeBruijn> {
+        Term::Lambda {
+            parameter_name: NamedDeBruijn {
+                text: "x".to_string(),
+                index: 0.into(),
+            }
+            .into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn evaluates_deep_terms_in_bounded_stack() {
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 500;
+
+        let nest = |leaf: Term<NamedDeBruijn>,
+                    f: fn(Term<NamedDeBruijn>) -> Term<NamedDeBruijn>| {
+            (0..DEPTH).fold(leaf, |term, _| f(term))
+        };
+
+        // Far too little to evaluate or discharge the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                let evaluate = |term: Term<NamedDeBruijn>| {
+                    Program {
+                        version: (1, 1, 0),
+                        term,
+                    }
+                    .eval_version(ExBudget::max(), &Language::PlutusV3)
+                    .result()
+                };
+
+                // Values discharged back into the terms they came from.
+                let delays = nest(Term::Error, |term| term.delay());
+                assert_eq!(evaluate(delays.clone()), Ok(delays));
+
+                let lambdas = nest(var(1), lambda);
+                assert_eq!(evaluate(lambdas.clone()), Ok(lambdas));
+
+                let constrs = nest(Term::unit(), |term| Term::Constr {
+                    tag: 0,
+                    fields: vec![term],
+                });
+                assert_eq!(evaluate(constrs.clone()), Ok(constrs));
+
+                // Values discharged with the values their environments bind:
+                // the outermost `x` is the unit the lambda around it is applied
+                // to, while the others are bound inside the value.
+                let closure = |term| lambda(term).apply(var(1)).delay();
+                let closures = (1..DEPTH).fold(var(1), |term, _| closure(term));
+                assert_eq!(
+                    evaluate(lambda(closure(closures.clone())).apply(Term::unit())),
+                    Ok(lambda(closures).apply(Term::unit()).delay())
+                );
+
+                // Deep stacks of frames.
+                let forces = nest(Term::unit(), |term| term.delay().force());
+                assert_eq!(evaluate(forces), Ok(Term::unit()));
+
+                let arguments = nest(Term::unit(), |term| lambda(var(1)).apply(term));
+                assert_eq!(evaluate(arguments), Ok(Term::unit()));
+
+                let functions = (0..DEPTH).fold(nest(Term::unit(), lambda), |term, _| {
+                    term.apply(Term::Error.delay())
+                });
+                assert_eq!(evaluate(functions), Ok(Term::unit()));
+
+                let scrutinees = nest(
+                    Term::Constr {
+                        tag: 0,
+                        fields: vec![],
+                    },
+                    |term| Term::Case {
+                        constr: term.into(),
+                        branches: vec![Term::Constr {
+                            tag: 0,
+                            fields: vec![],
+                        }],
+                    },
+                );
+                assert_eq!(
+                    evaluate(scrutinees),
+                    Ok(Term::Constr {
+                        tag: 0,
+                        fields: vec![]
+                    })
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn formats_errors_holding_deep_data_in_bounded_stack() {
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 500;
+
+        // Far too little to format the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let data =
+                    (0..DEPTH).fold(Data::integer(0.into()), |data, _| Data::list(vec![data]));
+
+                for builtin in [
+                    DefaultFunction::UnConstrData,
+                    DefaultFunction::UnMapData,
+                    DefaultFunction::UnIData,
+                    DefaultFunction::UnBData,
+                ] {
+                    let program = Program {
+                        version: (1, 1, 0),
+                        term: Term::<NamedDeBruijn>::Builtin(builtin)
+                            .apply(Term::Constant(Constant::Data(data.clone()).into())),
+                    };
+
+                    let result = program.eval_version(ExBudget::max(), &Language::PlutusV3);
+                    let error = result.error().unwrap();
+
+                    assert!(matches!(error, Error::DeserialisationError(..)));
+                    assert!(format!("{error}").len() < 1 << 16);
+                    assert!(format!("{error:?}").len() < 1 << 16);
+                    assert!(format!("{error:#?}").len() < 1 << 20);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn results_are_only_discharged_on_demand() {
+        // Each application of `double` returns a constr whose two fields share
+        // the value it got, so the value is evaluated in 64 steps and in a
+        // little memory, but discharges into a term with 2^64 constrs.
+        let double = lambda(Term::Constr {
+            tag: 0,
+            fields: vec![var(1), var(1)],
+        });
+
+        let program = Program {
+            version: (1, 1, 0),
+            term: lambda((0..64).fold(Term::unit(), |term, _| var(1).apply(term))).apply(double),
+        };
+
+        let result = program.eval_version(ExBudget::default(), &Language::PlutusV3);
+
+        assert!(!result.failed(false, &Language::PlutusV2));
+        assert!(result.failed(true, &Language::PlutusV3));
+        assert_eq!(result.error(), None);
+        assert_eq!(result.constant(), None);
+        assert!(format!("{result:?}").len() < 1 << 20);
     }
 }

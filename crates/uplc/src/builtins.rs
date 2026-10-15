@@ -1,5 +1,12 @@
-use crate::ast::Term;
+use crate::{
+    ast::Term,
+    protocol::{
+        ALONZO_PROTOCOL_VERSION, CHANG_PROTOCOL_VERSION, PLOMIN_PROTOCOL_VERSION,
+        VALENTINE_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION, VASIL_PROTOCOL_VERSION,
+    },
+};
 use pallas_codec::flat::de;
+use pallas_primitives::conway::Language;
 use std::{fmt::Display, rc::Rc, str::FromStr};
 use strum::EnumIter;
 
@@ -133,6 +140,10 @@ pub enum DefaultFunction {
     Ripemd_160 = 86,
     ExpModInteger = 87,
     DropList = 88,
+    // Arrays
+    LengthOfArray = 89,
+    ListToArray = 90,
+    IndexArray = 91,
     // Match
     // CaseList = xx,
     // CaseData = xx,
@@ -342,6 +353,9 @@ impl TryFrom<u8> for DefaultFunction {
             v if v == DefaultFunction::Ripemd_160 as u8 => Ok(DefaultFunction::Ripemd_160),
             v if v == DefaultFunction::ExpModInteger as u8 => Ok(DefaultFunction::ExpModInteger),
             v if v == DefaultFunction::DropList as u8 => Ok(DefaultFunction::DropList),
+            v if v == DefaultFunction::LengthOfArray as u8 => Ok(DefaultFunction::LengthOfArray),
+            v if v == DefaultFunction::ListToArray as u8 => Ok(DefaultFunction::ListToArray),
+            v if v == DefaultFunction::IndexArray as u8 => Ok(DefaultFunction::IndexArray),
             v if v == DefaultFunction::Bls12_381_G1_MultiScalarMul as u8 => {
                 Ok(DefaultFunction::Bls12_381_G1_MultiScalarMul)
             }
@@ -455,6 +469,9 @@ impl FromStr for DefaultFunction {
             "findFirstSetBit" => Ok(FindFirstSetBit),
             "ripemd_160" => Ok(Ripemd_160),
             "dropList" => Ok(DropList),
+            "lengthOfArray" => Ok(LengthOfArray),
+            "listToArray" => Ok(ListToArray),
+            "indexArray" => Ok(IndexArray),
             "bls12_381_G1_multiScalarMul" => Ok(Bls12_381_G1_MultiScalarMul),
             "expModInteger" => Ok(ExpModInteger),
             "insertCoin" => Ok(InsertCoin),
@@ -565,6 +582,9 @@ impl Display for DefaultFunction {
             FindFirstSetBit => write!(f, "findFirstSetBit"),
             Ripemd_160 => write!(f, "ripemd_160"),
             DropList => write!(f, "dropList"),
+            LengthOfArray => write!(f, "lengthOfArray"),
+            ListToArray => write!(f, "listToArray"),
+            IndexArray => write!(f, "indexArray"),
             Bls12_381_G1_MultiScalarMul => write!(f, "bls12_381_G1_multiScalarMul"),
             ExpModInteger => write!(f, "expModInteger"),
             InsertCoin => write!(f, "insertCoin"),
@@ -580,20 +600,153 @@ impl Display for DefaultFunction {
     }
 }
 
+/// A group of builtins that reached the ledger languages together. Batch 4
+/// is split because PlutusV2 received its two halves separately.
+#[derive(Clone, Copy)]
+enum Batch {
+    One,
+    Two,
+    Three,
+    FourA,
+    FourB,
+    Five,
+    Six,
+}
+
 impl DefaultFunction {
-    /// The CIP-0153 value builtins, only available from Plutus V3 /
-    /// protocol version 11 (Van Rossem) onwards.
-    pub fn is_value_builtin(&self) -> bool {
+    /// The builtins over builtin arrays.
+    pub fn is_array_builtin(&self) -> bool {
         matches!(
             self,
-            DefaultFunction::InsertCoin
-                | DefaultFunction::LookupCoin
-                | DefaultFunction::UnionValue
-                | DefaultFunction::ValueContains
-                | DefaultFunction::ValueData
-                | DefaultFunction::UnValueData
-                | DefaultFunction::ScaleValue
+            DefaultFunction::LengthOfArray
+                | DefaultFunction::ListToArray
+                | DefaultFunction::IndexArray
         )
+    }
+
+    /// The batch of builtins this builtin was released in, as plutus-ledger-api
+    /// groups them in `PlutusLedgerApi.Common.Versions`.
+    fn batch(&self) -> Batch {
+        use DefaultFunction::*;
+
+        match self {
+            AddInteger
+            | SubtractInteger
+            | MultiplyInteger
+            | DivideInteger
+            | QuotientInteger
+            | RemainderInteger
+            | ModInteger
+            | EqualsInteger
+            | LessThanInteger
+            | LessThanEqualsInteger
+            | AppendByteString
+            | ConsByteString
+            | SliceByteString
+            | LengthOfByteString
+            | IndexByteString
+            | EqualsByteString
+            | LessThanByteString
+            | LessThanEqualsByteString
+            | Sha2_256
+            | Sha3_256
+            | Blake2b_256
+            | VerifyEd25519Signature
+            | AppendString
+            | EqualsString
+            | EncodeUtf8
+            | DecodeUtf8
+            | IfThenElse
+            | ChooseUnit
+            | Trace
+            | FstPair
+            | SndPair
+            | ChooseList
+            | MkCons
+            | HeadList
+            | TailList
+            | NullList
+            | ChooseData
+            | ConstrData
+            | MapData
+            | ListData
+            | IData
+            | BData
+            | UnConstrData
+            | UnMapData
+            | UnListData
+            | UnIData
+            | UnBData
+            | EqualsData
+            | MkPairData
+            | MkNilData
+            | MkNilPairData => Batch::One,
+            SerialiseData => Batch::Two,
+            VerifyEcdsaSecp256k1Signature | VerifySchnorrSecp256k1Signature => Batch::Three,
+            Bls12_381_G1_Add
+            | Bls12_381_G1_Neg
+            | Bls12_381_G1_ScalarMul
+            | Bls12_381_G1_Equal
+            | Bls12_381_G1_HashToGroup
+            | Bls12_381_G1_Compress
+            | Bls12_381_G1_Uncompress
+            | Bls12_381_G2_Add
+            | Bls12_381_G2_Neg
+            | Bls12_381_G2_ScalarMul
+            | Bls12_381_G2_Equal
+            | Bls12_381_G2_HashToGroup
+            | Bls12_381_G2_Compress
+            | Bls12_381_G2_Uncompress
+            | Bls12_381_MillerLoop
+            | Bls12_381_MulMlResult
+            | Bls12_381_FinalVerify
+            | Keccak_256
+            | Blake2b_224 => Batch::FourA,
+            IntegerToByteString | ByteStringToInteger => Batch::FourB,
+            AndByteString | OrByteString | XorByteString | ComplementByteString | ReadBit
+            | WriteBits | ReplicateByte | ShiftByteString | RotateByteString | CountSetBits
+            | FindFirstSetBit | Ripemd_160 => Batch::Five,
+            ExpModInteger
+            | DropList
+            | LengthOfArray
+            | ListToArray
+            | IndexArray
+            | Bls12_381_G1_MultiScalarMul
+            | Bls12_381_G2_MultiScalarMul
+            | InsertCoin
+            | LookupCoin
+            | UnionValue
+            | ValueContains
+            | ValueData
+            | UnValueData
+            | ScaleValue => Batch::Six,
+        }
+    }
+
+    /// The protocol major version from which this builtin is available in the
+    /// given ledger language (`builtinsIntroducedIn`). From protocol version 11
+    /// (Van Rossem) onwards every builtin is available in every ledger language.
+    pub fn introduced_in(&self, language: &Language) -> u16 {
+        match (language, self.batch()) {
+            (Language::PlutusV1, Batch::One) => ALONZO_PROTOCOL_VERSION,
+            (Language::PlutusV1, _) => VAN_ROSSEM_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::One | Batch::Two) => VASIL_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::Three) => VALENTINE_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::FourB) => PLOMIN_PROTOCOL_VERSION,
+            (Language::PlutusV2, Batch::FourA | Batch::Five | Batch::Six) => {
+                VAN_ROSSEM_PROTOCOL_VERSION
+            }
+            (
+                Language::PlutusV3,
+                Batch::One | Batch::Two | Batch::Three | Batch::FourA | Batch::FourB,
+            ) => CHANG_PROTOCOL_VERSION,
+            (Language::PlutusV3, Batch::Five) => PLOMIN_PROTOCOL_VERSION,
+            (Language::PlutusV3, Batch::Six) => VAN_ROSSEM_PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn is_available_in(&self, language: &Language, protocol_major_version: u16) -> bool {
+        protocol_major_version >= self.introduced_in(language)
     }
 
     pub fn aiken_name(&self) -> String {
@@ -689,6 +842,9 @@ impl DefaultFunction {
             FindFirstSetBit => "find_first_set_bit",
             Ripemd_160 => "ripemd_160",
             DropList => "drop_list",
+            LengthOfArray => "length_of_array",
+            ListToArray => "list_to_array",
+            IndexArray => "index_array",
             Bls12_381_G1_MultiScalarMul => "bls12_381_g1_multi_scalar_mul",
             ExpModInteger => "exp_mod_integer",
             InsertCoin => "insert_value",
@@ -714,5 +870,38 @@ impl<T> From<DefaultFunction> for Term<T> {
 impl<T> From<DefaultFunction> for Rc<Term<T>> {
     fn from(builtin: DefaultFunction) -> Self {
         Term::Builtin(builtin).into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DefaultFunction::{self, *};
+    use pallas_primitives::conway::Language;
+
+    /// A builtin of each batch, and the protocol versions at which it reached
+    /// Plutus V1, V2 and V3 (`builtinsIntroducedIn` at plutus 1b03c165).
+    const INTRODUCED_IN: [(DefaultFunction, [u16; 3]); 7] = [
+        (AddInteger, [5, 7, 9]),
+        (SerialiseData, [11, 7, 9]),
+        (VerifyEcdsaSecp256k1Signature, [11, 8, 9]),
+        (Bls12_381_G1_Add, [11, 11, 9]),
+        (IntegerToByteString, [11, 10, 9]),
+        (AndByteString, [11, 11, 10]),
+        (IndexArray, [11, 11, 11]),
+    ];
+
+    #[test]
+    fn builtins_are_introduced_as_plutus_ledger_api_says() {
+        let languages = [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3];
+
+        for (builtin, introduced_in) in INTRODUCED_IN {
+            for (language, protocol_major_version) in languages.iter().zip(introduced_in) {
+                assert_eq!(
+                    builtin.introduced_in(language),
+                    protocol_major_version,
+                    "{builtin} in {language:?}"
+                );
+            }
+        }
     }
 }

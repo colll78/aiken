@@ -266,7 +266,7 @@ impl Type {
             ) => true,
 
             None => false,
-            Some(UplcType::List(_) | UplcType::Pair(_, _)) => false,
+            Some(UplcType::List(_) | UplcType::Pair(_, _) | UplcType::Array(_)) => false,
         }
     }
 

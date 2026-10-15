@@ -8,6 +8,8 @@ pub mod machine;
 pub mod optimize;
 pub mod parser;
 mod pretty;
+pub mod protocol;
+mod rebuild;
 pub mod tx;
 
 pub use pallas_primitives::{

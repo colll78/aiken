@@ -4,6 +4,7 @@ use crate::{
     builtins::DefaultFunction,
 };
 use num_bigint::BigInt;
+use pallas_primitives::conway::Language;
 use std::string::FromUtf8Error;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error, miette::Diagnostic)]
@@ -48,6 +49,10 @@ pub enum Error {
     ListTypeMismatch(Type),
     #[error("type mismatch\n{:>13}(pair a b)\n{:>13} {0}", "Expected", "Got")]
     PairTypeMismatch(Type),
+    #[error("type mismatch\n{:>13} (array a)\n{:>13} {0}", "Expected", "Got")]
+    ArrayTypeMismatch(Type),
+    #[error("indexArray: index {0} is out of bounds for an array of length {1}")]
+    IndexArrayOutOfBounds(BigInt, usize),
     #[error(
         "unexpected empty list\n{:>13} {}",
         "List",
@@ -60,14 +65,14 @@ pub enum Error {
         indent(redacted(format!("{:#?}", .0), 10)),
         "Hint"
     )]
-    UnexpectedBuiltinTermArgument(Term<NamedDeBruijn>),
+    UnexpectedBuiltinTermArgument(Value),
     #[error(
         "a builtin expected a term argument, but something else was received:\n{:>13} {}\n{:>13} You probably have an extra force wrapped around a builtin",
         "Term",
         indent(redacted(format!("{:#?}", .0), 10)),
         "Hint"
     )]
-    BuiltinTermArgumentExpected(Term<NamedDeBruijn>),
+    BuiltinTermArgumentExpected(Value),
     #[error(
         "Unable to unlift value because it is not a constant\n{:>13} {}",
         "Value",
@@ -78,6 +83,24 @@ pub enum Error {
     MachineNeverReachedDone,
     #[error("integerToByteString encountered negative size\n{:>13} {0}", "Size")]
     IntegerToByteStringNegativeSize(BigInt),
+    #[error(
+        "{0} expects an integer in the signed 64-bit range\n{:>13} {1}",
+        "Integer"
+    )]
+    IntegerOutOfInt64Range(DefaultFunction, BigInt),
+    #[error(
+        "{0} expects an integer in the unsigned 64-bit range\n{:>13} {1}",
+        "Integer"
+    )]
+    IntegerOutOfWord64Range(DefaultFunction, BigInt),
+    #[error("{0} expects an integer within [-2^262143, 2^262143 - 1] but got one of {1} bits")]
+    IntegerOutOfBounds(DefaultFunction, u64),
+    #[error("{builtin} expects a bytestring of at most {maximum} bytes but got {actual} bytes")]
+    ByteStringTooLong {
+        builtin: DefaultFunction,
+        maximum: usize,
+        actual: usize,
+    },
     #[error("replicateByte encountered negative size\n{:>13} {0}", "Size")]
     ReplicateByteNegativeSize(BigInt),
     #[error("integerToByteString encountered negative input\n{:>13} {0}", "Input")]
@@ -125,6 +148,13 @@ pub enum Error {
     UnexpectedEd25519PublicKeyLength(usize),
     #[error("Ed25519S Signature should be 64 bytes but it was {0}")]
     UnexpectedEd25519SignatureLength(usize),
+    #[error("{builtin} expects a {expected}-byte {argument} but got {actual} bytes")]
+    UnexpectedArgumentLength {
+        builtin: DefaultFunction,
+        argument: &'static str,
+        expected: usize,
+        actual: usize,
+    },
     #[error(
       "failed to deserialise PlutusData using {0}\n{:>13} {}",
       "Value",
@@ -137,8 +167,15 @@ pub enum Error {
     ValueBuiltin(#[source] ValueError),
     #[error("builtin {0} is not available in this plutus / protocol version")]
     BuiltinNotAvailable(DefaultFunction),
-    #[error("Value constants are not available in this plutus / protocol version")]
-    ValueConstantNotAvailable,
+    #[error("{0:?} is not available at this protocol version")]
+    LanguageNotAvailable(Language),
+    #[error("a constr has {0} fields, more than the 1024 the ledger allows")]
+    ConstrTooManyFields(usize),
+    #[error(
+        "the type of a constant is too large for the ledger\n{:>13} {0}",
+        "Type"
+    )]
+    ConstantTypeTooLarge(Type),
     #[error("{0} is not within the bounds of a Natural")]
     OutsideNaturalBounds(BigInt),
     #[error("{0} is not within the bounds of a Byte")]
@@ -153,7 +190,7 @@ pub enum Error {
     Blst(blst::BLST_ERROR),
     #[error("blst::hashToGroup")]
     HashToCurveDstTooBig,
-    #[error("Scalar exceeds 512-byte bound for multiScalarMul")]
+    #[error("Scalar exceeds 512-byte bound for scalar multiplication")]
     MsmScalarOutOfBounds,
     #[cfg(not(target_family = "wasm"))]
     #[error(transparent)]

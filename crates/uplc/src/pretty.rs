@@ -2,10 +2,7 @@ use crate::{
     ast::{Constant, Data, Program, Term, Type},
     data::Constr,
     flat::Binder,
-    machine::{
-        runtime::{Compressable, convert_tag_to_constr},
-        value::from_pallas_bigint,
-    },
+    machine::{runtime::Compressable, value::from_pallas_bigint},
 };
 use pretty::RcDoc;
 use std::ascii::escape_default;
@@ -237,18 +234,25 @@ impl Constant {
             Constant::Bool(b) => RcDoc::text("bool")
                 .append(RcDoc::line())
                 .append(RcDoc::text(if *b { "True" } else { "False" })),
-            Constant::ProtoList(r#type, items) => RcDoc::text("(")
-                .append("list")
-                .append(RcDoc::space())
-                .append(r#type.to_doc())
-                .append(")")
-                .append(RcDoc::line())
-                .append(RcDoc::text("["))
-                .append(RcDoc::intersperse(
-                    items.iter().map(|c| c.to_doc_list()),
-                    RcDoc::text(", "),
-                ))
-                .append(RcDoc::text("]")),
+            Constant::ProtoList(r#type, items) | Constant::ProtoArray(r#type, items) => {
+                let kind = match self {
+                    Constant::ProtoArray(..) => "array",
+                    _ => "list",
+                };
+
+                RcDoc::text("(")
+                    .append(kind)
+                    .append(RcDoc::space())
+                    .append(r#type.to_doc())
+                    .append(")")
+                    .append(RcDoc::line())
+                    .append(RcDoc::text("["))
+                    .append(RcDoc::intersperse(
+                        items.iter().map(|c| c.to_doc_list()),
+                        RcDoc::text(", "),
+                    ))
+                    .append(RcDoc::text("]"))
+            }
             Constant::ProtoPair(type_left, type_right, left, right) => RcDoc::text("(")
                 .append("pair")
                 .append(RcDoc::space())
@@ -298,7 +302,7 @@ impl Constant {
                 .append(RcDoc::text("\"")),
             Constant::Unit => RcDoc::text("()"),
             Constant::Bool(b) => RcDoc::text(if *b { "True" } else { "False" }),
-            Constant::ProtoList(_, items) => RcDoc::text("[")
+            Constant::ProtoList(_, items) | Constant::ProtoArray(_, items) => RcDoc::text("[")
                 .append(RcDoc::intersperse(
                     items.iter().map(|c| c.to_doc_list()),
                     RcDoc::text(", "),
@@ -353,15 +357,9 @@ impl Constant {
     // This feels a little awkward here; not sure if it should be upstreamed to pallas
     fn to_doc_list_plutus_data(data: &Data) -> RcDoc<'_, ()> {
         match data {
-            Data::Constr(Constr {
-                tag,
-                any_constructor,
-                fields,
-            }) => RcDoc::text("Constr")
+            Data::Constr(constr @ Constr { fields, .. }) => RcDoc::text("Constr")
                 .append(RcDoc::space())
-                .append(RcDoc::as_string(
-                    convert_tag_to_constr(*tag).unwrap_or_else(|| any_constructor.unwrap()),
-                ))
+                .append(RcDoc::as_string(constr.constr_index()))
                 .append(RcDoc::space())
                 .append(RcDoc::text("["))
                 .append(RcDoc::intersperse(
@@ -423,8 +421,13 @@ impl Type {
                 .append(")"),
             Type::Data => RcDoc::text("data"),
             Type::Bls12_381G1Element => RcDoc::text("bls12_381_G1_element"),
-            Type::Bls12_381G2Element => RcDoc::text("bls12_381_G1_element"),
+            Type::Bls12_381G2Element => RcDoc::text("bls12_381_G2_element"),
             Type::Bls12_381MlResult => RcDoc::text("bls12_381_mlresult"),
+            Type::Array(r#type) => RcDoc::text("(array")
+                .append(RcDoc::line())
+                .append(r#type.to_doc())
+                .append(RcDoc::line_())
+                .append(")"),
             Type::Value => RcDoc::text("value"),
         }
     }

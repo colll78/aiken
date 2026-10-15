@@ -5,6 +5,7 @@ use crate::{
     },
     builtins::DefaultFunction,
     machine::runtime::Compressable,
+    protocol::MAX_CONSTANT_TYPE_SIZE,
 };
 use num_bigint::BigInt;
 use pallas_codec::flat::{
@@ -25,7 +26,30 @@ pub trait Binder<'b>: Encode + Decode<'b> {
     fn text(&self) -> String;
 }
 
-impl<'b, T> Flat<'b> for Program<T> where T: Binder<'b> + Debug {}
+impl<'b, T> Flat<'b> for Program<T>
+where
+    T: Binder<'b> + Debug,
+{
+    /// Decodes a program and its filler, rejecting anything after them as
+    /// Plutus' flat decoder does (`TooMuchSpace`).
+    fn unflat(bytes: &'b [u8]) -> Result<Self, de::Error> {
+        let mut d = Decoder::new(bytes);
+
+        let program = d.decode()?;
+
+        d.filler()?;
+
+        // A filler ending inside a byte leaves `pos` on that byte.
+        if d.pos < bytes.len() {
+            return Err(de::Error::Message(format!(
+                "{} unexpected bytes after the program",
+                bytes.len() - d.pos
+            )));
+        }
+
+        Ok(program)
+    }
+}
 
 impl<'b, T> Program<T>
 where
@@ -169,17 +193,34 @@ where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        let mut state_log: Vec<String> = vec![];
-        let version = (usize::decode(d)?, usize::decode(d)?, usize::decode(d)?);
-        let term_option = Term::decode_debug(d, &mut state_log);
+        let version = (decode_usize(d)?, decode_usize(d)?, decode_usize(d)?);
+        let (pos, used_bits) = (d.pos, d.used_bits);
 
-        match term_option {
-            Ok(term) => Ok(Program { version, term }),
-            Err(error) => Err(de::Error::Message(format!(
-                "{} {error}",
-                state_log.join("")
-            ))),
-        }
+        let term = match decode_term(d, &mut Log(None)) {
+            Ok(term) => term,
+            Err(error) => {
+                // Decode the term again, logging what decodes, to explain where
+                // it failed.
+                d.pos = pos;
+                d.used_bits = used_bits;
+
+                let mut log = vec![];
+
+                let error = decode_term::<T>(d, &mut Log(Some(&mut log)))
+                    .err()
+                    .unwrap_or(error);
+
+                return Err(de::Error::Message(format!("{} {error}", log.join(""))));
+            }
+        };
+
+        let program = Program { version, term };
+
+        program
+            .check_version_features()
+            .map_err(de::Error::Message)?;
+
+        Ok(program)
     }
 }
 
@@ -188,60 +229,77 @@ where
     T: Binder<'b> + Debug,
 {
     fn encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
-        match self {
-            Term::Var(name) => {
-                encode_term_tag(0, e)?;
-                name.encode(e)?;
-            }
-            Term::Delay(term) => {
-                encode_term_tag(1, e)?;
-                term.encode(e)?;
-            }
-            Term::Lambda {
-                parameter_name,
-                body,
-            } => {
-                encode_term_tag(2, e)?;
-                parameter_name.binder_encode(e)?;
-                body.encode(e)?;
-            }
-            Term::Apply { function, argument } => {
-                encode_term_tag(3, e)?;
-                function.encode(e)?;
-                argument.encode(e)?;
-            }
+        enum Pending<'a, T> {
+            Term(&'a Term<T>),
+            /// The rest of a list of terms: each is written after a 1 bit,
+            /// and the list ends with a 0 bit.
+            Terms(&'a [Term<T>]),
+        }
 
-            Term::Constant(constant) => {
-                encode_term_tag(4, e)?;
-                constant.encode(e)?;
-            }
+        // Terms can nest deeper than the stack would allow recursing.
+        let mut pending = vec![Pending::Term(self)];
 
-            Term::Force(term) => {
-                encode_term_tag(5, e)?;
-                term.encode(e)?;
-            }
+        while let Some(next) = pending.pop() {
+            let term = match next {
+                Pending::Term(term) => term,
+                Pending::Terms([]) => {
+                    e.bits(1, 0);
+                    continue;
+                }
+                Pending::Terms([term, rest @ ..]) => {
+                    e.bits(1, 1);
+                    pending.push(Pending::Terms(rest));
+                    term
+                }
+            };
 
-            Term::Error => {
-                encode_term_tag(6, e)?;
-            }
-            Term::Builtin(builtin) => {
-                encode_term_tag(7, e)?;
-
-                builtin.encode(e)?;
-            }
-            Term::Constr { tag, fields } => {
-                encode_term_tag(8, e)?;
-
-                tag.encode(e)?;
-
-                e.encode_list_with(fields, |term, e| (*term).encode(e))?;
-            }
-            Term::Case { constr, branches } => {
-                encode_term_tag(9, e)?;
-
-                constr.encode(e)?;
-
-                e.encode_list_with(branches, |term, e| (*term).encode(e))?;
+            match term {
+                Term::Var(name) => {
+                    encode_term_tag(0, e)?;
+                    name.encode(e)?;
+                }
+                Term::Delay(body) => {
+                    encode_term_tag(1, e)?;
+                    pending.push(Pending::Term(body));
+                }
+                Term::Lambda {
+                    parameter_name,
+                    body,
+                } => {
+                    encode_term_tag(2, e)?;
+                    parameter_name.binder_encode(e)?;
+                    pending.push(Pending::Term(body));
+                }
+                Term::Apply { function, argument } => {
+                    encode_term_tag(3, e)?;
+                    pending.push(Pending::Term(argument));
+                    pending.push(Pending::Term(function));
+                }
+                Term::Constant(constant) => {
+                    encode_term_tag(4, e)?;
+                    constant.encode(e)?;
+                }
+                Term::Force(body) => {
+                    encode_term_tag(5, e)?;
+                    pending.push(Pending::Term(body));
+                }
+                Term::Error => {
+                    encode_term_tag(6, e)?;
+                }
+                Term::Builtin(builtin) => {
+                    encode_term_tag(7, e)?;
+                    builtin.encode(e)?;
+                }
+                Term::Constr { tag, fields } => {
+                    encode_term_tag(8, e)?;
+                    encode_word64(*tag, e);
+                    pending.push(Pending::Terms(fields));
+                }
+                Term::Case { constr, branches } => {
+                    encode_term_tag(9, e)?;
+                    pending.push(Pending::Terms(branches));
+                    pending.push(Pending::Term(constr));
+                }
             }
         }
 
@@ -254,240 +312,280 @@ where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        match decode_term_tag(d)? {
-            0 => Ok(Term::Var(T::decode(d)?.into())),
-            1 => Ok(Term::Delay(Rc::new(Term::decode(d)?))),
-            2 => Ok(Term::Lambda {
-                parameter_name: T::binder_decode(d)?.into(),
-                body: Rc::new(Term::decode(d)?),
-            }),
-            3 => Ok(Term::Apply {
-                function: Rc::new(Term::decode(d)?),
-                argument: Rc::new(Term::decode(d)?),
-            }),
-            // Need size limit for Constant
-            4 => Ok(Term::Constant(Constant::decode(d)?.into())),
-            5 => Ok(Term::Force(Rc::new(Term::decode(d)?))),
-            6 => Ok(Term::Error),
-            7 => Ok(Term::Builtin(DefaultFunction::decode(d)?)),
-            8 => {
-                let tag = usize::decode(d)?;
-                let fields = d.decode_list_with(Term::<T>::decode)?;
+        decode_term(d, &mut Log(None))
+    }
+}
 
-                Ok(Term::Constr { tag, fields })
-            }
-            9 => {
-                let constr = (Term::<T>::decode(d)?).into();
+/// Where decoding a term logs what it decodes, if anywhere.
+struct Log<'a>(Option<&'a mut Vec<String>>);
 
-                let branches = d.decode_list_with(Term::<T>::decode)?;
+impl Log<'_> {
+    fn text(&mut self, text: &str) {
+        if let Some(log) = &mut self.0 {
+            log.push(text.to_string());
+        }
+    }
 
-                Ok(Term::Case { constr, branches })
-            }
-            x => {
-                let buffer_slice: Vec<u8> = d
-                    .buffer
-                    .to_vec()
-                    .iter()
-                    .skip(d.pos.saturating_sub(5))
-                    .take(10)
-                    .cloned()
-                    .collect();
-
-                Err(de::Error::UnknownTermConstructor(
-                    x,
-                    if d.pos > 5 { 5 } else { d.pos },
-                    format!("{buffer_slice:02X?}"),
-                    d.pos,
-                    d.buffer.len(),
-                ))
-            }
+    fn entry(&mut self, entry: impl FnOnce() -> String) {
+        if let Some(log) = &mut self.0 {
+            log.push(entry());
         }
     }
 }
 
-impl<'b, T> Term<T>
+/// A term waiting on the subterm being decoded.
+enum Pending<T> {
+    Delay,
+    Force,
+    Lambda(T),
+    /// An application, whose function is being decoded.
+    Function,
+    /// An application of this function, whose argument is being decoded.
+    Argument(Term<T>),
+    Fields(u64, Vec<Term<T>>),
+    Scrutinee,
+    Branches(Term<T>, Vec<Term<T>>),
+}
+
+/// Decodes a term. Terms can nest deeper than the stack would allow
+/// recursing, so the terms waiting on a subterm are kept on the heap.
+fn decode_term<'b, T>(d: &mut Decoder, log: &mut Log) -> Result<Term<T>, de::Error>
 where
     T: Binder<'b>,
 {
-    fn decode_debug(d: &mut Decoder, state_log: &mut Vec<String>) -> Result<Term<T>, de::Error> {
-        match decode_term_tag(d)? {
+    let mut pending = Vec::new();
+
+    let result = decode_pending(d, log, &mut pending);
+
+    if result.is_err() {
+        for waiting in pending.iter().rev() {
+            log.text(match waiting {
+                Pending::Function => " not parsed]",
+                Pending::Argument(_) => "]",
+                _ => ")",
+            });
+        }
+    }
+
+    result
+}
+
+fn decode_pending<'b, T>(
+    d: &mut Decoder,
+    log: &mut Log,
+    pending: &mut Vec<Pending<T>>,
+) -> Result<Term<T>, de::Error>
+where
+    T: Binder<'b>,
+{
+    'term: loop {
+        let mut term = match decode_term_tag(d)? {
             0 => {
-                state_log.push("(var ".to_string());
-                let var_option = T::decode(d);
-                match var_option {
+                log.text("(var ");
+
+                match T::decode(d) {
                     Ok(var) => {
-                        state_log.push(format!("{})", var.text()));
-                        Ok(Term::Var(var.into()))
+                        log.entry(|| format!("{})", var.text()));
+                        Term::Var(var.into())
                     }
                     Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
+                        log.text("parse error)");
+                        return Err(error);
                     }
                 }
             }
-
             1 => {
-                state_log.push("(delay ".to_string());
-                let term_option = Term::decode_debug(d, state_log);
-                match term_option {
-                    Ok(term) => {
-                        state_log.push(")".to_string());
-                        Ok(Term::Delay(Rc::new(term)))
-                    }
-                    Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
-                    }
-                }
+                log.text("(delay ");
+                pending.push(Pending::Delay);
+                continue;
             }
             2 => {
-                state_log.push("(lam ".to_string());
+                log.text("(lam ");
 
-                let var_option = T::binder_decode(d);
-                match var_option {
+                match T::binder_decode(d) {
                     Ok(var) => {
-                        state_log.push(var.text());
-                        let term_option = Term::decode_debug(d, state_log);
-                        match term_option {
-                            Ok(term) => {
-                                state_log.push(")".to_string());
-                                Ok(Term::Lambda {
-                                    parameter_name: var.into(),
-                                    body: Rc::new(term),
-                                })
-                            }
-                            Err(error) => {
-                                state_log.push(")".to_string());
-                                Err(error)
-                            }
-                        }
+                        log.entry(|| var.text());
+                        pending.push(Pending::Lambda(var));
+                        continue;
                     }
                     Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
+                        log.text(")");
+                        return Err(error);
                     }
                 }
             }
             3 => {
-                state_log.push("[ ".to_string());
-
-                let function_term_option = Term::decode_debug(d, state_log);
-                match function_term_option {
-                    Ok(function) => {
-                        state_log.push(" ".to_string());
-                        let arg_term_option = Term::decode_debug(d, state_log);
-                        match arg_term_option {
-                            Ok(argument) => {
-                                state_log.push("]".to_string());
-                                Ok(Term::Apply {
-                                    function: Rc::new(function),
-                                    argument: Rc::new(argument),
-                                })
-                            }
-                            Err(error) => {
-                                state_log.push("]".to_string());
-                                Err(error)
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        state_log.push(" not parsed]".to_string());
-                        Err(error)
-                    }
-                }
+                log.text("[ ");
+                pending.push(Pending::Function);
+                continue;
             }
-            // Need size limit for Constant
             4 => {
-                state_log.push("(con ".to_string());
+                log.text("(con ");
 
-                let con_option = Constant::decode(d);
-                match con_option {
+                match Constant::decode(d) {
                     Ok(constant) => {
-                        state_log.push(format!("{})", constant.to_pretty()));
-                        Ok(Term::Constant(constant.into()))
+                        log.entry(|| {
+                            let r#type = Type::from(&constant);
+
+                            // Printing Data recurses as deep as the Data nests,
+                            // so a constant holding some is logged by its type
+                            // alone.
+                            if mentions_data(&r#type) {
+                                format!("{type} …)")
+                            } else {
+                                format!("{})", constant.to_pretty())
+                            }
+                        });
+
+                        Term::Constant(constant.into())
                     }
                     Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
+                        log.text("parse error)");
+                        return Err(error);
                     }
                 }
             }
             5 => {
-                state_log.push("(force ".to_string());
-                let term_option = Term::decode_debug(d, state_log);
-                match term_option {
-                    Ok(term) => {
-                        state_log.push(")".to_string());
-                        Ok(Term::Force(Rc::new(term)))
-                    }
-                    Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
-                    }
-                }
+                log.text("(force ");
+                pending.push(Pending::Force);
+                continue;
             }
             6 => {
-                state_log.push("(error)".to_string());
-                Ok(Term::Error)
+                log.text("(error)");
+                Term::Error
             }
             7 => {
-                state_log.push("(builtin ".to_string());
+                log.text("(builtin ");
 
-                let builtin_option = DefaultFunction::decode(d);
-                match builtin_option {
+                match DefaultFunction::decode(d) {
                     Ok(builtin) => {
-                        state_log.push(format!("{builtin})"));
-                        Ok(Term::Builtin(builtin))
+                        log.entry(|| format!("{builtin})"));
+                        Term::Builtin(builtin)
                     }
                     Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
+                        log.text("parse error)");
+                        return Err(error);
                     }
                 }
             }
             8 => {
-                state_log.push("(constr ".to_string());
+                log.text("(constr ");
 
-                let tag = usize::decode(d)?;
+                let tag = decode_word64(d)?;
 
-                let fields = d.decode_list_with_debug(
-                    |d, state_log| Term::<T>::decode_debug(d, state_log),
-                    state_log,
-                )?;
+                if decode_bool(d)? {
+                    pending.push(Pending::Fields(tag, vec![]));
+                    continue;
+                }
 
-                Ok(Term::Constr { tag, fields })
+                log.text(")");
+                Term::Constr {
+                    tag,
+                    fields: vec![],
+                }
             }
             9 => {
-                state_log.push("(case ".to_string());
-                let constr = Term::<T>::decode_debug(d, state_log)?.into();
-
-                let branches = d.decode_list_with_debug(
-                    |d, state_log| Term::<T>::decode_debug(d, state_log),
-                    state_log,
-                )?;
-
-                Ok(Term::Case { constr, branches })
+                log.text("(case ");
+                pending.push(Pending::Scrutinee);
+                continue;
             }
             x => {
-                state_log.push("parse error".to_string());
+                log.text("parse error");
 
                 let buffer_slice: Vec<u8> = d
                     .buffer
-                    .to_vec()
                     .iter()
                     .skip(d.pos.saturating_sub(5))
                     .take(10)
                     .cloned()
                     .collect();
 
-                Err(de::Error::UnknownTermConstructor(
+                return Err(de::Error::UnknownTermConstructor(
                     x,
                     if d.pos > 5 { 5 } else { d.pos },
                     format!("{buffer_slice:02X?}"),
                     d.pos,
                     d.buffer.len(),
-                ))
+                ));
             }
+        };
+
+        // Complete the terms waiting on this one, until one waits on another.
+        loop {
+            let Some(waiting) = pending.pop() else {
+                return Ok(term);
+            };
+
+            term = match waiting {
+                Pending::Delay => Term::Delay(term.into()),
+                Pending::Force => Term::Force(term.into()),
+                Pending::Lambda(var) => Term::Lambda {
+                    parameter_name: var.into(),
+                    body: term.into(),
+                },
+                Pending::Function => {
+                    log.text(" ");
+                    pending.push(Pending::Argument(term));
+                    continue 'term;
+                }
+                Pending::Argument(function) => {
+                    log.text("]");
+                    term = Term::Apply {
+                        function: function.into(),
+                        argument: term.into(),
+                    };
+                    continue;
+                }
+                Pending::Fields(tag, mut fields) => {
+                    fields.push(term);
+                    pending.push(Pending::Fields(tag, fields));
+
+                    if decode_bool(d)? {
+                        continue 'term;
+                    }
+
+                    let Some(Pending::Fields(tag, fields)) = pending.pop() else {
+                        unreachable!("the fields were just pushed")
+                    };
+
+                    Term::Constr { tag, fields }
+                }
+                Pending::Scrutinee => {
+                    pending.push(Pending::Branches(term, vec![]));
+
+                    if decode_bool(d)? {
+                        continue 'term;
+                    }
+
+                    let Some(Pending::Branches(constr, branches)) = pending.pop() else {
+                        unreachable!("the branches were just pushed")
+                    };
+
+                    Term::Case {
+                        constr: constr.into(),
+                        branches,
+                    }
+                }
+                Pending::Branches(constr, mut branches) => {
+                    branches.push(term);
+                    pending.push(Pending::Branches(constr, branches));
+
+                    if decode_bool(d)? {
+                        continue 'term;
+                    }
+
+                    let Some(Pending::Branches(constr, branches)) = pending.pop() else {
+                        unreachable!("the branches were just pushed")
+                    };
+
+                    Term::Case {
+                        constr: constr.into(),
+                        branches,
+                    }
+                }
+            };
+
+            log.text(")");
         }
     }
 }
@@ -527,6 +625,15 @@ impl Encode for Constant {
                 encode_constant(&type_encode, e)?;
 
                 e.encode_list_with(list, |item, e| encode_constant_value(item, e))?;
+            }
+            Constant::ProtoArray(typ, items) => {
+                let mut type_encode = vec![7, 12];
+
+                encode_type(typ, &mut type_encode);
+
+                encode_constant(&type_encode, e)?;
+
+                e.encode_list_with(items, |item, e| encode_constant_value(item, e))?;
             }
             Constant::ProtoPair(type1, type2, a, b) => {
                 let mut type_encode = vec![7, 7, 6];
@@ -603,7 +710,7 @@ fn encode_constant_value(x: &Constant, e: &mut Encoder) -> Result<(), en::Error>
         Constant::String(s) => s.encode(e),
         Constant::Unit => Ok(()),
         Constant::Bool(b) => b.encode(e),
-        Constant::ProtoList(_, list) => {
+        Constant::ProtoList(_, list) | Constant::ProtoArray(_, list) => {
             e.encode_list_with(list, |item, e| encode_constant_value(item, e))?;
             Ok(())
         }
@@ -652,77 +759,30 @@ fn encode_type(typ: &Type, bytes: &mut Vec<u8>) {
         Type::Bls12_381G1Element => bytes.push(9),
         Type::Bls12_381G2Element => bytes.push(10),
         Type::Bls12_381MlResult => bytes.push(11),
+        Type::Array(sub_typ) => {
+            bytes.extend_from_slice(&[7, 12]);
+            encode_type(sub_typ, bytes);
+        }
         Type::Value => bytes.push(13),
     }
 }
 
+/// Decodes a constant as Plutus' `decodeKindedUni` does: its type tags must
+/// encode exactly one type, with no tag left over.
 impl Decode<'_> for Constant {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        match &decode_constant(d)?[..] {
-            [0] => Ok(Constant::Integer(BigInt::decode(d)?)),
-            [1] => Ok(Constant::ByteString(Vec::<u8>::decode(d)?)),
-            [2] => Ok(Constant::String(String::decode(d)?)),
-            [3] => Ok(Constant::Unit),
-            [4] => Ok(Constant::Bool(bool::decode(d)?)),
-            [7, 5, rest @ ..] => {
-                let mut rest = VecDeque::from(rest.to_vec());
+        let tags = decode_constant(d)?;
+        let mut rest = VecDeque::from(tags.clone());
 
-                let typ = decode_type(&mut rest)?;
+        let typ = decode_type(&mut rest)?;
 
-                let list: Vec<Rc<Constant>> = d.decode_list_with(|d| {
-                    decode_constant_value(typ.clone().into(), d).map(Rc::new)
-                })?;
-
-                Ok(Constant::ProtoList(typ, list.into()))
-            }
-            [7, 7, 6, rest @ ..] => {
-                let mut rest = VecDeque::from(rest.to_vec());
-
-                let type1 = decode_type(&mut rest)?;
-                let type2 = decode_type(&mut rest)?;
-
-                let a = decode_constant_value(type1.clone().into(), d)?;
-                let b = decode_constant_value(type2.clone().into(), d)?;
-
-                Ok(Constant::ProtoPair(type1, type2, a.into(), b.into()))
-            }
-            [8] => {
-                let cbor = Vec::<u8>::decode(d)?;
-
-                let data = Data::decode_fragment(&cbor)
-                    .map_err(|err| de::Error::Message(err.to_string()))?;
-
-                Ok(Constant::Data(data))
-            }
-            [9] => {
-                let p1 = Vec::<u8>::decode(d)?;
-
-                let _p1 = blst::blst_p1::uncompress(&p1)
-                    .map_err(|err| de::Error::Message(format!("Failed to uncompress p1: {err}")))?;
-
-                Err(de::Error::Message(
-                    "BLS12-381 G1 points are not supported for flat decoding.".to_string(),
-                ))
-            }
-
-            [10] => {
-                let p2 = Vec::<u8>::decode(d)?;
-
-                let _p2 = blst::blst_p2::uncompress(&p2)
-                    .map_err(|err| de::Error::Message(format!("Failed to uncompress p2: {err}")))?;
-
-                Err(de::Error::Message(
-                    "BLS12-381 G2 points are not supported for flat decoding.".to_string(),
-                ))
-            }
-            [11] => Err(de::Error::Message(
-                "BLS12-381 ML results are not supported for flat decoding".to_string(),
-            )),
-            [13] => Ok(Constant::Value(decode_value(d)?)),
-            x => Err(de::Error::Message(format!(
-                "Unknown constant constructor tag: {x:?}"
-            ))),
+        if !rest.is_empty() {
+            return Err(de::Error::Message(format!(
+                "Constant type tags {tags:?} encode more than one type"
+            )));
         }
+
+        decode_constant_value(typ.into(), d)
     }
 }
 
@@ -747,12 +807,21 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
         Type::ByteString => Ok(Constant::ByteString(Vec::<u8>::decode(d)?)),
         Type::String => Ok(Constant::String(String::decode(d)?)),
         Type::Unit => Ok(Constant::Unit),
-        Type::Bool => Ok(Constant::Bool(bool::decode(d)?)),
+        Type::Bool => Ok(Constant::Bool(decode_bool(d)?)),
         Type::List(sub_type) => {
             let list: Vec<Rc<Constant>> =
                 d.decode_list_with(|d| decode_constant_value(sub_type.clone(), d).map(Rc::new))?;
 
             Ok(Constant::ProtoList(sub_type.as_ref().clone(), list.into()))
+        }
+        Type::Array(sub_type) => {
+            let items: Vec<Rc<Constant>> =
+                d.decode_list_with(|d| decode_constant_value(sub_type.clone(), d).map(Rc::new))?;
+
+            Ok(Constant::ProtoArray(
+                sub_type.as_ref().clone(),
+                items.into(),
+            ))
         }
         Type::Pair(type1, type2) => {
             let a = decode_constant_value(type1.clone(), d)?;
@@ -800,6 +869,24 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
     }
 }
 
+/// Whether values of a type can hold Data, however deep within lists, arrays
+/// and pairs. Types take at most `MAX_CONSTANT_TYPE_SIZE` tags to decode, so
+/// this recursion is shallow.
+fn mentions_data(r#type: &Type) -> bool {
+    match r#type {
+        Type::Data => true,
+        Type::List(item) | Type::Array(item) => mentions_data(item),
+        Type::Pair(first, second) => mentions_data(first) || mentions_data(second),
+        _ => false,
+    }
+}
+
+/// Decodes a bool, failing at the end of the input where pallas'
+/// `Decoder::bool` panics.
+fn decode_bool(d: &mut Decoder) -> Result<bool, de::Error> {
+    Ok(d.bits8(1)? == 1)
+}
+
 fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
     match types.pop_front() {
         Some(4) => Ok(Type::Bool),
@@ -814,6 +901,7 @@ fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
         Some(13) => Ok(Type::Value),
         Some(7) => match types.pop_front() {
             Some(5) => Ok(Type::List(decode_type(types)?.into())),
+            Some(12) => Ok(Type::Array(decode_type(types)?.into())),
             Some(7) => match types.pop_front() {
                 Some(6) => {
                     let type1 = decode_type(types)?;
@@ -927,7 +1015,7 @@ impl Binder<'_> for NamedDeBruijn {
 
 impl Encode for DeBruijn {
     fn encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
-        usize::from(*self).encode(e)?;
+        encode_word64(self.word(), e);
 
         Ok(())
     }
@@ -935,7 +1023,7 @@ impl Encode for DeBruijn {
 
 impl Decode<'_> for DeBruijn {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        Ok(usize::decode(d)?.into())
+        Ok(DeBruijn::from_word(decode_word64(d)?))
     }
 }
 
@@ -1006,6 +1094,70 @@ fn encode_term_tag(tag: u8, e: &mut Encoder) -> Result<(), en::Error> {
     safe_encode_bits(TERM_TAG_WIDTH, tag, e)
 }
 
+/// Encode a natural as a flat word: 7-bit groups, least significant first.
+/// Unlike Pallas' `Encoder::word`, this does not go through `usize`, so it
+/// handles the full `Word64` range on 32-bit targets as well.
+fn encode_word64(word: u64, e: &mut Encoder) {
+    let mut word = word;
+
+    loop {
+        let mut group = (word & 0x7f) as u8;
+        word >>= 7;
+
+        if word != 0 {
+            group |= 0x80;
+        }
+
+        e.bits(8, group);
+
+        if word == 0 {
+            break;
+        }
+    }
+}
+
+/// Decode a flat-encoded natural that must fit in 64 bits, as the reference
+/// `Word64` decoder requires. Pallas' `Decoder::word` accumulates into a
+/// `usize` without any overflow check, so an over-long encoding silently
+/// aliases a smaller value: a constr tag of 2^64 decodes as 0 everywhere, and
+/// any tag at or above 2^32 aliases on 32-bit targets.
+fn decode_word64(d: &mut Decoder) -> Result<u64, de::Error> {
+    let mut word: u64 = 0;
+    let mut shift: u32 = 0;
+
+    loop {
+        let byte = d.bits8(8)?;
+        let chunk = u64::from(byte & 0x7f);
+
+        if shift > 63 || (shift == 63 && chunk > 1) {
+            return Err(de::Error::Message(
+                "flat-encoded natural does not fit in 64 bits".to_string(),
+            ));
+        }
+
+        word |= chunk << shift;
+
+        if byte & 0x80 == 0 {
+            return Ok(word);
+        }
+
+        shift += 7;
+    }
+}
+
+/// Like [`decode_word64`], but additionally refuses values that do not fit in
+/// a `usize` (only possible on 32-bit targets) rather than truncating them.
+fn decode_usize(d: &mut Decoder) -> Result<usize, de::Error> {
+    let word = decode_word64(d)?;
+
+    usize::try_from(word).map_err(|_| {
+        de::Error::Message(format!(
+            "flat-encoded natural {word} does not fit in a {}-bit word",
+            usize::BITS
+        ))
+    })
+}
+
 fn decode_term_tag(d: &mut Decoder) -> Result<u8, de::Error> {
     d.bits8(TERM_TAG_WIDTH as usize)
 }
@@ -1027,8 +1179,23 @@ pub fn encode_constant(tag: &[u8], e: &mut Encoder) -> Result<(), en::Error> {
     Ok(())
 }
 
+/// Decodes the type tags of a constant, rejecting more than the ledger
+/// allows ([`MAX_CONSTANT_TYPE_SIZE`]) as soon as there are, so that a long
+/// list is neither read in full nor decoded into a deeply nested type.
 pub fn decode_constant(d: &mut Decoder) -> Result<Vec<u8>, de::Error> {
-    d.decode_list_with(decode_constant_tag)
+    let mut tags = Vec::new();
+
+    while decode_bool(d)? {
+        if tags.len() == MAX_CONSTANT_TYPE_SIZE {
+            return Err(de::Error::Message(format!(
+                "Constant type takes more than {MAX_CONSTANT_TYPE_SIZE} tags"
+            )));
+        }
+
+        tags.push(decode_constant_tag(d)?);
+    }
+
+    Ok(tags)
 }
 
 pub fn encode_constant_tag(tag: &u8, e: &mut Encoder) -> Result<(), en::Error> {
@@ -1041,9 +1208,9 @@ pub fn decode_constant_tag(d: &mut Decoder) -> Result<u8, de::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Constant, Program, Term, decode_value};
+    use super::{Constant, Program, Term, decode_bool, decode_value, encode_constant};
     use crate::{
-        ast::{BigIntValueEntries, DeBruijn, Name, Type, Value},
+        ast::{BigIntValueEntries, Data, DeBruijn, Name, Type, Value},
         parser,
     };
     use indoc::indoc;
@@ -1335,5 +1502,336 @@ mod tests {
         let mut truncated = encode_raw_value(vec![(vec![0], vec![(vec![0], BigInt::from(1))])]);
         truncated.truncate(truncated.len() - 2);
         assert!(decode_value(&mut Decoder::new(&truncated)).is_err());
+    }
+
+    /// Flat bytes for `(program 1.1.0 (constr <tag>))`, with the tag written
+    /// as the given 7-bit groups (least significant first).
+    fn constr_with_tag_groups(groups: &[u8]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        for word in [1_usize, 1, 0] {
+            word.encode(&mut e).unwrap();
+        }
+        e.bits(4, 8);
+        for (i, group) in groups.iter().enumerate() {
+            let more = if i + 1 < groups.len() { 0x80 } else { 0 };
+            e.bits(8, group | more);
+        }
+        // empty field list, then padding
+        e.bits(1, 0);
+        pallas_codec::flat::filler::Filler::FillerEnd
+            .encode(&mut e)
+            .unwrap();
+        e.buffer
+    }
+
+    #[test]
+    fn constr_tag_must_fit_in_64_bits() {
+        // 2^64 - 1 is the largest tag the reference implementation accepts.
+        let max =
+            constr_with_tag_groups(&[0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 1]);
+        let program = Program::<DeBruijn>::unflat(&max).unwrap();
+        assert_eq!(
+            program.term,
+            Term::Constr {
+                tag: u64::MAX,
+                fields: vec![]
+            }
+        );
+        assert_eq!(program.to_flat().unwrap(), max);
+
+        // 2^32 + 1 must neither alias nor be rejected on 32-bit targets.
+        let wide = constr_with_tag_groups(&[1, 0, 0, 0, 0x10]);
+        let program = Program::<DeBruijn>::unflat(&wide).unwrap();
+        assert_eq!(
+            program.term,
+            Term::Constr {
+                tag: (1 << 32) + 1,
+                fields: vec![]
+            }
+        );
+        assert_eq!(program.to_flat().unwrap(), wide);
+
+        // 2^64 used to alias to 0.
+        let overflow = constr_with_tag_groups(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(Program::<DeBruijn>::unflat(&overflow).is_err());
+
+        // An 11th group can only overflow, even when it is zero.
+        let overlong = constr_with_tag_groups(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(Program::<DeBruijn>::unflat(&overlong).is_err());
+
+        // A redundant (but in-range) encoding is still accepted.
+        let padded = constr_with_tag_groups(&[5, 0]);
+        assert_eq!(
+            Program::<DeBruijn>::unflat(&padded).unwrap().term,
+            Term::Constr {
+                tag: 5,
+                fields: vec![]
+            }
+        );
+    }
+
+    #[test]
+    fn constr_and_case_rejected_before_uplc_1_1() {
+        for source in [
+            "(constr 0)",
+            "(case (constr 0) (con integer 1))",
+            "(lam x [(force (delay (constr 1 x))) x])",
+        ] {
+            let mut program: Program<DeBruijn> =
+                parser::program(&format!("(program 1.1.0 {source})"))
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+            assert!(Program::<DeBruijn>::unflat(&program.to_flat().unwrap()).is_ok());
+
+            program.version = (1, 0, 0);
+            assert!(
+                Program::<DeBruijn>::unflat(&program.to_flat().unwrap()).is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn bytes_after_the_program_rejected() {
+        let program: Program<DeBruijn> = parser::program("(program 1.0.0 (con integer 1))")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let bytes = program.to_flat().unwrap();
+
+        assert_eq!(Program::<DeBruijn>::unflat(&bytes).unwrap(), program);
+
+        for trailing in [&[0x00][..], &[0x01], &[0x00, 0x00, 0x00, 0x00]] {
+            let bytes = [&bytes[..], trailing].concat();
+
+            assert!(
+                Program::<DeBruijn>::unflat(&bytes).is_err(),
+                "{}",
+                hex::encode(&bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn array_constant_round_trips() {
+        let source = "(program 1.1.0 (con (array (list integer)) [[1, 2], [], [3]]))";
+        let program: Program<DeBruijn> = parser::program(source).unwrap().try_into().unwrap();
+
+        assert!(matches!(
+            program.term,
+            Term::Constant(ref c) if matches!(c.as_ref(), Constant::ProtoArray(Type::List(_), items) if items.len() == 3)
+        ));
+
+        let bytes = program.to_flat().unwrap();
+        // Decodes to the same array in Plutus.
+        assert_eq!(hex::encode(&bytes), "0101004bf2f58302822c1801");
+
+        let decoded = Program::<DeBruijn>::unflat(&bytes).unwrap();
+        assert_eq!(decoded, program);
+
+        let printed: Program<Name> = (&decoded).try_into().unwrap();
+        let reparsed: Program<DeBruijn> = parser::program(&printed.to_pretty())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(reparsed, program);
+    }
+
+    /// Flat bytes for `(program 1.1.0 (con <type> <value>))`, with the type
+    /// given as its raw tags and the value written by `value`.
+    fn constant_with_tags(tags: &[u8], value: impl FnOnce(&mut Encoder)) -> Vec<u8> {
+        let mut e = Encoder::new();
+        for word in [1_usize, 1, 0] {
+            word.encode(&mut e).unwrap();
+        }
+        e.bits(4, 4);
+        encode_constant(tags, &mut e).unwrap();
+        value(&mut e);
+        pallas_codec::flat::filler::Filler::FillerEnd
+            .encode(&mut e)
+            .unwrap();
+        e.buffer
+    }
+
+    #[test]
+    fn constant_type_tags_must_encode_one_type() {
+        // Units have no value, and a list or array value here is empty.
+        for (tags, is_list, leftover) in [
+            (&[3][..], false, &[3][..]),
+            (&[7, 7, 6, 3, 3], false, &[3]),
+            (&[7, 5, 3], true, &[0]),
+            (&[7, 12, 3], true, &[3, 3, 3]),
+            (&[7, 5, 7, 7, 6, 3, 3], true, &[7]),
+        ] {
+            let value = |e: &mut Encoder| {
+                if is_list {
+                    e.bits(1, 0);
+                }
+            };
+
+            let valid = constant_with_tags(tags, value);
+            assert!(Program::<DeBruijn>::unflat(&valid).is_ok(), "{tags:?}");
+
+            let invalid = constant_with_tags(&[tags, leftover].concat(), value);
+            assert!(
+                Program::<DeBruijn>::unflat(&invalid).is_err(),
+                "{tags:?} {leftover:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_types_limited_to_32_tags() {
+        // A list type takes 2 more tags than its element type, and a pair
+        // type 3 more than its two, so a type takes an odd number of tags.
+        let lists = |depth: usize| [&[7, 5].repeat(depth)[..], &[3]].concat();
+        let empty = |e: &mut Encoder| {
+            e.bits(1, 0);
+        };
+
+        assert_eq!(lists(15).len(), 31);
+        assert!(Program::<DeBruijn>::unflat(&constant_with_tags(&lists(15), empty)).is_ok());
+
+        // Rejected before the tags are decoded into a type.
+        for depth in [16, 100_000] {
+            assert!(
+                Program::<DeBruijn>::unflat(&constant_with_tags(&lists(depth), empty)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_bools_rejected() {
+        let mut d = Decoder::new(&[0b1000_0000]);
+        assert!(decode_bool(&mut d).unwrap());
+        for _ in 0..7 {
+            assert!(!decode_bool(&mut d).unwrap());
+        }
+        assert!(decode_bool(&mut d).is_err());
+
+        // A `bool` constant whose value is past the end of the input, which
+        // used to panic in pallas' `Decoder::bool`.
+        let bytes = hex::decode("010000183682d528").unwrap();
+        assert!(Program::<DeBruijn>::unflat(&bytes).is_err());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn decodes_deep_data_constants_in_bounded_stack() {
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 2_000;
+
+        // Room for the nested drops allowed before queuing (see
+        // `data::tests::drops_deep_data_in_bounded_stack`), but far too little
+        // to print or decode the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let data =
+                    (0..DEPTH).fold(Data::integer(0.into()), |data, _| Data::list(vec![data]));
+                let program = Program::<DeBruijn> {
+                    version: (1, 0, 0),
+                    term: Term::Constant(Constant::Data(data).into()),
+                };
+
+                let bytes = program.to_flat().unwrap();
+                assert_eq!(Program::<DeBruijn>::unflat(&bytes).unwrap(), program);
+
+                // Logged on the way to a failure: an application of the
+                // constant to a term with no tag.
+                let mut e = Encoder::new();
+                for word in [1_usize, 0, 0] {
+                    word.encode(&mut e).unwrap();
+                }
+                e.bits(4, 3);
+                program.term.encode(&mut e).unwrap();
+                e.bits(4, 15);
+                pallas_codec::flat::filler::Filler::FillerEnd
+                    .encode(&mut e)
+                    .unwrap();
+                assert!(Program::<DeBruijn>::unflat(&e.buffer).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn handles_deep_terms_in_bounded_stack() {
+        use crate::ast::{FakeNamedDeBruijn, NamedDeBruijn};
+
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 500;
+
+        type Nest = fn(Term<DeBruijn>) -> Term<DeBruijn>;
+
+        let nests: [Nest; 8] = [
+            |term| term.delay(),
+            |term| term.force(),
+            |term| Term::Lambda {
+                parameter_name: DeBruijn::new(0).into(),
+                body: term.into(),
+            },
+            |term| term.apply(Term::unit()),
+            |term| Term::unit().apply(term),
+            |term| Term::Constr {
+                tag: 0,
+                fields: vec![Term::unit(), term, Term::unit()],
+            },
+            |term| Term::Case {
+                constr: term.into(),
+                branches: vec![Term::unit()],
+            },
+            |term| Term::Case {
+                constr: Term::unit().into(),
+                branches: vec![Term::unit(), term],
+            },
+        ];
+
+        // Far too little to walk the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                for nest in nests {
+                    let program = Program::<DeBruijn> {
+                        version: (1, 1, 0),
+                        term: (0..DEPTH).fold(Term::Error, |term, _| nest(term)),
+                    };
+
+                    let bytes = program.to_flat().unwrap();
+                    let decoded = Program::<DeBruijn>::unflat(&bytes).unwrap();
+                    assert_eq!(decoded, program);
+                    assert_eq!(decoded.clone(), program);
+                    assert!(format!("{decoded:?}").len() < 1 << 20);
+
+                    let named: Program<NamedDeBruijn> = decoded.into();
+                    let fake: Program<FakeNamedDeBruijn> = named.clone().into();
+                    let name: Program<Name> = named.try_into().unwrap();
+                    assert_eq!(Program::<DeBruijn>::try_from(name).unwrap(), program);
+                    assert_eq!(
+                        Program::<DeBruijn>::from(Program::<NamedDeBruijn>::from(fake)),
+                        program
+                    );
+
+                    // Logged on the way to a failure: the bytes end inside the
+                    // nesting.
+                    assert!(Program::<DeBruijn>::unflat(&bytes[..bytes.len() / 2]).is_err());
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

@@ -66,6 +66,31 @@ jobs:
       - name: Run unit tests
         run: cargo test --verbose --workspace
 
+  wasm_tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ${{ runner.os }}-cache-wasm-v${{ inputs.cache-version }}
+      - uses: bytecodealliance/actions/wasmtime/setup@v1
+      # The evaluator is also shipped as wasm, where usize is 32 bits and
+      # secp256k1 goes through k256 instead of libsecp256k1, so run its unit
+      # and conformance tests on a wasm32 target as well.
+      - name: Run uplc tests on wasm32
+        env:
+          CC_wasm32_wasip1: clang
+          AR_wasm32_wasip1: llvm-ar
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: >-
+            wasmtime --dir=.
+            --dir=${{ github.workspace }}::${{ github.workspace }}
+            --env INSTA_WORKSPACE_ROOT=${{ github.workspace }}
+        run: |
+          sudo apt-get install -y clang llvm
+          rustup target add wasm32-wasip1
+          cargo test --verbose --package uplc --target wasm32-wasip1
+
   benchmarks:
     runs-on: ubuntu-24.04
     steps:

@@ -14,37 +14,25 @@ pub enum Error {
     FlatDecode(#[from] pallas_codec::flat::de::Error),
     #[error("{0}")]
     FragmentDecode(#[from] pallas_primitives::Error),
-    #[error("{}{}", .0, .2.iter()
-        .map(|trace| trace.to_string())
-        .map(|trace| {
-            format!(
-                "\n{:>13} {}",
-                "Trace",
-                if trace.contains('\n') {
-                    trace.lines()
-                        .enumerate()
-                        .map(|(ix, row)| {
-                            if ix == 0 {
-                                row.to_string()
-                            } else {
-                                format!("{:>13} {}", "",
-                                    row
-                                )
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                } else {
-                    trace.to_string()
-                }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("")
-        .as_str()
-    )]
+    #[error("{}{}", .0, format_traces(.2))]
     Machine(machine::Error, ExBudget, Vec<Trace>),
+    #[error(
+        "the evaluation finished but the result value is not valid: PlutusV3 scripts must return unit{}",
+        format_traces(.1)
+    )]
+    InvalidReturnValue(ExBudget, Vec<Trace>),
 
+    #[error("{0} unexpected bytes follow a PlutusV3 script")]
+    ScriptTrailingBytes(usize),
+    #[error(
+        "UPLC version {}.{}.{} is not available to {language:?} at protocol version {protocol_major_version}",
+        .version.0, .version.1, .version.2
+    )]
+    UplcVersionNotAvailable {
+        language: Language,
+        version: (usize, usize, usize),
+        protocol_major_version: u16,
+    },
     #[error("native script can't be executed in phase-two")]
     NativeScriptPhaseTwo,
     #[error("can't eval without redeemers")]
@@ -102,4 +90,34 @@ pub enum Error {
     ApplyParamsError,
     #[error("validity start or end too far in the past")]
     SlotTooFarInThePast { oldest_allowed: u64 },
+}
+
+fn format_traces(traces: &[Trace]) -> String {
+    traces
+        .iter()
+        .map(|trace| trace.to_string())
+        .map(|trace| {
+            format!(
+                "\n{:>13} {}",
+                "Trace",
+                if trace.contains('\n') {
+                    trace
+                        .lines()
+                        .enumerate()
+                        .map(|(ix, row)| {
+                            if ix == 0 {
+                                row.to_string()
+                            } else {
+                                format!("{:>13} {}", "", row)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    trace.to_string()
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
 }

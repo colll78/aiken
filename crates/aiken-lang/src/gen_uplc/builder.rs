@@ -190,6 +190,7 @@ pub fn get_generic_variant_name(t: &Rc<Type>) -> String {
         Some(UplcType::Bls12_381G2Element) => "_bls381_12_g2".to_string(),
         Some(UplcType::Bls12_381MlResult) => "_ml_result".to_string(),
         Some(UplcType::Value) => "_value".to_string(),
+        Some(UplcType::Array(_)) => unreachable!("Aiken has no array type"),
         None if t.is_unbound() => "_unbound".to_string(),
         None if t.is_generic() => {
             unreachable!("FOUND A POLYMORPHIC TYPE. EXPECTED MONOMORPHIC TYPE")
@@ -509,6 +510,7 @@ pub fn known_data_to_type(
         }
         Some(UplcType::Bls12_381MlResult) => panic!("ML Result not supported"),
         Some(UplcType::Value) => Term::Builtin(DefaultFunction::UnValueData).apply(term),
+        Some(UplcType::Array(_)) => unreachable!("Aiken has no array type"),
         Some(UplcType::Data) | None => {
             let list_decorator = lookup_data_type_by_tipo(data_types, field_type)
                 .map(|dt| {
@@ -548,6 +550,7 @@ pub fn unknown_data_to_type(
         }
         Some(UplcType::Bls12_381MlResult) => panic!("ML Result not supported"),
         Some(UplcType::Value) => Term::Builtin(DefaultFunction::UnValueData).apply(term),
+        Some(UplcType::Array(_)) => unreachable!("Aiken has no array type"),
         Some(UplcType::Pair(_, _)) => Term::tail_list()
             .apply(Term::tail_list().apply(Term::var("__list_data")))
             .delayed_choose_list(
@@ -619,6 +622,7 @@ pub fn softcast_data_to_type_otherwise(
         Some(UplcType::Value) => {
             callback(Term::Builtin(DefaultFunction::UnValueData).apply(Term::Var(val)))
         }
+        Some(UplcType::Array(_)) => unreachable!("Aiken has no array type"),
         Some(UplcType::Data) => callback(Term::Var(val)),
 
         Some(UplcType::Bls12_381MlResult) => {
@@ -742,7 +746,7 @@ fn convert_constant_to_data(constant: &UplcConstant) -> Option<UplcConstant> {
         UplcConstant::Bls12_381G2Element(element) => {
             Data::bytestring(element.deref().clone().compress())
         }
-        UplcConstant::Bls12_381MlResult(_) => return None,
+        UplcConstant::Bls12_381MlResult(_) | UplcConstant::ProtoArray(..) => return None,
         UplcConstant::Value(value) => value.to_data_checked().ok()?,
     };
 
@@ -768,6 +772,7 @@ pub fn convert_type_to_data(
         }
         Some(UplcType::Bls12_381MlResult) => panic!("ML Result not supported"),
         Some(UplcType::Value) => Term::Builtin(DefaultFunction::ValueData).apply(term),
+        Some(UplcType::Array(_)) => unreachable!("Aiken has no array type"),
         Some(UplcType::Pair(_, _)) => Term::list_data()
             .apply(
                 Term::mk_cons()

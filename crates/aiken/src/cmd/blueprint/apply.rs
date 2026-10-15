@@ -107,7 +107,12 @@ pub fn exec(
             None => blueprint.construct_parameter_incrementally(
                 module.as_deref(),
                 validator.as_deref(),
-                |schema, definitions| ask_schema(schema, definitions).map(PlutusData::from),
+                |schema, definitions| {
+                    // Every constructor index asked for is a 64-bit word.
+                    ask_schema(schema, definitions).map(|data| {
+                        PlutusData::try_from(data).expect("constructor index fits in 64 bits")
+                    })
+                },
             ),
         }
         .map_err(|err| Error::Blueprint(err.into()))?;

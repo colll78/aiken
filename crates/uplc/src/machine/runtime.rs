@@ -1,13 +1,14 @@
 use super::{
     Error, Trace, Value,
     cost_model::{BuiltinCosts, ExBudget},
-    value::{from_pallas_bigint, to_pallas_bigint},
+    value::{Values, from_pallas_bigint, to_pallas_bigint},
 };
 use crate::{
     ast::{Constant, Data, Type},
     builtins::DefaultFunction,
     data::{Array, Constr, Map},
     machine::value::integer_log2_ref,
+    protocol::{CHANG_PROTOCOL_VERSION, DIJKSTRA_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION},
 };
 use bitvec::{order::Msb0, vec::BitVec};
 use itertools::Itertools;
@@ -29,8 +30,9 @@ static SCALAR_PERIOD: Lazy<BigInt> = Lazy::new(|| {
     )
 });
 
-// The maximum size of a scalar for the BLS12-381 multiScalarMul functions is
-// 512 bytes = 4096 bits, so valid scalars lie in [-(2^4095), 2^4095 - 1].
+// The maximum size of a scalar for the BLS12-381 multiScalarMul functions (and,
+// in semantics variants D to G, the scalarMul functions) is 512 bytes = 4096
+// bits, so valid scalars lie in [-(2^4095), 2^4095 - 1].
 // See PlutusCore.Crypto.BLS12_381.Bounds.
 static MSM_SCALAR_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 4095u32) - 1);
 
@@ -40,16 +42,27 @@ static EXP_MOD_INTEGER_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 8191u
 
 static EXP_MOD_INTEGER_LB: Lazy<BigInt> = Lazy::new(|| -(BigInt::from(1) << 8191u32));
 
+// The bounds of Plutus' `CInteger`, through which semantics variants D and E
+// unlift the operands of integer arithmetic and comparison.
+static BOUNDED_INTEGER_UB: Lazy<BigInt> = Lazy::new(|| (BigInt::from(1) << 262143u32) - 1);
+
+static BOUNDED_INTEGER_LB: Lazy<BigInt> = Lazy::new(|| -(BigInt::from(1) << 262143u32));
+
+/// The bound of Plutus' `CByteString`, through which semantics variants D to G
+/// unlift most bytestring arguments.
+const BOUNDED_BYTE_STRING_MAXIMUM_LENGTH: usize = 65536;
+
+/// The longest input `writeBits` accepts in semantics variants D to G
+/// (Plutus' `Bitwise.maximumInputLength`).
+const WRITE_BITS_MAXIMUM_INPUT_LENGTH: usize = 4096;
+
 const BLST_P1_COMPRESSED_SIZE: usize = 48;
 
 const BLST_P2_COMPRESSED_SIZE: usize = 96;
 
 pub const INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH: i64 = 8192;
 
-pub const CHANG_PROTOCOL_VERSION: u16 = 9;
-pub const VAN_ROSSEM_PROTOCOL_VERSION: u16 = 11;
-
-/// Ledger builtin semantics variants.
+/// Ledger builtin semantics variants (Plutus' `BuiltinSemanticsVariant`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinSemantics {
     A,
@@ -57,48 +70,65 @@ pub enum BuiltinSemantics {
     C,
     D,
     E,
+    F,
+    G,
 }
 
 impl BuiltinSemantics {
+    /// The semantics of a ledger language under protocol version 11 (Van
+    /// Rossem).
     pub fn for_language(language: &Language) -> Self {
-        match language {
-            Language::PlutusV1 | Language::PlutusV2 => BuiltinSemantics::D,
-            Language::PlutusV3 => BuiltinSemantics::E,
-        }
+        Self::for_language_and_protocol(language, VAN_ROSSEM_PROTOCOL_VERSION)
     }
 
+    /// The semantics the ledger evaluates a ledger language's scripts with at a
+    /// protocol version (plutus-ledger-api's `mkEvaluationContext`).
     pub fn for_language_and_protocol(language: &Language, protocol_major_version: u16) -> Self {
         match language {
-            Language::PlutusV1 | Language::PlutusV2
-                if protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION =>
-            {
-                BuiltinSemantics::D
-            }
-            Language::PlutusV1 | Language::PlutusV2
-                if protocol_major_version >= CHANG_PROTOCOL_VERSION =>
-            {
-                BuiltinSemantics::B
-            }
-            Language::PlutusV1 | Language::PlutusV2 => BuiltinSemantics::A,
-            Language::PlutusV3 if protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION => {
-                BuiltinSemantics::E
-            }
-            Language::PlutusV3 => BuiltinSemantics::C,
+            Language::PlutusV1 | Language::PlutusV2 => match protocol_major_version {
+                ..CHANG_PROTOCOL_VERSION => BuiltinSemantics::A,
+                CHANG_PROTOCOL_VERSION..VAN_ROSSEM_PROTOCOL_VERSION => BuiltinSemantics::B,
+                VAN_ROSSEM_PROTOCOL_VERSION..DIJKSTRA_PROTOCOL_VERSION => BuiltinSemantics::D,
+                DIJKSTRA_PROTOCOL_VERSION.. => BuiltinSemantics::F,
+            },
+            Language::PlutusV3 => match protocol_major_version {
+                ..VAN_ROSSEM_PROTOCOL_VERSION => BuiltinSemantics::C,
+                VAN_ROSSEM_PROTOCOL_VERSION..DIJKSTRA_PROTOCOL_VERSION => BuiltinSemantics::E,
+                DIJKSTRA_PROTOCOL_VERSION.. => BuiltinSemantics::G,
+            },
         }
     }
 
     pub fn costs_strings_by_utf8_bytes(self) -> bool {
-        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
+        matches!(
+            self,
+            BuiltinSemantics::D | BuiltinSemantics::E | BuiltinSemantics::F | BuiltinSemantics::G
+        )
     }
 
     fn cons_byte_string_range_checks(self) -> bool {
-        matches!(self, BuiltinSemantics::C | BuiltinSemantics::E)
+        matches!(
+            self,
+            BuiltinSemantics::C | BuiltinSemantics::E | BuiltinSemantics::G
+        )
     }
 
-    /// The CIP-0153 value builtins and native `Value` constants only exist
-    /// for Plutus V3 from protocol version 11 (Van Rossem) onwards.
-    pub fn supports_values(self) -> bool {
-        matches!(self, BuiltinSemantics::E)
+    /// Whether integer arithmetic and comparisons bound their operands, as
+    /// Plutus' `CInteger` does (`ensurableInteger`).
+    fn bounds_integers(self) -> bool {
+        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
+    }
+
+    /// Whether builtins bound their bytestring arguments, as Plutus'
+    /// `CByteString` does (`ensurableByteString`). Under these semantics,
+    /// `writeBits` also limits the length of its input, scalar multiplication
+    /// the size of its scalar, and `constrData`, the shifts and the rotations
+    /// take machine-word operands.
+    fn bounds_byte_strings(self) -> bool {
+        matches!(
+            self,
+            BuiltinSemantics::D | BuiltinSemantics::E | BuiltinSemantics::F | BuiltinSemantics::G
+        )
     }
 }
 
@@ -110,7 +140,7 @@ impl From<&Language> for BuiltinSemantics {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuiltinRuntime {
-    pub(super) args: Vec<Value>,
+    pub(super) args: Values,
     pub fun: DefaultFunction,
     pub(super) forces: u32,
 }
@@ -118,18 +148,23 @@ pub struct BuiltinRuntime {
 impl BuiltinRuntime {
     pub fn new(fun: DefaultFunction) -> BuiltinRuntime {
         Self {
-            args: vec![],
+            args: Values::default(),
             fun,
             forces: 0,
         }
     }
 
+    /// The arguments applied so far.
+    pub fn args(&self) -> &[Value] {
+        &self.args
+    }
+
     pub fn is_arrow(&self) -> bool {
-        self.args.len() != self.fun.arity()
+        self.args().len() != self.fun.arity()
     }
 
     pub fn is_ready(&self) -> bool {
-        self.args.len() == self.fun.arity()
+        self.args().len() == self.fun.arity()
     }
 
     pub fn needs_force(&self) -> bool {
@@ -145,7 +180,7 @@ impl BuiltinRuntime {
         semantics: BuiltinSemantics,
         traces: &mut Vec<Trace>,
     ) -> Result<Value, Error> {
-        self.fun.call(semantics, &self.args, traces)
+        self.fun.call(semantics, self.args(), traces)
     }
 
     pub fn push(&mut self, arg: Value) -> Result<(), Error> {
@@ -154,18 +189,166 @@ impl BuiltinRuntime {
         Ok(())
     }
 
+    /// Checks that every argument of a saturated builtin can be unlifted to
+    /// what the builtin expects there. Plutus defers unlifting until the
+    /// builtin is saturated, and fails an application whose arguments do not
+    /// unlift before costing it.
+    pub fn unlift_arguments(&self, semantics: BuiltinSemantics) -> Result<(), Error> {
+        self.args().iter().enumerate().try_for_each(|(index, arg)| {
+            self.fun
+                .argument_unlifting(semantics, index)
+                .unlift(self.fun, arg)
+        })
+    }
+
     pub fn to_ex_budget(
         &self,
         costs: &BuiltinCosts,
         semantics: BuiltinSemantics,
     ) -> Result<ExBudget, Error> {
-        costs.to_ex_budget(self.fun, &self.args, semantics)
+        costs.to_ex_budget(self.fun, self.args(), semantics)
     }
 }
 
 impl From<DefaultFunction> for BuiltinRuntime {
     fn from(fun: DefaultFunction) -> Self {
         BuiltinRuntime::new(fun)
+    }
+}
+
+/// What a builtin accepts as one of its arguments, after the Haskell type
+/// Plutus unlifts that argument to; see `BuiltinRuntime::unlift_arguments`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unlift {
+    /// Any value at all (a type variable, or Plutus' `Opaque`).
+    Any,
+    /// Any constant (Plutus' `SomeConstant`), whose type the builtin itself
+    /// checks once it has been costed.
+    Constant,
+    Integer,
+    /// An integer in [-2^262143, 2^262143 - 1] (Plutus' `CInteger`).
+    BoundedInteger,
+    /// An integer in the signed 64-bit range (Plutus' `Int`).
+    Int,
+    /// An integer in [0, 255] (Plutus' `Word8`).
+    Word8,
+    /// An integer in the unsigned 64-bit range (Plutus' `Word64`).
+    Word64,
+    ByteString,
+    /// A bytestring of at most 65536 bytes (Plutus' `CByteString`).
+    BoundedByteString,
+    String,
+    Bool,
+    Unit,
+    Data,
+    Value,
+    Bls12_381G1Element,
+    Bls12_381G2Element,
+    Bls12_381MlResult,
+    ListOfIntegers,
+    ListOfData,
+    ListOfPairsOfData,
+    ListOfBls12_381G1Elements,
+    ListOfBls12_381G2Elements,
+}
+
+impl Unlift {
+    fn unlift(self, builtin: DefaultFunction, arg: &Value) -> Result<(), Error> {
+        match self {
+            Unlift::Any => Ok(()),
+            Unlift::Constant => arg.unwrap_constant().map(|_| ()),
+            Unlift::Integer => arg.unwrap_integer().map(|_| ()),
+            Unlift::BoundedInteger => {
+                let integer = arg.unwrap_integer()?;
+
+                if integer < &BOUNDED_INTEGER_LB || integer > &BOUNDED_INTEGER_UB {
+                    return Err(Error::IntegerOutOfBounds(builtin, integer.bits()));
+                }
+
+                Ok(())
+            }
+            Unlift::Int => int64_operand(builtin, arg.unwrap_integer()?).map(|_| ()),
+            Unlift::Word8 => {
+                let integer = arg.unwrap_integer()?;
+
+                if u8::try_from(integer).is_err() {
+                    return Err(match builtin {
+                        DefaultFunction::ConsByteString => {
+                            Error::ByteStringConsNotAByte(integer.clone())
+                        }
+                        _ => Error::OutsideByteBounds(integer.clone()),
+                    });
+                }
+
+                Ok(())
+            }
+            Unlift::Word64 => {
+                let integer = arg.unwrap_integer()?;
+
+                if u64::try_from(integer).is_err() {
+                    return Err(Error::IntegerOutOfWord64Range(builtin, integer.clone()));
+                }
+
+                Ok(())
+            }
+            Unlift::ByteString => arg.unwrap_byte_string().map(|_| ()),
+            Unlift::BoundedByteString => {
+                let bytes = arg.unwrap_byte_string()?;
+
+                if bytes.len() > BOUNDED_BYTE_STRING_MAXIMUM_LENGTH {
+                    return Err(Error::ByteStringTooLong {
+                        builtin,
+                        maximum: BOUNDED_BYTE_STRING_MAXIMUM_LENGTH,
+                        actual: bytes.len(),
+                    });
+                }
+
+                Ok(())
+            }
+            Unlift::String => arg.unwrap_string().map(|_| ()),
+            Unlift::Bool => arg.unwrap_bool().map(|_| ()),
+            Unlift::Unit => arg.unwrap_unit(),
+            Unlift::Data => arg.unwrap_data().map(|_| ()),
+            Unlift::Value => arg.unwrap_value().map(|_| ()),
+            Unlift::Bls12_381G1Element => arg.unwrap_bls12_381_g1_element().map(|_| ()),
+            Unlift::Bls12_381G2Element => arg.unwrap_bls12_381_g2_element().map(|_| ()),
+            Unlift::Bls12_381MlResult => arg.unwrap_bls12_381_ml_result().map(|_| ()),
+            Unlift::ListOfIntegers => unlift_list(arg, |t| *t == Type::Integer, || Type::Integer),
+            Unlift::ListOfData => unlift_list(arg, |t| *t == Type::Data, || Type::Data),
+            Unlift::ListOfPairsOfData => unlift_list(
+                arg,
+                |t| matches!(t, Type::Pair(k, v) if **k == Type::Data && **v == Type::Data),
+                || Type::Pair(Type::Data.into(), Type::Data.into()),
+            ),
+            Unlift::ListOfBls12_381G1Elements => unlift_list(
+                arg,
+                |t| *t == Type::Bls12_381G1Element,
+                || Type::Bls12_381G1Element,
+            ),
+            Unlift::ListOfBls12_381G2Elements => unlift_list(
+                arg,
+                |t| *t == Type::Bls12_381G2Element,
+                || Type::Bls12_381G2Element,
+            ),
+        }
+    }
+}
+
+/// `element_type` only builds the expected type for the error, so that a
+/// successful unlift allocates nothing.
+fn unlift_list(
+    arg: &Value,
+    is_element_type: fn(&Type) -> bool,
+    element_type: fn() -> Type,
+) -> Result<(), Error> {
+    let constant = arg.unwrap_constant()?;
+
+    match constant {
+        Constant::ProtoList(r#type, _) if is_element_type(r#type) => Ok(()),
+        _ => Err(Error::TypeMismatch(
+            Type::List(element_type().into()),
+            constant.into(),
+        )),
     }
 }
 
@@ -260,6 +443,9 @@ impl DefaultFunction {
             | DefaultFunction::FindFirstSetBit
             | DefaultFunction::Ripemd_160
             | DefaultFunction::DropList
+            | DefaultFunction::LengthOfArray
+            | DefaultFunction::ListToArray
+            | DefaultFunction::IndexArray
             | DefaultFunction::Bls12_381_G1_MultiScalarMul
             | DefaultFunction::ExpModInteger
             | DefaultFunction::InsertCoin
@@ -367,6 +553,9 @@ impl DefaultFunction {
             DefaultFunction::Bls12_381_G1_MultiScalarMul => 2,
             DefaultFunction::ExpModInteger => 3,
             DefaultFunction::DropList => 2,
+            DefaultFunction::LengthOfArray => 1,
+            DefaultFunction::ListToArray => 1,
+            DefaultFunction::IndexArray => 2,
             DefaultFunction::InsertCoin => 4,
             DefaultFunction::LookupCoin => 3,
             DefaultFunction::UnionValue => 2,
@@ -470,6 +659,9 @@ impl DefaultFunction {
             DefaultFunction::Bls12_381_G1_MultiScalarMul => 0,
             DefaultFunction::ExpModInteger => 0,
             DefaultFunction::DropList => 1,
+            DefaultFunction::LengthOfArray => 1,
+            DefaultFunction::ListToArray => 1,
+            DefaultFunction::IndexArray => 1,
             DefaultFunction::InsertCoin
             | DefaultFunction::LookupCoin
             | DefaultFunction::UnionValue
@@ -480,16 +672,235 @@ impl DefaultFunction {
         }
     }
 
+    /// How the builtin unlifts its `index`-th argument under the given
+    /// semantics; see `Unlift`.
+    fn argument_unlifting(&self, semantics: BuiltinSemantics, index: usize) -> Unlift {
+        let integer = if semantics.bounds_integers() {
+            Unlift::BoundedInteger
+        } else {
+            Unlift::Integer
+        };
+        let byte_string = if semantics.bounds_byte_strings() {
+            Unlift::BoundedByteString
+        } else {
+            Unlift::ByteString
+        };
+
+        match (self, index) {
+            (
+                DefaultFunction::AddInteger
+                | DefaultFunction::SubtractInteger
+                | DefaultFunction::MultiplyInteger
+                | DefaultFunction::DivideInteger
+                | DefaultFunction::QuotientInteger
+                | DefaultFunction::RemainderInteger
+                | DefaultFunction::ModInteger
+                | DefaultFunction::LessThanInteger
+                | DefaultFunction::LessThanEqualsInteger,
+                _,
+            ) => integer,
+            (DefaultFunction::EqualsInteger, _) => Unlift::Integer,
+            (
+                DefaultFunction::AppendByteString
+                | DefaultFunction::EqualsByteString
+                | DefaultFunction::LessThanByteString
+                | DefaultFunction::LessThanEqualsByteString
+                | DefaultFunction::Sha2_256
+                | DefaultFunction::Sha3_256
+                | DefaultFunction::Blake2b_224
+                | DefaultFunction::Blake2b_256
+                | DefaultFunction::Keccak_256
+                | DefaultFunction::Ripemd_160
+                | DefaultFunction::DecodeUtf8
+                | DefaultFunction::ComplementByteString
+                | DefaultFunction::CountSetBits
+                | DefaultFunction::FindFirstSetBit,
+                _,
+            ) => byte_string,
+            (DefaultFunction::ConsByteString, 0) => {
+                if semantics.cons_byte_string_range_checks() {
+                    Unlift::Word8
+                } else {
+                    integer
+                }
+            }
+            (DefaultFunction::ConsByteString, _) => byte_string,
+            (DefaultFunction::SliceByteString, 0 | 1) => Unlift::Int,
+            (DefaultFunction::SliceByteString, _) => byte_string,
+            (DefaultFunction::LengthOfByteString, _) => Unlift::ByteString,
+            (DefaultFunction::IndexByteString, 0) => byte_string,
+            (DefaultFunction::IndexByteString, _) => Unlift::Int,
+            (
+                DefaultFunction::VerifyEd25519Signature
+                | DefaultFunction::VerifySchnorrSecp256k1Signature,
+                1,
+            ) => byte_string,
+            (
+                DefaultFunction::VerifyEd25519Signature
+                | DefaultFunction::VerifyEcdsaSecp256k1Signature
+                | DefaultFunction::VerifySchnorrSecp256k1Signature,
+                _,
+            ) => Unlift::ByteString,
+            (
+                DefaultFunction::AppendString
+                | DefaultFunction::EqualsString
+                | DefaultFunction::EncodeUtf8,
+                _,
+            ) => Unlift::String,
+            (DefaultFunction::IfThenElse, 0) => Unlift::Bool,
+            (DefaultFunction::ChooseUnit, 0) => Unlift::Unit,
+            (DefaultFunction::Trace, 0) => Unlift::String,
+            (DefaultFunction::ChooseList, 0) => Unlift::Constant,
+            (DefaultFunction::ChooseData, 0) => Unlift::Data,
+            (
+                DefaultFunction::IfThenElse
+                | DefaultFunction::ChooseUnit
+                | DefaultFunction::Trace
+                | DefaultFunction::ChooseList
+                | DefaultFunction::ChooseData,
+                _,
+            ) => Unlift::Any,
+            (
+                DefaultFunction::FstPair
+                | DefaultFunction::SndPair
+                | DefaultFunction::MkCons
+                | DefaultFunction::HeadList
+                | DefaultFunction::TailList
+                | DefaultFunction::NullList
+                | DefaultFunction::LengthOfArray
+                | DefaultFunction::ListToArray,
+                _,
+            ) => Unlift::Constant,
+            (DefaultFunction::ConstrData, 0) => {
+                if semantics.bounds_byte_strings() {
+                    Unlift::Word64
+                } else {
+                    Unlift::Integer
+                }
+            }
+            (DefaultFunction::ConstrData | DefaultFunction::ListData, _) => Unlift::ListOfData,
+            (DefaultFunction::MapData, _) => Unlift::ListOfPairsOfData,
+            (DefaultFunction::IData, _) => Unlift::Integer,
+            (DefaultFunction::BData, _) => Unlift::ByteString,
+            (
+                DefaultFunction::UnConstrData
+                | DefaultFunction::UnMapData
+                | DefaultFunction::UnListData
+                | DefaultFunction::UnIData
+                | DefaultFunction::UnBData
+                | DefaultFunction::EqualsData
+                | DefaultFunction::SerialiseData
+                | DefaultFunction::MkPairData
+                | DefaultFunction::UnValueData,
+                _,
+            ) => Unlift::Data,
+            (DefaultFunction::MkNilData | DefaultFunction::MkNilPairData, _) => Unlift::Unit,
+            (
+                DefaultFunction::Bls12_381_G1_ScalarMul | DefaultFunction::Bls12_381_G2_ScalarMul,
+                0,
+            ) => Unlift::Integer,
+            (
+                DefaultFunction::Bls12_381_G1_Add
+                | DefaultFunction::Bls12_381_G1_Neg
+                | DefaultFunction::Bls12_381_G1_ScalarMul
+                | DefaultFunction::Bls12_381_G1_Equal
+                | DefaultFunction::Bls12_381_G1_Compress,
+                _,
+            ) => Unlift::Bls12_381G1Element,
+            (
+                DefaultFunction::Bls12_381_G2_Add
+                | DefaultFunction::Bls12_381_G2_Neg
+                | DefaultFunction::Bls12_381_G2_ScalarMul
+                | DefaultFunction::Bls12_381_G2_Equal
+                | DefaultFunction::Bls12_381_G2_Compress,
+                _,
+            ) => Unlift::Bls12_381G2Element,
+            (
+                DefaultFunction::Bls12_381_G1_HashToGroup
+                | DefaultFunction::Bls12_381_G2_HashToGroup,
+                0,
+            ) => byte_string,
+            (
+                DefaultFunction::Bls12_381_G1_Uncompress
+                | DefaultFunction::Bls12_381_G2_Uncompress
+                | DefaultFunction::Bls12_381_G1_HashToGroup
+                | DefaultFunction::Bls12_381_G2_HashToGroup,
+                _,
+            ) => Unlift::ByteString,
+            (DefaultFunction::Bls12_381_MillerLoop, 0) => Unlift::Bls12_381G1Element,
+            (DefaultFunction::Bls12_381_MillerLoop, _) => Unlift::Bls12_381G2Element,
+            (
+                DefaultFunction::Bls12_381_MulMlResult | DefaultFunction::Bls12_381_FinalVerify,
+                _,
+            ) => Unlift::Bls12_381MlResult,
+            (
+                DefaultFunction::Bls12_381_G1_MultiScalarMul
+                | DefaultFunction::Bls12_381_G2_MultiScalarMul,
+                0,
+            ) => Unlift::ListOfIntegers,
+            (DefaultFunction::Bls12_381_G1_MultiScalarMul, _) => Unlift::ListOfBls12_381G1Elements,
+            (DefaultFunction::Bls12_381_G2_MultiScalarMul, _) => Unlift::ListOfBls12_381G2Elements,
+            (DefaultFunction::IntegerToByteString, 0) => Unlift::Bool,
+            (DefaultFunction::IntegerToByteString, _) => Unlift::Integer,
+            (DefaultFunction::ByteStringToInteger, 0) => Unlift::Bool,
+            (DefaultFunction::ByteStringToInteger, _) => byte_string,
+            (
+                DefaultFunction::AndByteString
+                | DefaultFunction::OrByteString
+                | DefaultFunction::XorByteString,
+                0,
+            ) => Unlift::Bool,
+            (
+                DefaultFunction::AndByteString
+                | DefaultFunction::OrByteString
+                | DefaultFunction::XorByteString,
+                _,
+            ) => byte_string,
+            (DefaultFunction::ReadBit, 0) => byte_string,
+            (DefaultFunction::ReadBit, _) => Unlift::Int,
+            (DefaultFunction::WriteBits, 0) => Unlift::ByteString,
+            (DefaultFunction::WriteBits, 1) => Unlift::ListOfIntegers,
+            (DefaultFunction::WriteBits, _) => Unlift::Bool,
+            (DefaultFunction::ReplicateByte, 0) => Unlift::Integer,
+            (DefaultFunction::ReplicateByte, _) => Unlift::Word8,
+            (DefaultFunction::ShiftByteString | DefaultFunction::RotateByteString, 0) => {
+                Unlift::ByteString
+            }
+            (DefaultFunction::ShiftByteString | DefaultFunction::RotateByteString, _) => {
+                if semantics.bounds_byte_strings() {
+                    Unlift::Int
+                } else {
+                    Unlift::Integer
+                }
+            }
+            (DefaultFunction::ExpModInteger, _) => Unlift::Integer,
+            (DefaultFunction::DropList, 0) => Unlift::Integer,
+            (DefaultFunction::DropList, _) => Unlift::Constant,
+            (DefaultFunction::IndexArray, 0) => Unlift::Constant,
+            (DefaultFunction::IndexArray, _) => Unlift::Int,
+            (DefaultFunction::InsertCoin | DefaultFunction::LookupCoin, 0 | 1) => {
+                Unlift::ByteString
+            }
+            (DefaultFunction::InsertCoin, 2) => Unlift::Integer,
+            (DefaultFunction::ScaleValue, 0) => Unlift::Integer,
+            (
+                DefaultFunction::InsertCoin
+                | DefaultFunction::LookupCoin
+                | DefaultFunction::UnionValue
+                | DefaultFunction::ValueContains
+                | DefaultFunction::ValueData
+                | DefaultFunction::ScaleValue,
+                _,
+            ) => Unlift::Value,
+        }
+    }
+
     pub fn call(
         &self,
         semantics: BuiltinSemantics,
         args: &[Value],
         traces: &mut Vec<Trace>,
     ) -> Result<Value, Error> {
-        if self.is_value_builtin() && !semantics.supports_values() {
-            return Err(Error::BuiltinNotAvailable(*self));
-        }
-
         match self {
             DefaultFunction::AddInteger => {
                 let arg1 = args[0].unwrap_integer()?;
@@ -640,16 +1051,12 @@ impl DefaultFunction {
                 let arg2 = args[1].unwrap_integer()?;
                 let arg3 = args[2].unwrap_byte_string()?;
 
-                let skip: usize = if arg1.lt(&0.into()) {
-                    0
-                } else {
-                    arg1.try_into().unwrap()
-                };
-                let take: usize = if arg2.lt(&0.into()) {
-                    0
-                } else {
-                    arg2.try_into().unwrap()
-                };
+                // Plutus takes both operands as an `Int`: anything outside the
+                // signed 64-bit range fails, and negatives behave like zero.
+                let skip = int64_operand(*self, arg1)?;
+                let take = int64_operand(*self, arg2)?;
+                let skip = usize::try_from(skip.max(0)).unwrap_or(usize::MAX);
+                let take = usize::try_from(take.max(0)).unwrap_or(usize::MAX);
 
                 let ret: Vec<u8> = arg3.iter().skip(skip).take(take).cloned().collect();
 
@@ -668,16 +1075,11 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_byte_string()?;
                 let arg2 = args[1].unwrap_integer()?;
 
-                let index: i128 = arg2.try_into().unwrap();
+                let index = int64_operand(*self, arg2)?;
 
-                if 0 <= index && index < arg1.len() as i128 {
-                    let ret = arg1[index as usize];
-
-                    let value = Value::integer(ret.into());
-
-                    Ok(value)
-                } else {
-                    Err(Error::ByteStringOutOfBounds(arg2.clone(), arg1.to_vec()))
+                match usize::try_from(index).ok().and_then(|i| arg1.get(i)) {
+                    Some(byte) => Ok(Value::integer((*byte).into())),
+                    None => Err(Error::ByteStringOutOfBounds(arg2.clone(), arg1.to_vec())),
                 }
             }
             DefaultFunction::EqualsByteString => {
@@ -787,8 +1189,6 @@ impl DefaultFunction {
                 Ok(value)
             }
             DefaultFunction::VerifyEd25519Signature => {
-                use cryptoxide::ed25519;
-
                 let public_key = args[0].unwrap_byte_string()?;
                 let message = args[1].unwrap_byte_string()?;
                 let signature = args[2].unwrap_byte_string()?;
@@ -803,7 +1203,7 @@ impl DefaultFunction {
                     .try_into()
                     .map_err(|e: Vec<u8>| Error::UnexpectedEd25519SignatureLength(e.len()))?;
 
-                let valid = ed25519::verify(message, &public_key, &signature);
+                let valid = verify_ed25519(&public_key, message, &signature);
 
                 let value = Value::bool(valid);
 
@@ -969,9 +1369,8 @@ impl DefaultFunction {
                 let i = args[0].unwrap_integer()?;
                 let l = args[1].unwrap_data_list()?;
 
-                let i: u64 = i.try_into().map_err(|_| Error::OverflowError)?;
-
-                let constr_data = Constr::new(i, Array::from_data_list(l.clone()));
+                // Any integer, unless unlifting bounded it to a 64-bit word.
+                let constr_data = Constr::with_index(i, Array::from_data_list(l.clone()));
 
                 let value = Value::data(Data::Constr(constr_data));
 
@@ -1027,12 +1426,7 @@ impl DefaultFunction {
                     let constant = Constant::ProtoPair(
                         Type::Integer,
                         Type::List(Type::Data.into()),
-                        Constant::Integer(
-                            convert_tag_to_constr(c.tag)
-                                .unwrap_or_else(|| c.any_constructor.unwrap())
-                                .into(),
-                        )
-                        .into(),
+                        Constant::Integer(c.constr_index().into()).into(),
                         Constant::ProtoList(Type::Data, c.fields.as_data_list().clone()).into(),
                     );
 
@@ -1198,6 +1592,10 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_integer()?;
                 let arg2 = args[1].unwrap_bls12_381_g1_element()?;
 
+                if semantics.bounds_byte_strings() && msm_scalar_out_of_bounds(arg1) {
+                    return Err(Error::MsmScalarOutOfBounds);
+                }
+
                 let size_scalar = size_of::<blst::blst_scalar>();
 
                 let arg1 = arg1.mod_floor(&SCALAR_PERIOD);
@@ -1329,6 +1727,10 @@ impl DefaultFunction {
                 let arg1 = args[0].unwrap_integer()?;
                 let arg2 = args[1].unwrap_bls12_381_g2_element()?;
 
+                if semantics.bounds_byte_strings() && msm_scalar_out_of_bounds(arg1) {
+                    return Err(Error::MsmScalarOutOfBounds);
+                }
+
                 let size_scalar = size_of::<blst::blst_scalar>();
 
                 let arg1 = arg1.mod_floor(&SCALAR_PERIOD);
@@ -1380,7 +1782,7 @@ impl DefaultFunction {
                         ));
                     };
 
-                    if scalar < &MSM_SCALAR_LB || scalar > &MSM_SCALAR_UB {
+                    if msm_scalar_out_of_bounds(scalar) {
                         return Err(Error::MsmScalarOutOfBounds);
                     }
                 }
@@ -1557,12 +1959,7 @@ impl DefaultFunction {
                 let size = args[1].unwrap_integer()?;
                 let input = args[2].unwrap_integer()?;
 
-                // NOTE:
-                // We ought to also check for negative size and too large sizes. These checks
-                // however happens prior to calling the builtin as part of the costing step. So by
-                // the time we reach this builtin call, the size can be assumed to be
-                //
-                // >= 0 && < INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH
+                let size_unwrapped = check_output_length(*self, size)?;
 
                 if size.is_zero()
                     && integer_log2_ref(input) >= 8 * INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH
@@ -1578,8 +1975,6 @@ impl DefaultFunction {
                 if input.is_negative() {
                     return Err(Error::IntegerToByteStringNegativeInput(input.clone()));
                 }
-
-                let size_unwrapped: usize = size.try_into().unwrap();
 
                 if input.is_zero() {
                     let constant = Constant::ByteString(vec![0; size_unwrapped]);
@@ -1749,9 +2144,20 @@ impl DefaultFunction {
                 Ok(Value::bool(bit_test))
             }
             DefaultFunction::WriteBits => {
-                let mut bytes = args[0].unwrap_byte_string()?.clone();
+                let bytes = args[0].unwrap_byte_string()?;
                 let indices = args[1].unwrap_int_list()?;
                 let set_bit = args[2].unwrap_bool()?;
+
+                if semantics.bounds_byte_strings() && bytes.len() > WRITE_BITS_MAXIMUM_INPUT_LENGTH
+                {
+                    return Err(Error::ByteStringTooLong {
+                        builtin: *self,
+                        maximum: WRITE_BITS_MAXIMUM_INPUT_LENGTH,
+                        actual: bytes.len(),
+                    });
+                }
+
+                let mut bytes = bytes.clone();
 
                 for index in indices {
                     let Constant::Integer(bit_index) = index.as_ref() else {
@@ -1783,8 +2189,7 @@ impl DefaultFunction {
                 let size = args[0].unwrap_integer()?;
                 let byte = args[1].unwrap_integer()?;
 
-                // Safe since this is checked by cost model
-                let size = usize::try_from(size).unwrap();
+                let size = check_output_length(*self, size)?;
 
                 let Ok(byte) = u8::try_from(byte) else {
                     return Err(Error::OutsideByteBounds(byte.clone()));
@@ -1801,10 +2206,6 @@ impl DefaultFunction {
             DefaultFunction::ShiftByteString => {
                 let bytes = args[0].unwrap_byte_string()?;
                 let shift = args[1].unwrap_integer()?;
-
-                if matches!(semantics, BuiltinSemantics::E) && shift.to_i64().is_none() {
-                    return Err(Error::EvaluationFailure);
-                }
 
                 let byte_length = bytes.len();
 
@@ -1829,10 +2230,6 @@ impl DefaultFunction {
             DefaultFunction::RotateByteString => {
                 let bytes = args[0].unwrap_byte_string()?;
                 let shift = args[1].unwrap_integer()?;
-
-                if matches!(semantics, BuiltinSemantics::E) && shift.to_i64().is_none() {
-                    return Err(Error::EvaluationFailure);
-                }
 
                 let byte_length = bytes.len();
 
@@ -1926,7 +2323,7 @@ impl DefaultFunction {
                         return Err(Error::TypeMismatch(Type::Integer, constant.as_ref().into()));
                     };
 
-                    if scalar < &MSM_SCALAR_LB || scalar > &MSM_SCALAR_UB {
+                    if msm_scalar_out_of_bounds(scalar) {
                         return Err(Error::MsmScalarOutOfBounds);
                     }
 
@@ -2015,6 +2412,29 @@ impl DefaultFunction {
 
                 Ok(value)
             }
+            DefaultFunction::LengthOfArray => {
+                let (_, items) = args[0].unwrap_array()?;
+
+                Ok(Value::integer(items.len().into()))
+            }
+            DefaultFunction::ListToArray => {
+                let (r#type, list) = args[0].unwrap_list()?;
+
+                // Arrays share the list's spine, so this is O(1).
+                let array = Constant::ProtoArray(r#type.clone(), list.clone());
+
+                Ok(Value::Con(array.into()))
+            }
+            DefaultFunction::IndexArray => {
+                let (_, items) = args[0].unwrap_array()?;
+                let index = args[1].unwrap_integer()?;
+                let index64 = int64_operand(DefaultFunction::IndexArray, index)?;
+
+                match usize::try_from(index64).ok().and_then(|i| items.get(i)) {
+                    Some(item) => Ok(Value::Con(item.clone())),
+                    None => Err(Error::IndexArrayOutOfBounds(index.clone(), items.len())),
+                }
+            }
             DefaultFunction::InsertCoin => {
                 let currency = args[0].unwrap_byte_string()?;
                 let token = args[1].unwrap_byte_string()?;
@@ -2070,6 +2490,31 @@ impl DefaultFunction {
     }
 }
 
+/// The length of the bytestring `integerToByteString` or `replicateByte`
+/// produces, which may not exceed `INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH`.
+fn check_output_length(builtin: DefaultFunction, size: &BigInt) -> Result<usize, Error> {
+    let maximum = INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH;
+
+    if let Some(size) = size.to_i64().filter(|size| (0..=maximum).contains(size)) {
+        return Ok(size as usize);
+    }
+
+    Err(match builtin {
+        DefaultFunction::ReplicateByte if size.is_negative() => {
+            Error::ReplicateByteNegativeSize(size.clone())
+        }
+        DefaultFunction::ReplicateByte => Error::ReplicateByteSizeTooBig(size.clone(), maximum),
+        _ if size.is_negative() => Error::IntegerToByteStringNegativeSize(size.clone()),
+        _ => Error::IntegerToByteStringSizeTooBig(size.clone(), maximum),
+    })
+}
+
+/// Unlift an `Int` operand the way Plutus does: integers outside the signed
+/// 64-bit range make the builtin fail.
+fn int64_operand(builtin: DefaultFunction, integer: &BigInt) -> Result<i64, Error> {
+    i64::try_from(integer).map_err(|_| Error::IntegerOutOfInt64Range(builtin, integer.clone()))
+}
+
 fn exp_mod_integer(base: &BigInt, exponent: &BigInt, modulus: &BigInt) -> Result<BigInt, Error> {
     if modulus <= &BigInt::zero() || modulus > &EXP_MOD_INTEGER_UB {
         return Err(Error::OutsideNaturalBounds(modulus.clone()));
@@ -2098,6 +2543,10 @@ fn exp_mod_integer(base: &BigInt, exponent: &BigInt, modulus: &BigInt) -> Result
     } else {
         Ok(base.modpow(exponent, modulus))
     }
+}
+
+fn msm_scalar_out_of_bounds(scalar: &BigInt) -> bool {
+    scalar < &MSM_SCALAR_LB || scalar > &MSM_SCALAR_UB
 }
 
 fn exp_mod_integer_out_of_bounds(value: &BigInt) -> bool {
@@ -2243,85 +2692,580 @@ pub fn convert_constr_to_tag(constr: u64) -> Option<u64> {
 
 pub static ANY_TAG: u64 = 102;
 
-#[cfg(not(target_family = "wasm"))]
-fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use secp256k1::{Message, PublicKey, Secp256k1, ecdsa::Signature};
+/// Whether `signature` is an Ed25519 signature of `message` by
+/// `public_key`, as libsodium's `crypto_sign_verify_detached` (which Plutus
+/// uses) decides: beyond the checks cryptoxide makes, libsodium rejects
+/// public keys and `R` points of small order, and public keys encoded
+/// non-canonically.
+fn verify_ed25519(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    let r = <&[u8; 32]>::try_from(&signature[..32]).expect("a signature is 64 bytes");
 
-    let secp = Secp256k1::verification_only();
-
-    let public_key = PublicKey::from_slice(public_key)?;
-
-    let signature = Signature::from_compact(signature)?;
-
-    let message = Message::from_slice(message)?;
-
-    let valid = secp.verify_ecdsa(&message, &signature, &public_key);
-
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
+    !has_small_order(r)
+        && is_canonical_point(public_key)
+        && !has_small_order(public_key)
+        && cryptoxide::ed25519::verify(message, public_key, signature)
 }
 
-/// Plutus delegates Schnorr verification to libsecp256k1's BIP-340 verifier,
-/// which accepts arbitrary message lengths. The high-level Rust wrapper only
-/// accepts 32-byte `Message`s, so call the FFI verifier directly.
-#[cfg(not(target_family = "wasm"))]
+/// The encodings of the points of small order (libsodium's blocklist), with
+/// the sign of x left out.
+#[rustfmt::skip]
+const ED25519_SMALL_ORDER: [[u8; 32]; 7] = [
+    // y = 0, of order 4
+    [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
+    // y = 1, the identity
+    [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
+    // of order 8
+    [
+        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4,
+        0x89, 0xf2, 0xef, 0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6,
+        0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
+    ],
+    // of order 8
+    [
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b,
+        0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39,
+        0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+    ],
+    // y = p - 1, of order 2
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+    // y = p, a non-canonical 0
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+    // y = p + 1, a non-canonical 1
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+];
+
+/// Whether an encoded point is of small order (libsodium's
+/// `ge25519_has_small_order`).
+fn has_small_order(point: &[u8; 32]) -> bool {
+    let mut y = *point;
+    y[31] &= 0x7f;
+
+    ED25519_SMALL_ORDER.contains(&y)
+}
+
+/// Whether an encoded point has its y coordinate below the field modulus
+/// (libsodium's `ge25519_is_canonical`).
+fn is_canonical_point(point: &[u8; 32]) -> bool {
+    !(point[31] & 0x7f == 0x7f && point[1..31].iter().all(|&byte| byte == 0xff) && point[0] >= 0xed)
+}
+
+/// Plutus (through cardano-crypto-class) only accepts a 33-byte compressed
+/// public key, a 64-byte compact signature whose scalars are below the group
+/// order, and a 32-byte message hash; anything else fails the builtin. A
+/// well-formed signature that does not verify (including one with a zero or
+/// high `s`) is `False`.
+fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
+    let builtin = DefaultFunction::VerifyEcdsaSecp256k1Signature;
+
+    expect_length(builtin, "public key", public_key, 33)?;
+    expect_length(builtin, "signature", signature, 64)?;
+    expect_length(builtin, "message hash", message, 32)?;
+
+    let valid = backend::verify_ecdsa(public_key, message, signature)?;
+
+    Ok(Value::Con(Constant::Bool(valid).into()))
+}
+
+/// Plutus only accepts a 32-byte x-only public key and a 64-byte signature,
+/// which is not parsed any further: a signature whose `r` or `s` is out of
+/// range simply does not verify. The message may have any length (BIP-340).
 fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use secp256k1::{
-        Secp256k1, XOnlyPublicKey,
+    let builtin = DefaultFunction::VerifySchnorrSecp256k1Signature;
+
+    expect_length(builtin, "public key", public_key, 32)?;
+    expect_length(builtin, "signature", signature, 64)?;
+
+    let valid = backend::verify_schnorr(public_key, message, signature)?;
+
+    Ok(Value::Con(Constant::Bool(valid).into()))
+}
+
+fn expect_length(
+    builtin: DefaultFunction,
+    argument: &'static str,
+    bytes: &[u8],
+    expected: usize,
+) -> Result<(), Error> {
+    if bytes.len() == expected {
+        Ok(())
+    } else {
+        Err(Error::UnexpectedArgumentLength {
+            builtin,
+            argument,
+            expected,
+            actual: bytes.len(),
+        })
+    }
+}
+
+/// libsecp256k1, which Plutus itself uses. The callers have already checked
+/// the argument lengths.
+#[cfg(not(target_family = "wasm"))]
+mod backend {
+    use super::Error;
+    use ::secp256k1::{
+        Message, PublicKey, Secp256k1, XOnlyPublicKey, ecdsa,
         ffi::{self, CPtr},
-        schnorr::Signature,
+        schnorr,
     };
 
-    let secp = Secp256k1::verification_only();
+    pub(super) fn verify_ecdsa(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let secp = Secp256k1::verification_only();
 
-    let public_key = XOnlyPublicKey::from_slice(public_key)?;
+        let public_key = PublicKey::from_slice(public_key)?;
 
-    let signature = Signature::from_slice(signature)?;
+        let signature = ecdsa::Signature::from_compact(signature)?;
 
-    let valid = unsafe {
-        ffi::secp256k1_schnorrsig_verify(
-            secp.ctx().as_ptr(),
-            signature.as_c_ptr(),
-            message.as_c_ptr(),
-            message.len(),
-            public_key.as_c_ptr(),
-        )
+        let message = Message::from_slice(message)?;
+
+        Ok(secp.verify_ecdsa(&message, &signature, &public_key).is_ok())
+    }
+
+    /// The high-level wrapper only accepts 32-byte `Message`s, so call the
+    /// BIP-340 verifier, which takes messages of any length, directly.
+    pub(super) fn verify_schnorr(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let secp = Secp256k1::verification_only();
+
+        let public_key = XOnlyPublicKey::from_slice(public_key)?;
+
+        let signature = schnorr::Signature::from_slice(signature)?;
+
+        let valid = unsafe {
+            ffi::secp256k1_schnorrsig_verify(
+                secp.ctx().as_ptr(),
+                signature.as_c_ptr(),
+                message.as_c_ptr(),
+                message.len(),
+                public_key.as_c_ptr(),
+            )
+        };
+
+        Ok(valid == 1)
+    }
+}
+
+/// k256, a pure-Rust implementation, where libsecp256k1 does not build. Its
+/// parsers are stricter than libsecp256k1's (they reject zero scalars, and
+/// Schnorr signature components out of range), so those cases are mapped
+/// back to the `False` that libsecp256k1 gives. The callers have already
+/// checked the argument lengths, which k256 would otherwise panic on.
+#[cfg(target_family = "wasm")]
+mod backend {
+    use super::Error;
+    use k256::{
+        FieldBytes, Scalar,
+        ecdsa::{self, signature::hazmat::PrehashVerifier as _},
+        elliptic_curve::PrimeField,
+        schnorr,
     };
 
-    Ok(Value::Con(Constant::Bool(valid == 1).into()))
-}
+    pub(super) fn verify_ecdsa(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let verifying_key = ecdsa::VerifyingKey::from_sec1_bytes(public_key)?;
 
-#[cfg(target_family = "wasm")]
-fn verify_ecdsa(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use k256::ecdsa::{self, signature::hazmat::PrehashVerifier};
+        let (r, s) = signature.split_at(32);
 
-    let verifying_key = ecdsa::VerifyingKey::try_from(public_key)?;
+        let (Some(r), Some(s)) = (
+            Option::<Scalar>::from(Scalar::from_repr(*FieldBytes::from_slice(r))),
+            Option::<Scalar>::from(Scalar::from_repr(*FieldBytes::from_slice(s))),
+        ) else {
+            return Err(Error::K256Error(
+                "ECDSA signature scalar is not below the group order".to_string(),
+            ));
+        };
 
-    let signature = ecdsa::Signature::try_from(signature)?;
+        let Ok(signature) = ecdsa::Signature::from_scalars(r, s) else {
+            // A zero scalar parses in libsecp256k1 but never verifies.
+            return Ok(false);
+        };
 
-    let valid = verifying_key.verify_prehash(message, &signature);
+        Ok(verifying_key.verify_prehash(message, &signature).is_ok())
+    }
 
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
-}
+    pub(super) fn verify_schnorr(
+        public_key: &[u8],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, Error> {
+        let verifying_key = schnorr::VerifyingKey::from_bytes(public_key)?;
 
-#[cfg(target_family = "wasm")]
-fn verify_schnorr(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<Value, Error> {
-    use k256::schnorr::{self, signature::hazmat::PrehashVerifier};
+        let Ok(signature) = schnorr::Signature::try_from(signature) else {
+            return Ok(false);
+        };
 
-    let verifying_key = schnorr::VerifyingKey::from_bytes(public_key)?;
-
-    let signature = schnorr::Signature::try_from(signature)?;
-
-    let valid = verifying_key.verify_prehash(message, &signature);
-
-    Ok(Value::Con(Constant::Bool(valid.is_ok()).into()))
+        Ok(verifying_key.verify_raw(message, &signature).is_ok())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{BuiltinSemantics, Error, convert_constr_to_tag, convert_tag_to_constr};
-    use crate::{builtins::DefaultFunction, machine::value::Value};
+    use crate::{
+        ast::{Constant, Type},
+        builtins::DefaultFunction,
+        machine::value::Value,
+    };
     use num_bigint::BigInt;
     use pallas_primitives::conway::Language;
+
+    /// Vectors checked against libsodium (IOG's libsodium-vrf, which Cardano
+    /// links), where cryptoxide alone answers otherwise unless stated.
+    #[test_case::test_case(
+        "0076ed43a173e72f9670161e0addaea59ace4a2604c2f8e01cc81f71f6816766",
+        "",
+        "0162bbb0716bdab96886574b69a3dd89c825368845d98e0d32e9cdedb4506d31135d6191b713550fba381e19a583bb2f46355b20e9ec72773556c1397cefa80c"
+        => true; "valid, as cryptoxide also finds"
+    )]
+    #[test_case::test_case(
+        "0076ed43a173e72f9670161e0addaea59ace4a2604c2f8e01cc81f71f6816766",
+        "",
+        "0162bbb0716bdab96886574b69a3dd89c825368845d98e0d32e9cdedb4506d31003157eed176676790d515bc837d9a4446355b20e9ec72773556c1397cefa81c"
+        => false; "non-canonical s, as cryptoxide also finds"
+    )]
+    #[test_case::test_case(
+        "3ab21b6c1116cb7e0c04d37b7628ad7ff729e619456b092c56dca9a66feaaf4b",
+        "18778cbaa777c906",
+        "ff93defeb4bb3853809b1a7f5351aa9d1b0cbbc2e63fe517d281a12419f0afa49b52ea348c737b630fc65a5630a98c6fdaeae809ef85794af3c6a5c0c808b903"
+        => true; "public key of mixed order, as cryptoxide also finds"
+    )]
+    #[test_case::test_case(
+        "225e89722cfdae8119704fe80508956d9184f9bd695894762b02fc377f6f4ce9",
+        "e59bf58392602d27",
+        "0100000000000000000000000000000000000000000000000000000000000000d884a75229827fab9b39333a60a6a6525331dc7c9417eb57181feb1419a30c09"
+        => false; "r is the identity"
+    )]
+    #[test_case::test_case(
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "d792a54d6444e75a",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000"
+        => false; "public key of order 8"
+    )]
+    #[test_case::test_case(
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        "351946b87a0cbc83",
+        "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        => false; "public key of order 4 with the sign bit set"
+    )]
+    #[test_case::test_case(
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "",
+        "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        => false; "public key encoded non-canonically"
+    )]
+    fn verify_ed25519_signature_as_libsodium(
+        public_key: &str,
+        message: &str,
+        signature: &str,
+    ) -> bool {
+        let bytes = |text| Value::byte_string(hex::decode(text).unwrap());
+
+        let result = DefaultFunction::VerifyEd25519Signature
+            .call(
+                BuiltinSemantics::C,
+                &[bytes(public_key), bytes(message), bytes(signature)],
+                &mut vec![],
+            )
+            .unwrap();
+
+        *result.unwrap_bool().unwrap()
+    }
+
+    #[test]
+    fn bytestring_builtins_reject_operands_outside_int64() {
+        let bytes = || Value::byte_string(vec![1, 2, 3]);
+        let huge: BigInt = BigInt::from(1) << 64;
+        let enormous: BigInt = BigInt::from(1) << 200;
+        let slice = |skip: BigInt, take: BigInt| {
+            DefaultFunction::SliceByteString.call(
+                BuiltinSemantics::E,
+                &[Value::integer(skip), Value::integer(take), bytes()],
+                &mut vec![],
+            )
+        };
+
+        // In range, including negative and oversized-but-Int64 operands.
+        assert_eq!(
+            slice(1.into(), 5.into()).unwrap(),
+            Value::byte_string(vec![2, 3])
+        );
+        assert_eq!(
+            slice((-5).into(), 2.into()).unwrap(),
+            Value::byte_string(vec![1, 2])
+        );
+        assert_eq!(
+            slice(1.into(), (-1).into()).unwrap(),
+            Value::byte_string(vec![])
+        );
+        assert_eq!(
+            slice(i64::MAX.into(), i64::MAX.into()).unwrap(),
+            Value::byte_string(vec![])
+        );
+
+        // Outside Int64 in either direction fails instead of clamping or panicking.
+        for operand in [huge.clone(), -huge.clone(), enormous.clone()] {
+            assert!(matches!(
+                slice(operand.clone(), 1.into()),
+                Err(Error::IntegerOutOfInt64Range(_, _))
+            ));
+            assert!(matches!(
+                slice(0.into(), operand.clone()),
+                Err(Error::IntegerOutOfInt64Range(_, _))
+            ));
+        }
+
+        let index = |i: BigInt| {
+            DefaultFunction::IndexByteString.call(
+                BuiltinSemantics::E,
+                &[bytes(), Value::integer(i)],
+                &mut vec![],
+            )
+        };
+
+        assert_eq!(index(2.into()).unwrap(), Value::integer(3.into()));
+        for i in [BigInt::from(3), BigInt::from(-1), BigInt::from(i64::MAX)] {
+            assert!(matches!(index(i), Err(Error::ByteStringOutOfBounds(_, _))));
+        }
+        for i in [huge.clone(), -enormous.clone(), enormous] {
+            assert!(matches!(index(i), Err(Error::IntegerOutOfInt64Range(_, _))));
+        }
+    }
+
+    fn secp256k1(
+        builtin: DefaultFunction,
+        public_key: &str,
+        message: &str,
+        signature: &str,
+    ) -> Result<Value, Error> {
+        let bytes = |h: &str| Value::byte_string(hex::decode(h).unwrap());
+
+        builtin.call(
+            BuiltinSemantics::E,
+            &[bytes(public_key), bytes(message), bytes(signature)],
+            &mut vec![],
+        )
+    }
+
+    // Both backends (libsecp256k1 natively, k256 on wasm) must agree with
+    // Plutus on which arguments fail the builtin and which merely do not
+    // verify.
+    #[test]
+    fn verify_ecdsa_secp256k1_matches_plutus() {
+        // Conformance test-vector-01: the SHA2-256 of "" signed with a low s.
+        const KEY: &str = "032e433589dce61863199171f4d1e3fa946a5832621fcd29559940a0950f96fb6f";
+        const UNCOMPRESSED_KEY: &str = "042e433589dce61863199171f4d1e3fa946a5832621fcd29559940a0950f96fb6f503f0ede730b04c413cc9525f51d638b834fadefea334c42df7d96ea54c00723";
+        const HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        const R: &str = "4941155e2303988a1be97a021fbaf9fe6064d05ea694bc5e89328f297154e5c6";
+        const S: &str = "3a2f3e7b5f509294a4c2e22feb697a16b792fabfebe9d0f38403b1c929836b5a";
+        const HIGH_S: &str = "c5d0c184a0af6d6b5b3d1dd0149685e8031be226c35ecf483bceacc3a6b2d5e7";
+        const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        const ORDER: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+
+        let verify = |key: &str, hash: &str, signature: &str| {
+            secp256k1(
+                DefaultFunction::VerifyEcdsaSecp256k1Signature,
+                key,
+                hash,
+                signature,
+            )
+        };
+
+        assert_eq!(
+            verify(KEY, HASH, &format!("{R}{S}")).unwrap(),
+            Value::bool(true)
+        );
+
+        // Well-formed, but not a valid signature.
+        assert_eq!(
+            verify(KEY, HASH, &format!("{R}{HIGH_S}")).unwrap(),
+            Value::bool(false)
+        );
+        assert_eq!(
+            verify(KEY, HASH, &format!("{ZERO}{S}")).unwrap(),
+            Value::bool(false)
+        );
+        assert_eq!(
+            verify(KEY, HASH, &format!("{R}{ZERO}")).unwrap(),
+            Value::bool(false)
+        );
+
+        // Malformed: a scalar not below the group order, or an invalid key.
+        for (key, signature) in [
+            (KEY, format!("{ORDER}{S}")),
+            (KEY, format!("{R}{ORDER}")),
+            (&format!("02{ZERO}"), format!("{R}{S}")),
+        ] {
+            assert!(verify(key, HASH, &signature).is_err(), "{key} {signature}");
+        }
+
+        // Malformed: a wrong length, which an uncompressed key also has.
+        for (key, hash, signature, argument) in [
+            (UNCOMPRESSED_KEY, HASH, format!("{R}{S}"), "public key"),
+            (&KEY[2..], HASH, format!("{R}{S}"), "public key"),
+            (KEY, &HASH[2..], format!("{R}{S}"), "message hash"),
+            (KEY, &format!("{HASH}00"), format!("{R}{S}"), "message hash"),
+            (KEY, HASH, format!("{R}{}", &S[2..]), "signature"),
+            (KEY, HASH, String::new(), "signature"),
+        ] {
+            assert!(
+                matches!(
+                    verify(key, hash, &signature),
+                    Err(Error::UnexpectedArgumentLength { argument: a, .. }) if a == argument
+                ),
+                "{key} {hash} {signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_schnorr_secp256k1_matches_plutus() {
+        // BIP-340 test vector 1.
+        const KEY: &str = "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659";
+        const MESSAGE: &str = "243f6a8885a308d313198a2e03707344a4093822299f31d0082efa98ec4e6c89";
+        const R: &str = "6896bd60eeae296db48a229ff71dfe071bde413e6d43f917dc8dcf8c78de3341";
+        const S: &str = "8906d11ac976abccb20b091292bff4ea897efcb639ea871cfa95f6de339e4b0a";
+        const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+        const ORDER: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
+        const PRIME: &str = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f";
+
+        let verify = |key: &str, message: &str, signature: &str| {
+            secp256k1(
+                DefaultFunction::VerifySchnorrSecp256k1Signature,
+                key,
+                message,
+                signature,
+            )
+        };
+
+        assert_eq!(
+            verify(KEY, MESSAGE, &format!("{R}{S}")).unwrap(),
+            Value::bool(true)
+        );
+
+        // BIP-340 test vector 15: messages of any length are accepted.
+        assert_eq!(
+            verify(
+                "778caa53b4393ac467774d09497a87224bf9fab6f6e68b23086497324d6fd117",
+                "",
+                "71535db165ecd9fbbc046e5ffaea61186bb6ad436732fccc25291a55895464cf6069ce26bf03466228f19a3a62db8a649f2d560fac652827d1af0574e427ab63",
+            )
+            .unwrap(),
+            Value::bool(true)
+        );
+        assert_eq!(
+            verify(KEY, &format!("{MESSAGE}00"), &format!("{R}{S}")).unwrap(),
+            Value::bool(false)
+        );
+
+        // Any 64 bytes are a signature: out-of-range components do not verify.
+        for signature in [
+            format!("{ZERO}{S}"),
+            format!("{PRIME}{S}"),
+            format!("{R}{ZERO}"),
+            format!("{R}{ORDER}"),
+        ] {
+            assert_eq!(
+                verify(KEY, MESSAGE, &signature).unwrap(),
+                Value::bool(false),
+                "{signature}"
+            );
+        }
+
+        // Malformed: a key that is not on the curve.
+        assert!(verify(PRIME, MESSAGE, &format!("{R}{S}")).is_err());
+
+        // Malformed: a wrong length.
+        for (key, signature, argument) in [
+            (KEY[2..].to_string(), format!("{R}{S}"), "public key"),
+            (format!("{KEY}00"), format!("{R}{S}"), "public key"),
+            (String::new(), format!("{R}{S}"), "public key"),
+            (KEY.to_string(), format!("{R}{}", &S[2..]), "signature"),
+            (KEY.to_string(), format!("{R}{S}00"), "signature"),
+            (KEY.to_string(), String::new(), "signature"),
+        ] {
+            assert!(
+                matches!(
+                    verify(&key, MESSAGE, &signature),
+                    Err(Error::UnexpectedArgumentLength { argument: a, .. }) if a == argument
+                ),
+                "{key} {signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_array_rejects_operands_outside_int64() {
+        let array = || {
+            Value::Con(
+                Constant::ProtoArray(
+                    Type::Integer,
+                    vec![
+                        Constant::Integer(1.into()).into(),
+                        Constant::Integer(2.into()).into(),
+                    ]
+                    .into(),
+                )
+                .into(),
+            )
+        };
+        let index = |i: BigInt| {
+            DefaultFunction::IndexArray.call(
+                BuiltinSemantics::E,
+                &[array(), Value::integer(i)],
+                &mut vec![],
+            )
+        };
+
+        assert_eq!(index(1.into()).unwrap(), Value::integer(2.into()));
+
+        for i in [
+            BigInt::from(2),
+            BigInt::from(-1),
+            BigInt::from(u32::MAX) + 1,
+            BigInt::from(i64::MAX),
+            BigInt::from(i64::MIN),
+        ] {
+            assert!(matches!(index(i), Err(Error::IndexArrayOutOfBounds(_, _))));
+        }
+
+        for i in [
+            BigInt::from(i64::MAX) + 1,
+            BigInt::from(i64::MIN) - 1,
+            BigInt::from(1) << 200,
+        ] {
+            assert!(matches!(index(i), Err(Error::IntegerOutOfInt64Range(_, _))));
+        }
+    }
 
     #[test]
     fn exp_mod_integer_handles_positive_and_negative_exponents() {
@@ -2333,7 +3277,7 @@ mod tests {
 
         assert_eq!(
             DefaultFunction::ExpModInteger
-                .call(BuiltinSemantics::C, &positive, &mut vec![])
+                .call(BuiltinSemantics::E, &positive, &mut vec![])
                 .unwrap(),
             Value::integer(445.into())
         );
@@ -2346,7 +3290,7 @@ mod tests {
 
         assert_eq!(
             DefaultFunction::ExpModInteger
-                .call(BuiltinSemantics::C, &inverse, &mut vec![])
+                .call(BuiltinSemantics::E, &inverse, &mut vec![])
                 .unwrap(),
             Value::integer(4.into())
         );
@@ -2361,7 +3305,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            DefaultFunction::ExpModInteger.call(BuiltinSemantics::C, &no_inverse, &mut vec![]),
+            DefaultFunction::ExpModInteger.call(BuiltinSemantics::E, &no_inverse, &mut vec![]),
             Err(Error::ExpModIntegerNoInverse(_, _))
         ));
 
@@ -2372,7 +3316,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            DefaultFunction::ExpModInteger.call(BuiltinSemantics::C, &zero_modulus, &mut vec![]),
+            DefaultFunction::ExpModInteger.call(BuiltinSemantics::E, &zero_modulus, &mut vec![]),
             Err(Error::OutsideNaturalBounds(_))
         ));
 
@@ -2385,7 +3329,7 @@ mod tests {
 
         assert!(matches!(
             DefaultFunction::ExpModInteger.call(
-                BuiltinSemantics::C,
+                BuiltinSemantics::E,
                 &out_of_bounds_modulus,
                 &mut vec![],
             ),
@@ -2401,7 +3345,7 @@ mod tests {
         assert_eq!(
             DefaultFunction::ExpModInteger
                 .call(
-                    BuiltinSemantics::C,
+                    BuiltinSemantics::E,
                     &modulus_one_short_circuits,
                     &mut vec![],
                 )
@@ -2412,42 +3356,60 @@ mod tests {
 
     #[test]
     fn protocol_versions_select_ledger_semantics() {
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV2, 8),
-            BuiltinSemantics::A
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV2, 9),
-            BuiltinSemantics::B
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV3, 10),
-            BuiltinSemantics::C
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV3, 11),
-            BuiltinSemantics::E
-        );
-        assert_eq!(
-            BuiltinSemantics::for_language_and_protocol(&Language::PlutusV2, 11),
-            BuiltinSemantics::D
-        );
+        use BuiltinSemantics::*;
+        use Language::*;
+
+        // The protocol versions at which each language's semantics variant
+        // changes (`builtinSemanticsVariant` in plutus-ledger-api).
+        for (language, variants) in [
+            (
+                PlutusV1,
+                [(5, A), (8, A), (9, B), (10, B), (11, D), (12, F)],
+            ),
+            (
+                PlutusV2,
+                [(7, A), (8, A), (9, B), (10, B), (11, D), (12, F)],
+            ),
+            (
+                PlutusV3,
+                [(9, C), (10, C), (11, E), (12, G), (13, G), (u16::MAX, G)],
+            ),
+        ] {
+            for (protocol_major_version, semantics) in variants {
+                assert_eq!(
+                    BuiltinSemantics::for_language_and_protocol(&language, protocol_major_version),
+                    semantics,
+                    "{language:?} at protocol version {protocol_major_version}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn cons_byte_string_keeps_d_wrapping_and_e_range_checking() {
+    fn cons_byte_string_wraps_or_range_checks_its_byte() {
+        use BuiltinSemantics::*;
+
         let args = [Value::integer(256.into()), Value::byte_string(vec![])];
 
-        let wrapped = DefaultFunction::ConsByteString
-            .call(BuiltinSemantics::D, &args, &mut vec![])
-            .unwrap();
+        for semantics in [A, B, D, F] {
+            assert_eq!(
+                DefaultFunction::ConsByteString
+                    .call(semantics, &args, &mut vec![])
+                    .unwrap(),
+                Value::byte_string(vec![0]),
+                "{semantics:?}"
+            );
+        }
 
-        assert_eq!(wrapped, Value::byte_string(vec![0]));
-        assert!(
-            DefaultFunction::ConsByteString
-                .call(BuiltinSemantics::E, &args, &mut vec![])
-                .is_err()
-        );
+        for semantics in [C, E, G] {
+            assert!(
+                matches!(
+                    DefaultFunction::ConsByteString.call(semantics, &args, &mut vec![]),
+                    Err(Error::ByteStringConsNotAByte(_))
+                ),
+                "{semantics:?}"
+            );
+        }
     }
 
     #[test]

@@ -830,6 +830,19 @@ pub fn find_script(
     utxos: &[ResolvedInput],
     lookup_table: &DataLookupTable,
 ) -> Result<(PlutusScript, Option<PlutusData>), Error> {
+    find_script_cached(redeemer, tx, utxos, lookup_table, &mut None)
+}
+
+/// Like [`find_script`], but keeps the transaction's resolved spent inputs in
+/// `spend_inputs` the first time a spend redeemer needs them, and reuses them
+/// for the transaction's other spend redeemers.
+pub(crate) fn find_script_cached(
+    redeemer: &Redeemer,
+    tx: &MintedTx,
+    utxos: &[ResolvedInput],
+    lookup_table: &DataLookupTable,
+    spend_inputs: &mut Option<Vec<TxInInfo>>,
+) -> Result<(PlutusScript, Option<PlutusData>), Error> {
     let lookup_script = |script_hash: &ScriptHash| match lookup_table.get_script(script_hash) {
         Some(s) => Ok((s.clone(), None)),
         None => Err(Error::MissingRequiredScript {
@@ -903,32 +916,35 @@ pub fn find_script(
             })
             .and_then(lookup_script),
 
-        RedeemerTag::Spend => get_tx_in_info_v2(&tx.transaction_body.inputs, utxos)
-            .or_else(|err| {
-                if matches!(err, Error::ByronAddressNotAllowed) {
-                    get_tx_in_info_v1(&tx.transaction_body.inputs, utxos)
-                } else {
-                    Err(err)
-                }
-            })?
-            .get(redeemer.index as usize)
-            .ok_or(Error::MissingScriptForRedeemer)
-            .and_then(|input| match output_address(&input.resolved) {
-                Address::Shelley(shelley_address) => {
-                    let hash = shelley_address.payment().as_hash();
-                    let (script, _) = lookup_script(hash)?;
-                    let datum = lookup_datum(output_datum(&input.resolved))?;
-
-                    if datum.is_none()
-                        && matches!(script, PlutusScript::V1(..) | PlutusScript::V2(..))
-                    {
-                        return Err(Error::MissingRequiredInlineDatumOrHash);
+        RedeemerTag::Spend => match spend_inputs {
+            Some(inputs) => inputs,
+            None => spend_inputs.insert(
+                get_tx_in_info_v2(&tx.transaction_body.inputs, utxos).or_else(|err| {
+                    if matches!(err, Error::ByronAddressNotAllowed) {
+                        get_tx_in_info_v1(&tx.transaction_body.inputs, utxos)
+                    } else {
+                        Err(err)
                     }
+                })?,
+            ),
+        }
+        .get(redeemer.index as usize)
+        .ok_or(Error::MissingScriptForRedeemer)
+        .and_then(|input| match output_address(&input.resolved) {
+            Address::Shelley(shelley_address) => {
+                let hash = shelley_address.payment().as_hash();
+                let (script, _) = lookup_script(hash)?;
+                let datum = lookup_datum(output_datum(&input.resolved))?;
 
-                    Ok((script, datum))
+                if datum.is_none() && matches!(script, PlutusScript::V1(..) | PlutusScript::V2(..))
+                {
+                    return Err(Error::MissingRequiredInlineDatumOrHash);
                 }
-                _ => Err(Error::NonScriptStakeCredential),
-            }),
+
+                Ok((script, datum))
+            }
+            _ => Err(Error::NonScriptStakeCredential),
+        }),
 
         RedeemerTag::Vote => get_votes_info(&tx.transaction_body.voting_procedures)
             .get(redeemer.index as usize)
@@ -1215,12 +1231,12 @@ mod tests {
 
     #[test]
     fn script_context_simple_send() {
-        let datum = Some(Data::constr(0, Vec::new()).into());
+        let datum = Some(Data::constr(0, Vec::new()).try_into().unwrap());
 
         let redeemer = Redeemer {
             tag: RedeemerTag::Spend,
             index: 0,
-            data: Data::constr(0, Vec::new()).into(),
+            data: Data::constr(0, Vec::new()).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1257,7 +1273,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Mint,
             index: 1,
-            data: Data::integer(42.into()).into(),
+            data: Data::integer(42.into()).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1317,7 +1333,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Propose,
             index: 3,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1392,7 +1408,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Propose,
             index: 0,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1441,7 +1457,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Cert,
             index: 20,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1511,7 +1527,9 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Vote,
             index: 0,
-            data: Data::constr(0, vec![Data::integer(42.into())]).into(),
+            data: Data::constr(0, vec![Data::integer(42.into())])
+                .try_into()
+                .unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,
@@ -1564,7 +1582,7 @@ mod tests {
         let redeemer = Redeemer {
             tag: RedeemerTag::Reward,
             index: 0,
-            data: Data::constr(0, vec![]).into(),
+            data: Data::constr(0, vec![]).try_into().unwrap(),
             ex_units: ExUnits {
                 mem: 1000000,
                 steps: 100000000,

@@ -2118,6 +2118,7 @@ impl<'a> CodeGenerator<'a> {
                 | UplcType::Bls12_381G2Element
                 | UplcType::Bls12_381MlResult
                 | UplcType::Value
+                | UplcType::Array(_)
                 | UplcType::Data,
             ) => then,
 
@@ -4573,6 +4574,7 @@ impl<'a> CodeGenerator<'a> {
                                     .apply(Term::mk_cons().apply(right).apply(Term::empty_map()));
                                 Term::equals_data()
                             }
+                            Some(UplcType::Array(_)) => unreachable!("Aiken has no array type"),
                             Some(UplcType::List(_) | UplcType::Value | UplcType::Data) | None => {
                                 left = builder::convert_type_to_data(
                                     left,
@@ -4890,7 +4892,8 @@ impl<'a> CodeGenerator<'a> {
                         | UplcType::Bls12_381G1Element
                         | UplcType::Bls12_381G2Element
                         | UplcType::Bls12_381MlResult
-                        | UplcType::Value,
+                        | UplcType::Value
+                        | UplcType::Array(_),
                     ) => subject,
 
                     Some(UplcType::Data) => subject,
@@ -4937,7 +4940,7 @@ impl<'a> CodeGenerator<'a> {
                 let other_clauses = term.clone();
 
                 let body = if tipo.is_bool() {
-                    if matches!(clause, Term::Constant(boolean) if matches!(boolean.as_ref(), UplcConstant::Bool(true)))
+                    if matches!(&clause, Term::Constant(boolean) if matches!(boolean.as_ref(), UplcConstant::Bool(true)))
                     {
                         Term::var(subject_name)
                             .if_then_else(body.delay(), other_clauses)
@@ -4957,7 +4960,8 @@ impl<'a> CodeGenerator<'a> {
                             | UplcType::List(_)
                             | UplcType::Pair(_, _)
                             | UplcType::Bls12_381MlResult
-                            | UplcType::Value,
+                            | UplcType::Value
+                            | UplcType::Array(_),
                         ) => unreachable!("{:#?}", tipo),
                         Some(UplcType::Data) => unimplemented!(),
                         Some(UplcType::Integer) => Term::equals_integer()
@@ -5597,7 +5601,7 @@ mod tests {
 
         let program = generator.generate_raw(&expression, &[], "").unwrap();
 
-        let Term::Constant(constant) = program.term else {
+        let Term::Constant(constant) = &program.term else {
             panic!("Value literal did not lower to a direct UPLC constant")
         };
         let UplcConstant::Value(value) = constant.as_ref() else {
@@ -5753,7 +5757,7 @@ mod tests {
         let mut generator = empty_generator();
         let under_limit = value_data_term(&mut generator, uplc::ast::VALUE_DATA_MAX_SIZE - 1);
         assert!(matches!(
-            under_limit,
+            &under_limit,
             Term::Constant(constant)
                 if matches!(constant.as_ref(), UplcConstant::Data(_))
         ));
@@ -5761,7 +5765,7 @@ mod tests {
         let legal = value_data_term(&mut generator, uplc::ast::VALUE_DATA_MAX_SIZE);
 
         assert!(matches!(
-            legal,
+            &legal,
             Term::Constant(constant)
                 if matches!(constant.as_ref(), UplcConstant::Data(_))
         ));
@@ -5803,7 +5807,7 @@ mod tests {
             let legal = build_term(&mut generator, uplc::ast::VALUE_DATA_MAX_SIZE);
             assert!(
                 matches!(
-                    legal,
+                    &legal,
                     Term::Constant(constant) if is_expected_constant(constant.as_ref())
                 ),
                 "{case}"
