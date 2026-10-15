@@ -22,6 +22,7 @@
 - **uplc**: Drop deeply nested lists and `Data` without overflowing the stack. @colll78
 - **uplc**: Reject a flat-encoded natural (constr tag, de Bruijn index or version number) that does not fit in 64 bits instead of silently truncating it: a constr tag of 2^64 used to decode as 0 everywhere, and any tag of 2^32 or more aliased on 32-bit targets such as wasm32. Constr tags are now `u64`, like Plutus' `Word64`, so every tag up to 2^64 - 1 parses, decodes, encodes and evaluates identically on 32-bit and 64-bit targets; a tag with no matching branch is a missing-branch error. This is a breaking change of the `uplc` API: the `tag` of `Term::Constr` and of `Value::Constr`, and the `tag` argument of `Term::constr`, are now `u64` instead of `usize`. @colll78
 - **uplc**: Reject `constr` and `case` in programs of a UPLC version before 1.1.0, when parsing and when decoding flat. @colll78
+- **uplc**: Reject open terms (free variables, even unused ones) before evaluation, as the ledger does. @colll78
 - **uplc**: Parse string constants with Haskell character escapes, as the Plutus parser does (`\83`, `\o143`, `\x7f`, `\^A`, `\DEL`, `\&`, …), instead of keeping numeric escapes literally. @colll78
 - **uplc**: Print the `bls12_381_G2_element` type as such in the textual syntax instead of as `bls12_381_G1_element`. @colll78
 - **uplc**: Fail `sliceByteString`, `indexByteString` and `indexArray` cleanly when an integer operand is outside the signed 64-bit range, as Plutus does when unlifting an `Int`, instead of clamping or panicking. @colll78

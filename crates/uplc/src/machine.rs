@@ -261,31 +261,43 @@ impl Machine {
         }
     }
 
-    /// Builtins become available per ledger language and protocol version
-    /// (see `DefaultFunction::introduced_in`), and native `Value` and array
-    /// constants only exist from protocol version 11 (Van Rossem) onwards, from
-    /// which everything this machine knows about is available in every ledger
-    /// language. Availability is a whole-program well-formedness rule:
+    /// Reject, before any budget is spent, terms the ledger would refuse to
+    /// evaluate: open terms (the ledger scope-checks every script it runs) and,
+    /// before protocol version 11 (Van Rossem), builtins and constant types the
+    /// ledger language does not have yet (see `DefaultFunction::introduced_in`).
+    /// From Van Rossem onwards everything this machine knows about is available
+    /// in every ledger language. Both are whole-program well-formedness rules:
     /// occurrences in latent code (under lambdas, delays or untaken branches)
-    /// are rejected too, so the entire term is validated up-front before
-    /// evaluation starts.
+    /// are rejected too.
     fn check_term(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
-        if self.protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION {
-            return Ok(());
-        }
+        let check_availability = self.protocol_major_version < VAN_ROSSEM_PROTOCOL_VERSION;
 
-        let mut stack = vec![term];
+        // Each term is paired with the number of lambdas enclosing it.
+        let mut stack = vec![(term, 0_usize)];
 
-        while let Some(term) = stack.pop() {
+        while let Some((term, depth)) = stack.pop() {
             match term {
-                Term::Delay(body) | Term::Lambda { body, .. } | Term::Force(body) => {
-                    stack.push(body.as_ref());
+                Term::Var(name) => {
+                    let index = usize::from(name.index);
+
+                    if index == 0 || index > depth {
+                        return Err(Error::OpenTermEvaluated(term.clone()));
+                    }
                 }
+                Term::Lambda { body, .. } => stack.push((body.as_ref(), depth + 1)),
+                Term::Delay(body) | Term::Force(body) => stack.push((body.as_ref(), depth)),
                 Term::Apply { function, argument } => {
-                    stack.push(function.as_ref());
-                    stack.push(argument.as_ref());
+                    stack.push((function.as_ref(), depth));
+                    stack.push((argument.as_ref(), depth));
                 }
-                Term::Constant(constant) => {
+                Term::Constr { fields, .. } => {
+                    stack.extend(fields.iter().map(|field| (field, depth)));
+                }
+                Term::Case { constr, branches } => {
+                    stack.push((constr.as_ref(), depth));
+                    stack.extend(branches.iter().map(|branch| (branch, depth)));
+                }
+                Term::Constant(constant) if check_availability => {
                     if Constant::contains_value(constant) {
                         return Err(Error::ValueConstantNotAvailable);
                     }
@@ -293,19 +305,12 @@ impl Machine {
                         return Err(Error::ArrayConstantNotAvailable);
                     }
                 }
-                Term::Builtin(fun) => {
+                Term::Builtin(fun) if check_availability => {
                     if !fun.is_available_in(&self.language, self.protocol_major_version) {
                         return Err(Error::BuiltinNotAvailable(*fun));
                     }
                 }
-                Term::Constr { fields, .. } => {
-                    stack.extend(fields.iter());
-                }
-                Term::Case { constr, branches } => {
-                    stack.push(constr.as_ref());
-                    stack.extend(branches.iter());
-                }
-                Term::Var(_) | Term::Error => {}
+                Term::Constant(_) | Term::Builtin(_) | Term::Error => {}
             }
         }
 
@@ -702,6 +707,68 @@ mod tests {
         builtins::DefaultFunction,
     };
     use pallas_primitives::conway::Language;
+
+    #[test]
+    fn open_terms_rejected_before_evaluation() {
+        use crate::ast::DeBruijn;
+
+        let var = |index: usize| {
+            Term::Var(
+                NamedDeBruijn {
+                    text: "x".to_string(),
+                    index: DeBruijn::new(index),
+                }
+                .into(),
+            )
+        };
+        let lambda = |body: Term<NamedDeBruijn>| Term::Lambda {
+            parameter_name: NamedDeBruijn {
+                text: "y".to_string(),
+                index: DeBruijn::new(0),
+            }
+            .into(),
+            body: body.into(),
+        };
+
+        // A free variable that evaluation would never reach: under a delay
+        // that is not forced, in an unused argument, in an untaken branch, or
+        // under a lambda that is never applied.
+        for term in [
+            Term::Delay(var(1).into()),
+            lambda(Term::integer(0.into())).apply(Term::Delay(var(1).into())),
+            Term::Case {
+                constr: Term::Constr {
+                    tag: 0,
+                    fields: vec![],
+                }
+                .into(),
+                branches: vec![Term::integer(0.into()), var(1)],
+            },
+            lambda(var(1).apply(var(2))),
+        ] {
+            let program = Program {
+                version: (1, 1, 0),
+                term,
+            };
+
+            let source = program.to_pretty();
+
+            assert!(
+                matches!(
+                    program.eval(ExBudget::max()).result(),
+                    Err(Error::OpenTermEvaluated(_))
+                ),
+                "{source}"
+            );
+        }
+
+        // Closed, for comparison.
+        let program = Program {
+            version: (1, 1, 0),
+            term: lambda(var(1)),
+        };
+        assert!(program.eval(ExBudget::max()).result().is_ok());
+    }
 
     #[test]
     fn van_rossem_features_unavailable_before_van_rossem() {
