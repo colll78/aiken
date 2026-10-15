@@ -433,7 +433,16 @@ where
                 let con_option = Constant::decode(d);
                 match con_option {
                     Ok(constant) => {
-                        state_log.push(format!("{})", constant.to_pretty()));
+                        let r#type = Type::from(&constant);
+
+                        // Printing Data recurses as deep as the Data nests, so
+                        // a constant holding some is logged by its type alone.
+                        if mentions_data(&r#type) {
+                            state_log.push(format!("{type} …)"));
+                        } else {
+                            state_log.push(format!("{})", constant.to_pretty()));
+                        }
+
                         Ok(Term::Constant(constant.into()))
                     }
                     Err(error) => {
@@ -801,6 +810,18 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
     }
 }
 
+/// Whether values of a type can hold Data, however deep within lists, arrays
+/// and pairs. Types take at most `MAX_CONSTANT_TYPE_SIZE` tags to decode, so
+/// this recursion is shallow.
+fn mentions_data(r#type: &Type) -> bool {
+    match r#type {
+        Type::Data => true,
+        Type::List(item) | Type::Array(item) => mentions_data(item),
+        Type::Pair(first, second) => mentions_data(first) || mentions_data(second),
+        _ => false,
+    }
+}
+
 /// Decodes a bool, failing at the end of the input where pallas'
 /// `Decoder::bool` panics.
 fn decode_bool(d: &mut Decoder) -> Result<bool, de::Error> {
@@ -1130,7 +1151,7 @@ pub fn decode_constant_tag(d: &mut Decoder) -> Result<u8, de::Error> {
 mod tests {
     use super::{Constant, Program, Term, decode_bool, decode_value, encode_constant};
     use crate::{
-        ast::{BigIntValueEntries, DeBruijn, Name, Type, Value},
+        ast::{BigIntValueEntries, Data, DeBruijn, Name, Type, Value},
         parser,
     };
     use indoc::indoc;
@@ -1634,5 +1655,51 @@ mod tests {
         // used to panic in pallas' `Decoder::bool`.
         let bytes = hex::decode("010000183682d528").unwrap();
         assert!(Program::<DeBruijn>::unflat(&bytes).is_err());
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn decodes_deep_data_constants_in_bounded_stack() {
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 2_000;
+
+        // Room for the nested drops allowed before queuing (see
+        // `data::tests::drops_deep_data_in_bounded_stack`), but far too little
+        // to print or decode the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let data =
+                    (0..DEPTH).fold(Data::integer(0.into()), |data, _| Data::list(vec![data]));
+                let program = Program::<DeBruijn> {
+                    version: (1, 0, 0),
+                    term: Term::Constant(Constant::Data(data).into()),
+                };
+
+                let bytes = program.to_flat().unwrap();
+                assert_eq!(Program::<DeBruijn>::unflat(&bytes).unwrap(), program);
+
+                // Logged on the way to a failure: an application of the
+                // constant to a term with no tag.
+                let mut e = Encoder::new();
+                for word in [1_usize, 0, 0] {
+                    word.encode(&mut e).unwrap();
+                }
+                e.bits(4, 3);
+                program.term.encode(&mut e).unwrap();
+                e.bits(4, 15);
+                pallas_codec::flat::filler::Filler::FillerEnd
+                    .encode(&mut e)
+                    .unwrap();
+                assert!(Program::<DeBruijn>::unflat(&e.buffer).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }
