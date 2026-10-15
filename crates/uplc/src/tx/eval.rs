@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     PlutusData,
-    ast::{Data, FakeNamedDeBruijn, NamedDeBruijn, Program},
+    ast::{Constant, Data, FakeNamedDeBruijn, NamedDeBruijn, Program},
     machine::{cost_model::ExBudget, eval_result::EvalResult},
     protocol::{self, VAN_ROSSEM_PROTOCOL_VERSION},
     tx::{
@@ -274,6 +274,28 @@ fn eval_redeemer_with_optional_protocol(
     )
 }
 
+/// Whether the ledger accepts the outcome of a script: it must not fail, and
+/// PlutusV3 scripts must return unit while PlutusV1 and PlutusV2 ones may
+/// return any value (Plutus' `processLogsAndErrors`).
+fn check_result(lang: &Language, eval_result: &EvalResult) -> Result<(), Error> {
+    if let Some(err) = eval_result.error() {
+        return Err(Error::Machine(
+            err.clone(),
+            eval_result.cost(),
+            eval_result.traces(),
+        ));
+    }
+
+    if *lang == Language::PlutusV3 && eval_result.constant() != Some(&Constant::Unit) {
+        return Err(Error::InvalidReturnValue(
+            eval_result.cost(),
+            eval_result.traces(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_redeemer_cached(
     tx: &MintedTx,
@@ -331,9 +353,7 @@ pub(crate) fn eval_redeemer_cached(
 
         let cost = eval_result.cost();
 
-        if let Err(err) = eval_result.result() {
-            return Err(Error::Machine(err, cost, eval_result.traces()));
-        }
+        check_result(lang, &eval_result)?;
 
         let new_redeemer = Redeemer {
             tag: redeemer.tag,
@@ -421,4 +441,52 @@ pub(crate) fn eval_redeemer_cached(
         index: redeemer.index,
         err: Box::new(err),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{parser, tx::error::Error};
+
+    fn evaluate(lang: &Language, term: &str) -> EvalResult {
+        let program: Program<NamedDeBruijn> = parser::program(&format!("(program 1.1.0 {term})"))
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        program.eval_version(ExBudget::default(), lang)
+    }
+
+    #[test]
+    fn only_plutus_v3_scripts_must_return_unit() {
+        for lang in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            assert!(check_result(&lang, &evaluate(&lang, "(con unit ())")).is_ok());
+        }
+
+        for term in [
+            "(con bool True)",
+            "(con integer 0)",
+            "(lam x x)",
+            "(delay (con unit ()))",
+        ] {
+            for lang in [Language::PlutusV1, Language::PlutusV2] {
+                assert!(check_result(&lang, &evaluate(&lang, term)).is_ok());
+            }
+
+            assert!(matches!(
+                check_result(&Language::PlutusV3, &evaluate(&Language::PlutusV3, term)),
+                Err(Error::InvalidReturnValue(..))
+            ));
+        }
+    }
+
+    #[test]
+    fn failing_scripts_are_rejected_in_every_language() {
+        for lang in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            assert!(matches!(
+                check_result(&lang, &evaluate(&lang, "(error)")),
+                Err(Error::Machine(..))
+            ));
+        }
+    }
 }
