@@ -173,8 +173,9 @@ fn read_lit_char(window: &[char]) -> Option<(char, usize)> {
         'o' => numeric(8, digits, 2),
         '0'..='9' => numeric(10, rest, 1),
         _ => ASCII_MNEMONICS.iter().find_map(|(name, c)| {
-            let name: Vec<char> = name.chars().collect();
-            rest.starts_with(&name).then_some((*c, 1 + name.len()))
+            let matches = rest.len() >= name.len()
+                && rest.iter().copied().zip(name.chars()).all(|(a, b)| a == b);
+            matches.then_some((*c, 1 + name.len()))
         }),
     }
 }

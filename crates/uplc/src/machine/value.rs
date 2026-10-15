@@ -351,15 +351,12 @@ impl Value {
     /// bytes take up, saturating. Whether the integer is a valid number of
     /// bytes is up to the builtin, once it has been costed.
     pub fn cost_as_size(&self) -> Result<i64, Error> {
-        let size = self.unwrap_integer()?;
+        let bytes = self.unwrap_integer()?.magnitude();
 
-        if size.is_zero() {
-            return Ok(0);
-        }
-
-        let words = (size.abs() - 1) / 8 + 1;
-
-        Ok(i64::try_from(words).unwrap_or(i64::MAX))
+        Ok(match bytes.to_u64() {
+            Some(bytes) => bytes.div_ceil(8) as i64,
+            None => ((bytes - 1u8) / 8u8 + 1u8).to_i64().unwrap_or(i64::MAX),
+        })
     }
 
     pub fn to_ex_mem(&self) -> i64 {
@@ -657,6 +654,33 @@ mod tests {
     use pallas_primitives::{PlutusData, conway};
     use proptest::prelude::*;
     use std::rc::Rc;
+
+    #[test]
+    fn sizes_cost_as_words_of_their_magnitude() {
+        let two_to = |n: usize| BigInt::from(1) << n;
+
+        for (size, words) in [
+            (BigInt::from(0), 0),
+            (BigInt::from(1), 1),
+            (BigInt::from(8), 1),
+            (BigInt::from(9), 2),
+            (BigInt::from(-9), 2),
+            (BigInt::from(u64::MAX), 1 << 61),
+            (two_to(64), 1 << 61),
+            (two_to(64) + 1, (1 << 61) + 1),
+            (two_to(65), 1 << 62),
+            (two_to(66) - 8, i64::MAX),
+            // Saturating.
+            (two_to(66), i64::MAX),
+            (-two_to(70), i64::MAX),
+        ] {
+            assert_eq!(
+                Value::integer(size.clone()).cost_as_size().unwrap(),
+                words,
+                "{size}"
+            );
+        }
+    }
 
     #[test]
     fn to_ex_mem_bigint() {

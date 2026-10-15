@@ -234,18 +234,25 @@ impl Constant {
             Constant::Bool(b) => RcDoc::text("bool")
                 .append(RcDoc::line())
                 .append(RcDoc::text(if *b { "True" } else { "False" })),
-            Constant::ProtoList(r#type, items) => RcDoc::text("(")
-                .append("list")
-                .append(RcDoc::space())
-                .append(r#type.to_doc())
-                .append(")")
-                .append(RcDoc::line())
-                .append(RcDoc::text("["))
-                .append(RcDoc::intersperse(
-                    items.iter().map(|c| c.to_doc_list()),
-                    RcDoc::text(", "),
-                ))
-                .append(RcDoc::text("]")),
+            Constant::ProtoList(r#type, items) | Constant::ProtoArray(r#type, items) => {
+                let kind = match self {
+                    Constant::ProtoArray(..) => "array",
+                    _ => "list",
+                };
+
+                RcDoc::text("(")
+                    .append(kind)
+                    .append(RcDoc::space())
+                    .append(r#type.to_doc())
+                    .append(")")
+                    .append(RcDoc::line())
+                    .append(RcDoc::text("["))
+                    .append(RcDoc::intersperse(
+                        items.iter().map(|c| c.to_doc_list()),
+                        RcDoc::text(", "),
+                    ))
+                    .append(RcDoc::text("]"))
+            }
             Constant::ProtoPair(type_left, type_right, left, right) => RcDoc::text("(")
                 .append("pair")
                 .append(RcDoc::space())
@@ -272,18 +279,6 @@ impl Constant {
                 .append(RcDoc::text("0x"))
                 .append(RcDoc::text(hex::encode(p2.compress()))),
             Constant::Bls12_381MlResult(_) => panic!("cannot represent Bls12_381MlResult as text"),
-            Constant::ProtoArray(r#type, items) => RcDoc::text("(")
-                .append("array")
-                .append(RcDoc::space())
-                .append(r#type.to_doc())
-                .append(")")
-                .append(RcDoc::line())
-                .append(RcDoc::text("["))
-                .append(RcDoc::intersperse(
-                    items.iter().map(|c| c.to_doc_list()),
-                    RcDoc::text(", "),
-                ))
-                .append(RcDoc::text("]")),
             Constant::Value(value) => RcDoc::text("value")
                 .append(RcDoc::line())
                 .append(Self::to_doc_value(value)),
