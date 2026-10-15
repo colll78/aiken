@@ -441,11 +441,16 @@ impl Machine {
         };
 
         match value {
-            Value::Constr { tag, fields } => match branches.get(tag) {
-                Some(_) => {
+            // A tag beyond the platform's index range has no branch, as in
+            // the reference machine (which checks it against Int's maxBound).
+            Value::Constr { tag, fields } => match usize::try_from(tag)
+                .ok()
+                .filter(|&index| index < branches.len())
+            {
+                Some(index) => {
                     self.transfer_arg_stack(Rc::unwrap_or_clone(fields));
 
-                    Ok(MachineState::Compute(env, term.child(tag)))
+                    Ok(MachineState::Compute(env, term.child(index)))
                 }
                 None => Err(Error::MissingCaseBranch(
                     branches.to_vec(),
@@ -846,7 +851,7 @@ mod tests {
     #[test]
     fn case_constr_case_0() {
         let make_program =
-            |fun: DefaultFunction, tag: usize, n: i32, m: i32| Program::<NamedDeBruijn> {
+            |fun: DefaultFunction, tag: u64, n: i32, m: i32| Program::<NamedDeBruijn> {
                 version: (0, 0, 0),
                 term: Term::Case {
                     constr: Term::Constr {
@@ -877,8 +882,33 @@ mod tests {
     }
 
     #[test]
+    fn case_constr_tag_beyond_branches_is_missing_branch() {
+        for tag in [3, u32::MAX as u64 + 1, i64::MAX as u64 + 1, u64::MAX] {
+            let program = Program::<NamedDeBruijn> {
+                version: (1, 1, 0),
+                term: Term::Case {
+                    constr: Term::Constr {
+                        tag,
+                        fields: vec![],
+                    }
+                    .into(),
+                    branches: vec![Term::integer(5.into()); 3],
+                },
+            };
+
+            assert!(
+                matches!(
+                    program.eval(ExBudget::max()).result(),
+                    Err(Error::MissingCaseBranch(..))
+                ),
+                "{tag}"
+            );
+        }
+    }
+
+    #[test]
     fn case_constr_case_1() {
-        let make_program = |tag: usize| Program::<NamedDeBruijn> {
+        let make_program = |tag: u64| Program::<NamedDeBruijn> {
             version: (0, 0, 0),
             term: Term::Case {
                 constr: Term::Constr {

@@ -32,7 +32,7 @@ where
         Term::Delay(self.into())
     }
 
-    pub fn constr(tag: usize, fields: Vec<Term<T>>) -> Self {
+    pub fn constr(tag: u64, fields: Vec<Term<T>>) -> Self {
         Term::Constr { tag, fields }
     }
 

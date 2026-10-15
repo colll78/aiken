@@ -170,7 +170,7 @@ where
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
         let mut state_log: Vec<String> = vec![];
-        let version = (usize::decode(d)?, usize::decode(d)?, usize::decode(d)?);
+        let version = (decode_usize(d)?, decode_usize(d)?, decode_usize(d)?);
         let term_option = Term::decode_debug(d, &mut state_log);
 
         match term_option {
@@ -232,7 +232,7 @@ where
             Term::Constr { tag, fields } => {
                 encode_term_tag(8, e)?;
 
-                tag.encode(e)?;
+                encode_word64(*tag, e);
 
                 e.encode_list_with(fields, |term, e| (*term).encode(e))?;
             }
@@ -271,7 +271,7 @@ where
             6 => Ok(Term::Error),
             7 => Ok(Term::Builtin(DefaultFunction::decode(d)?)),
             8 => {
-                let tag = usize::decode(d)?;
+                let tag = decode_word64(d)?;
                 let fields = d.decode_list_with(Term::<T>::decode)?;
 
                 Ok(Term::Constr { tag, fields })
@@ -448,7 +448,7 @@ where
             8 => {
                 state_log.push("(constr ".to_string());
 
-                let tag = usize::decode(d)?;
+                let tag = decode_word64(d)?;
 
                 let fields = d.decode_list_with_debug(
                     |d, state_log| Term::<T>::decode_debug(d, state_log),
@@ -935,7 +935,7 @@ impl Encode for DeBruijn {
 
 impl Decode<'_> for DeBruijn {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        Ok(usize::decode(d)?.into())
+        Ok(decode_usize(d)?.into())
     }
 }
 
@@ -1004,6 +1004,70 @@ impl Decode<'_> for DefaultFunction {
 
 fn encode_term_tag(tag: u8, e: &mut Encoder) -> Result<(), en::Error> {
     safe_encode_bits(TERM_TAG_WIDTH, tag, e)
+}
+
+/// Encode a natural as a flat word: 7-bit groups, least significant first.
+/// Unlike Pallas' `Encoder::word`, this does not go through `usize`, so it
+/// handles the full `Word64` range on 32-bit targets as well.
+fn encode_word64(word: u64, e: &mut Encoder) {
+    let mut word = word;
+
+    loop {
+        let mut group = (word & 0x7f) as u8;
+        word >>= 7;
+
+        if word != 0 {
+            group |= 0x80;
+        }
+
+        e.bits(8, group);
+
+        if word == 0 {
+            break;
+        }
+    }
+}
+
+/// Decode a flat-encoded natural that must fit in 64 bits, as the reference
+/// `Word64` decoder requires. Pallas' `Decoder::word` accumulates into a
+/// `usize` without any overflow check, so an over-long encoding silently
+/// aliases a smaller value: a constr tag of 2^64 decodes as 0 everywhere, and
+/// any tag at or above 2^32 aliases on 32-bit targets.
+fn decode_word64(d: &mut Decoder) -> Result<u64, de::Error> {
+    let mut word: u64 = 0;
+    let mut shift: u32 = 0;
+
+    loop {
+        let byte = d.bits8(8)?;
+        let chunk = u64::from(byte & 0x7f);
+
+        if shift > 63 || (shift == 63 && chunk > 1) {
+            return Err(de::Error::Message(
+                "flat-encoded natural does not fit in 64 bits".to_string(),
+            ));
+        }
+
+        word |= chunk << shift;
+
+        if byte & 0x80 == 0 {
+            return Ok(word);
+        }
+
+        shift += 7;
+    }
+}
+
+/// Like [`decode_word64`], but additionally refuses values that do not fit in
+/// a `usize` (only possible on 32-bit targets) rather than truncating them.
+fn decode_usize(d: &mut Decoder) -> Result<usize, de::Error> {
+    let word = decode_word64(d)?;
+
+    usize::try_from(word).map_err(|_| {
+        de::Error::Message(format!(
+            "flat-encoded natural {word} does not fit in a {}-bit word",
+            usize::BITS
+        ))
+    })
 }
 
 fn decode_term_tag(d: &mut Decoder) -> Result<u8, de::Error> {
@@ -1335,5 +1399,71 @@ mod tests {
         let mut truncated = encode_raw_value(vec![(vec![0], vec![(vec![0], BigInt::from(1))])]);
         truncated.truncate(truncated.len() - 2);
         assert!(decode_value(&mut Decoder::new(&truncated)).is_err());
+    }
+
+    /// Flat bytes for `(program 1.1.0 (constr <tag>))`, with the tag written
+    /// as the given 7-bit groups (least significant first).
+    fn constr_with_tag_groups(groups: &[u8]) -> Vec<u8> {
+        let mut e = Encoder::new();
+        for word in [1_usize, 1, 0] {
+            word.encode(&mut e).unwrap();
+        }
+        e.bits(4, 8);
+        for (i, group) in groups.iter().enumerate() {
+            let more = if i + 1 < groups.len() { 0x80 } else { 0 };
+            e.bits(8, group | more);
+        }
+        // empty field list, then padding
+        e.bits(1, 0);
+        pallas_codec::flat::filler::Filler::FillerEnd
+            .encode(&mut e)
+            .unwrap();
+        e.buffer
+    }
+
+    #[test]
+    fn constr_tag_must_fit_in_64_bits() {
+        // 2^64 - 1 is the largest tag the reference implementation accepts.
+        let max =
+            constr_with_tag_groups(&[0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 1]);
+        let program = Program::<DeBruijn>::unflat(&max).unwrap();
+        assert_eq!(
+            program.term,
+            Term::Constr {
+                tag: u64::MAX,
+                fields: vec![]
+            }
+        );
+        assert_eq!(program.to_flat().unwrap(), max);
+
+        // 2^32 + 1 must neither alias nor be rejected on 32-bit targets.
+        let wide = constr_with_tag_groups(&[1, 0, 0, 0, 0x10]);
+        let program = Program::<DeBruijn>::unflat(&wide).unwrap();
+        assert_eq!(
+            program.term,
+            Term::Constr {
+                tag: (1 << 32) + 1,
+                fields: vec![]
+            }
+        );
+        assert_eq!(program.to_flat().unwrap(), wide);
+
+        // 2^64 used to alias to 0.
+        let overflow = constr_with_tag_groups(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        assert!(Program::<DeBruijn>::unflat(&overflow).is_err());
+
+        // An 11th group can only overflow, even when it is zero.
+        let overlong = constr_with_tag_groups(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(Program::<DeBruijn>::unflat(&overlong).is_err());
+
+        // A redundant (but in-range) encoding is still accepted.
+        let padded = constr_with_tag_groups(&[5, 0]);
+        assert_eq!(
+            Program::<DeBruijn>::unflat(&padded).unwrap().term,
+            Term::Constr {
+                tag: 5,
+                fields: vec![]
+            }
+        );
     }
 }

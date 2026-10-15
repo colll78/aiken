@@ -117,7 +117,7 @@ pub enum Value {
     /// lookup, environment capture) is O(1) instead of a deep copy of the
     /// whole structure.
     Constr {
-        tag: usize,
+        tag: u64,
         fields: Rc<Vec<Value>>,
     },
 }

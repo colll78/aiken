@@ -138,7 +138,7 @@ peg::parser! {
           = "(" _* "error" _* ")" { Term::Error }
 
         rule constr(interner: &mut Interner) -> Term<Name>
-          = "(" _* "constr" _+ tag:decimal() _* fields:(t:term(interner) _* { t })* _* ")" {
+          = "(" _* "constr" _+ tag:word64() _* fields:(t:term(interner) _* { t })* _* ")" {
             Term::Constr { tag, fields }
           }
 
@@ -212,6 +212,9 @@ peg::parser! {
 
         rule decimal() -> usize
           = n:$(['0'..='9']+) {? n.parse().or(Err("usize")) }
+
+        rule word64() -> u64
+          = n:$(['0'..='9']+) {? n.parse().or(Err("constr tag that fits in 64 bits")) }
 
         rule number() -> isize
           = n:$(("-"/"+")* ['0'..='9']+) {? n.parse().or(Err("isize")) }
@@ -516,6 +519,20 @@ mod tests {
                 fields: vec![]
             }
         );
+    }
+
+    #[test]
+    fn parse_constr_tag_up_to_word64_max() {
+        let program = super::program("(program 1.1.0 (constr 18446744073709551615))").unwrap();
+        assert_eq!(
+            program.term,
+            Term::Constr {
+                tag: u64::MAX,
+                fields: vec![]
+            }
+        );
+
+        assert!(super::program("(program 1.1.0 (constr 18446744073709551616))").is_err());
     }
 
     #[test]

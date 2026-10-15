@@ -326,7 +326,7 @@ pub enum Term<T> {
     Builtin(DefaultFunction),
     // tag: 8
     Constr {
-        tag: usize,
+        tag: u64,
         fields: Vec<Term<T>>,
     },
     // tag: 9
