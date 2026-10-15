@@ -1189,8 +1189,6 @@ impl DefaultFunction {
                 Ok(value)
             }
             DefaultFunction::VerifyEd25519Signature => {
-                use cryptoxide::ed25519;
-
                 let public_key = args[0].unwrap_byte_string()?;
                 let message = args[1].unwrap_byte_string()?;
                 let signature = args[2].unwrap_byte_string()?;
@@ -1205,7 +1203,7 @@ impl DefaultFunction {
                     .try_into()
                     .map_err(|e: Vec<u8>| Error::UnexpectedEd25519SignatureLength(e.len()))?;
 
-                let valid = ed25519::verify(message, &public_key, &signature);
+                let valid = verify_ed25519(&public_key, message, &signature);
 
                 let value = Value::bool(valid);
 
@@ -2694,6 +2692,83 @@ pub fn convert_constr_to_tag(constr: u64) -> Option<u64> {
 
 pub static ANY_TAG: u64 = 102;
 
+/// Whether `signature` is an Ed25519 signature of `message` by
+/// `public_key`, as libsodium's `crypto_sign_verify_detached` (which Plutus
+/// uses) decides: beyond the checks cryptoxide makes, libsodium rejects
+/// public keys and `R` points of small order, and public keys encoded
+/// non-canonically.
+fn verify_ed25519(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
+    let r = <&[u8; 32]>::try_from(&signature[..32]).expect("a signature is 64 bytes");
+
+    !has_small_order(r)
+        && is_canonical_point(public_key)
+        && !has_small_order(public_key)
+        && cryptoxide::ed25519::verify(message, public_key, signature)
+}
+
+/// The encodings of the points of small order (libsodium's blocklist), with
+/// the sign of x left out.
+#[rustfmt::skip]
+const ED25519_SMALL_ORDER: [[u8; 32]; 7] = [
+    // y = 0, of order 4
+    [
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
+    // y = 1, the identity
+    [
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ],
+    // of order 8
+    [
+        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4,
+        0x89, 0xf2, 0xef, 0x98, 0xf0, 0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6,
+        0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
+    ],
+    // of order 8
+    [
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b,
+        0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20, 0x53, 0xfa, 0x2c, 0x39,
+        0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+    ],
+    // y = p - 1, of order 2
+    [
+        0xec, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+    // y = p, a non-canonical 0
+    [
+        0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+    // y = p + 1, a non-canonical 1
+    [
+        0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+    ],
+];
+
+/// Whether an encoded point is of small order (libsodium's
+/// `ge25519_has_small_order`).
+fn has_small_order(point: &[u8; 32]) -> bool {
+    let mut y = *point;
+    y[31] &= 0x7f;
+
+    ED25519_SMALL_ORDER.contains(&y)
+}
+
+/// Whether an encoded point has its y coordinate below the field modulus
+/// (libsodium's `ge25519_is_canonical`).
+fn is_canonical_point(point: &[u8; 32]) -> bool {
+    !(point[31] & 0x7f == 0x7f && point[1..31].iter().all(|&byte| byte == 0xff) && point[0] >= 0xed)
+}
+
 /// Plutus (through cardano-crypto-class) only accepts a 33-byte compressed
 /// public key, a 64-byte compact signature whose scalars are below the group
 /// order, and a 32-byte message hash; anything else fails the builtin. A
@@ -2863,6 +2938,68 @@ mod tests {
     };
     use num_bigint::BigInt;
     use pallas_primitives::conway::Language;
+
+    /// Vectors checked against libsodium (IOG's libsodium-vrf, which Cardano
+    /// links), where cryptoxide alone answers otherwise unless stated.
+    #[test_case::test_case(
+        "0076ed43a173e72f9670161e0addaea59ace4a2604c2f8e01cc81f71f6816766",
+        "",
+        "0162bbb0716bdab96886574b69a3dd89c825368845d98e0d32e9cdedb4506d31135d6191b713550fba381e19a583bb2f46355b20e9ec72773556c1397cefa80c"
+        => true; "valid, as cryptoxide also finds"
+    )]
+    #[test_case::test_case(
+        "0076ed43a173e72f9670161e0addaea59ace4a2604c2f8e01cc81f71f6816766",
+        "",
+        "0162bbb0716bdab96886574b69a3dd89c825368845d98e0d32e9cdedb4506d31003157eed176676790d515bc837d9a4446355b20e9ec72773556c1397cefa81c"
+        => false; "non-canonical s, as cryptoxide also finds"
+    )]
+    #[test_case::test_case(
+        "3ab21b6c1116cb7e0c04d37b7628ad7ff729e619456b092c56dca9a66feaaf4b",
+        "18778cbaa777c906",
+        "ff93defeb4bb3853809b1a7f5351aa9d1b0cbbc2e63fe517d281a12419f0afa49b52ea348c737b630fc65a5630a98c6fdaeae809ef85794af3c6a5c0c808b903"
+        => true; "public key of mixed order, as cryptoxide also finds"
+    )]
+    #[test_case::test_case(
+        "225e89722cfdae8119704fe80508956d9184f9bd695894762b02fc377f6f4ce9",
+        "e59bf58392602d27",
+        "0100000000000000000000000000000000000000000000000000000000000000d884a75229827fab9b39333a60a6a6525331dc7c9417eb57181feb1419a30c09"
+        => false; "r is the identity"
+    )]
+    #[test_case::test_case(
+        "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+        "d792a54d6444e75a",
+        "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc050000000000000000000000000000000000000000000000000000000000000000"
+        => false; "public key of order 8"
+    )]
+    #[test_case::test_case(
+        "0000000000000000000000000000000000000000000000000000000000000080",
+        "351946b87a0cbc83",
+        "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        => false; "public key of order 4 with the sign bit set"
+    )]
+    #[test_case::test_case(
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "",
+        "01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+        => false; "public key encoded non-canonically"
+    )]
+    fn verify_ed25519_signature_as_libsodium(
+        public_key: &str,
+        message: &str,
+        signature: &str,
+    ) -> bool {
+        let bytes = |text| Value::byte_string(hex::decode(text).unwrap());
+
+        let result = DefaultFunction::VerifyEd25519Signature
+            .call(
+                BuiltinSemantics::C,
+                &[bytes(public_key), bytes(message), bytes(signature)],
+                &mut vec![],
+            )
+            .unwrap();
+
+        *result.unwrap_bool().unwrap()
+    }
 
     #[test]
     fn bytestring_builtins_reject_operands_outside_int64() {

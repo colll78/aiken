@@ -44,6 +44,7 @@
 - **uplc**: Decode, encode, convert, clone, compare, evaluate and drop deeply nested terms, and the values evaluating them makes, without overflowing the stack: a script of a few kilobytes nesting `delay`, `lam`, applications, `constr` or `case` some thousands deep used to crash the process. Formatting a term, value or `Data` with `Debug`, as error messages do, elides what lies past 128 levels or 4096 entries. @colll78
 - **uplc**: Keep the value a program evaluates to and only discharge it into a term when asked (`EvalResult::result`), as Plutus does, so that a script returning a value that shares its parts no longer takes time and memory exponential in its size to evaluate. @colll78
 - **uplc**: Fail a Plutus V3 script that returns anything other than unit in phase-two evaluation, with the new `tx::Error::InvalidReturnValue`, as the ledger does; Plutus V1 and V2 scripts may still return any value. @colll78
+- **uplc**: Verify Ed25519 signatures as Plutus (libsodium) does: `verifyEd25519Signature` returns false for a public key or signature point `R` of small order and for a public key not encoded canonically, where it used to return true. @colll78
 
 ## v1.1.24 - 2026-09-26
 
