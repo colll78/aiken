@@ -65,8 +65,10 @@ pub fn escape(string: &str) -> String {
 peg::parser! {
     grammar uplc() for str {
         pub rule program(interner: &mut Interner) -> Program<Name>
-          = _* "(" _* "program" _+ v:version() _+ t:term(interner) _* ")" _* {
-            Program {version: v, term: t}
+          = _* "(" _* "program" _+ v:version() _+ t:term(interner) _* ")" _* {?
+            let program = Program {version: v, term: t};
+            program.check_version_features().or(Err("constr and case require UPLC 1.1.0"))?;
+            Ok(program)
           }
 
         rule comma() = _* "," _*
@@ -510,15 +512,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_allows_constr_before_uplc_1_1() {
-        let uplc = "(program 1.0.0 (constr 0))";
-        assert_eq!(
-            super::program(uplc).unwrap().term,
-            Term::Constr {
-                tag: 0,
-                fields: vec![]
-            }
-        );
+    fn parse_rejects_constr_and_case_before_uplc_1_1() {
+        for term in [
+            "(constr 0)",
+            "(case (con integer 1))",
+            "(lam x [x (constr 0)])",
+        ] {
+            assert!(
+                super::program(&format!("(program 1.0.0 {term})")).is_err(),
+                "{term}"
+            );
+            assert!(
+                super::program(&format!("(program 1.1.0 {term})")).is_ok(),
+                "{term}"
+            );
+        }
     }
 
     #[test]

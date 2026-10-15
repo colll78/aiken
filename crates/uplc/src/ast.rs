@@ -46,6 +46,40 @@ pub struct Program<T> {
     pub term: Term<T>,
 }
 
+impl<T> Program<T> {
+    /// `constr` and `case` were introduced in UPLC 1.1.0; the reference
+    /// parser and flat decoder reject programs of an earlier version that
+    /// contain either.
+    pub fn check_version_features(&self) -> Result<(), String> {
+        if self.version >= (1, 1, 0) {
+            return Ok(());
+        }
+
+        let mut stack = vec![&self.term];
+
+        while let Some(term) = stack.pop() {
+            match term {
+                Term::Constr { .. } | Term::Case { .. } => {
+                    let (major, minor, patch) = self.version;
+                    return Err(format!(
+                        "constr and case require UPLC 1.1.0, but the program is version {major}.{minor}.{patch}"
+                    ));
+                }
+                Term::Delay(body) | Term::Force(body) | Term::Lambda { body, .. } => {
+                    stack.push(body)
+                }
+                Term::Apply { function, argument } => {
+                    stack.push(function);
+                    stack.push(argument);
+                }
+                Term::Var(_) | Term::Constant(_) | Term::Builtin(_) | Term::Error => {}
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl<T> Program<T>
 where
     T: Clone,

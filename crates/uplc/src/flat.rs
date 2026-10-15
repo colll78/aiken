@@ -174,7 +174,13 @@ where
         let term_option = Term::decode_debug(d, &mut state_log);
 
         match term_option {
-            Ok(term) => Ok(Program { version, term }),
+            Ok(term) => {
+                let program = Program { version, term };
+                program
+                    .check_version_features()
+                    .map_err(de::Error::Message)?;
+                Ok(program)
+            }
             Err(error) => Err(de::Error::Message(format!(
                 "{} {error}",
                 state_log.join("")
@@ -1465,5 +1471,15 @@ mod tests {
                 fields: vec![]
             }
         );
+    }
+
+    #[test]
+    fn constr_and_case_rejected_before_uplc_1_1() {
+        let mut bytes = constr_with_tag_groups(&[0]);
+        assert!(Program::<DeBruijn>::unflat(&bytes).is_ok());
+
+        // Same program, but version 1.0.0.
+        bytes[1] = 0;
+        assert!(Program::<DeBruijn>::unflat(&bytes).is_err());
     }
 }

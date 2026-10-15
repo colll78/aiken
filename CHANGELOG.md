@@ -19,6 +19,7 @@
 - **uplc**: Name Plutus V1, not V2, in the error reported when a V1 script is evaluated without a V1 cost model. @colll78
 - **uplc**: Drop deeply nested lists and `Data` without overflowing the stack. @colll78
 - **uplc**: Reject a flat-encoded natural (constr tag, de Bruijn index or version number) that does not fit in 64 bits instead of silently truncating it: a constr tag of 2^64 used to decode as 0 everywhere, and any tag of 2^32 or more aliased on 32-bit targets such as wasm32. Constr tags are now `u64`, like Plutus' `Word64`, so every tag up to 2^64 - 1 parses, decodes, encodes and evaluates identically on 32-bit and 64-bit targets; a tag with no matching branch is a missing-branch error. This is a breaking change of the `uplc` API: the `tag` of `Term::Constr` and of `Value::Constr`, and the `tag` argument of `Term::constr`, are now `u64` instead of `usize`. @colll78
+- **uplc**: Reject `constr` and `case` in programs of a UPLC version before 1.1.0, when parsing and when decoding flat. @colll78
 
 ## v1.1.24 - 2026-09-26
 
