@@ -16,6 +16,7 @@
 - **uplc**: Resolve a transaction's spent inputs once per evaluation instead of once per spend redeemer. Finding the script of a spend redeemer resolved, sorted and copied every input of the transaction, so a transaction with many script inputs did that work once for each of them. Results, execution budgets and errors are unchanged. @colll78
 - **uplc**: Gate builtins and constant types by ledger language and protocol version exactly as Plutus does: each builtin becomes available at the protocol version upstream introduces it in for that language, and from protocol version 11 every builtin, `case` on builtin values, and the `Value` and array constant types are available in Plutus V1 and V2 as well as V3. @colll78
 - **uplc**: Re-cost `insertCoin`, `unionValue`, `unValueData` and `scaleValue` with the current Plutus parameters in the default V1, V2 and V3 cost models, and run the full current Plutus conformance suite (textual and flat fixtures, with budgets) against the evaluator. @colll78
+- **uplc**: Run the `uplc` unit and conformance tests on `wasm32-wasip1` in CI as well, since the evaluator ships as wasm, where `usize` is 32 bits and secp256k1 goes through `k256`. `proptest` is now used without its default features, which do not build for WASI. @colll78
 
 ### Fixed
 

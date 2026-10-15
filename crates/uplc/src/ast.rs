@@ -1897,6 +1897,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
     fn drops_deep_lists_in_bounded_stack() {
         use crate::ast::{Constant, ListSpine, Type};
         use std::rc::Rc;

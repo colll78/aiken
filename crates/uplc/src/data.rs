@@ -991,6 +991,10 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
     fn drops_deep_data_in_bounded_stack() {
         #[cfg(not(miri))]
         const DEPTH: usize = 1_000_000;
