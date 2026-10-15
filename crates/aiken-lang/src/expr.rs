@@ -1060,6 +1060,10 @@ impl UntypedExpr {
                 preferred_format: ByteArrayFormatPreference::HexadecimalString,
             }),
 
+            uplc::ast::Constant::ProtoArray(..) => {
+                Err("cannot reify a builtin array: Aiken has no array type".to_string())
+            }
+
             uplc::ast::Constant::Bls12_381MlResult(ml) => {
                 let mut bytes = Vec::new();
 

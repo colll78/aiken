@@ -590,7 +590,8 @@ pub fn plutus(id_gen: &IdGenerator) -> TypeInfo {
         annotations: HashMap::new(),
     };
 
-    for builtin in DefaultFunction::iter() {
+    // The array builtins take and return builtin arrays, which Aiken has no type for.
+    for builtin in DefaultFunction::iter().filter(|builtin| !builtin.is_array_builtin()) {
         let value = from_default_function(builtin, id_gen);
         plutus.values.insert(builtin.aiken_name(), value);
     }
@@ -1163,6 +1164,12 @@ pub fn from_default_function(builtin: DefaultFunction, id_gen: &IdGenerator) -> 
             let tipo = Type::function(vec![Type::int(), Type::int(), Type::int()], Type::int());
 
             (tipo, 3)
+        }
+
+        DefaultFunction::LengthOfArray
+        | DefaultFunction::ListToArray
+        | DefaultFunction::IndexArray => {
+            unreachable!("{builtin} has no Aiken type: Aiken has no array type")
         }
     };
 

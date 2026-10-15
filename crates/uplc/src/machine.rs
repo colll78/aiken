@@ -16,7 +16,7 @@ use pallas_primitives::conway::Language;
 
 use self::{
     cost_model::CostModel,
-    runtime::{BuiltinRuntime, BuiltinSemantics},
+    runtime::{BuiltinRuntime, BuiltinSemantics, VAN_ROSSEM_PROTOCOL_VERSION},
     value::{Env, Value},
 };
 
@@ -131,28 +131,27 @@ pub struct Machine {
     pub traces: Vec<Trace>,
     pub spend_counter: Option<[i64; (TERM_COUNT + BUILTIN_COUNT) * 2]>,
     semantics: BuiltinSemantics,
+    language: Language,
+    protocol_major_version: u16,
     frames: Vec<Frame>,
 }
 
 impl Machine {
+    /// A machine for `version` under the latest supported protocol version.
     pub fn new(
         version: Language,
         costs: CostModel,
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
-        let semantics = BuiltinSemantics::for_language(&version);
-
-        Machine {
+        Self::build(
+            version,
+            VAN_ROSSEM_PROTOCOL_VERSION,
             costs,
-            ex_budget: initial_budget,
+            initial_budget,
             slippage,
-            unbudgeted_steps: [0; 10],
-            traces: vec![],
-            spend_counter: None,
-            semantics,
-            frames: vec![],
-        }
+            None,
+        )
     }
 
     pub fn new_with_protocol(
@@ -162,19 +161,14 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
-        let semantics =
-            BuiltinSemantics::for_language_and_protocol(&version, protocol_major_version);
-
-        Machine {
+        Self::build(
+            version,
+            protocol_major_version,
             costs,
-            ex_budget: initial_budget,
+            initial_budget,
             slippage,
-            unbudgeted_steps: [0; 10],
-            traces: vec![],
-            spend_counter: None,
-            semantics,
-            frames: vec![],
-        }
+            None,
+        )
     }
 
     pub fn new_debug(
@@ -183,18 +177,14 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
-        let semantics = BuiltinSemantics::for_language(&version);
-
-        Machine {
+        Self::build(
+            version,
+            VAN_ROSSEM_PROTOCOL_VERSION,
             costs,
-            ex_budget: initial_budget,
+            initial_budget,
             slippage,
-            unbudgeted_steps: [0; 10],
-            traces: vec![],
-            spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
-            semantics,
-            frames: vec![],
-        }
+            Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
+        )
     }
 
     pub fn new_debug_with_protocol(
@@ -204,8 +194,26 @@ impl Machine {
         initial_budget: ExBudget,
         slippage: u32,
     ) -> Machine {
+        Self::build(
+            version,
+            protocol_major_version,
+            costs,
+            initial_budget,
+            slippage,
+            Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
+        )
+    }
+
+    fn build(
+        language: Language,
+        protocol_major_version: u16,
+        costs: CostModel,
+        initial_budget: ExBudget,
+        slippage: u32,
+        spend_counter: Option<[i64; (TERM_COUNT + BUILTIN_COUNT) * 2]>,
+    ) -> Machine {
         let semantics =
-            BuiltinSemantics::for_language_and_protocol(&version, protocol_major_version);
+            BuiltinSemantics::for_language_and_protocol(&language, protocol_major_version);
 
         Machine {
             costs,
@@ -213,16 +221,16 @@ impl Machine {
             slippage,
             unbudgeted_steps: [0; 10],
             traces: vec![],
-            spend_counter: Some([0; (TERM_COUNT + BUILTIN_COUNT) * 2]),
+            spend_counter,
             semantics,
+            language,
+            protocol_major_version,
             frames: vec![],
         }
     }
 
     pub fn run(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
-        if !self.semantics.supports_values() {
-            Self::assert_no_values(&term)?;
-        }
+        self.check_term(&term)?;
 
         let startup_budget = self.costs.machine_costs.get(StepKind::StartUp);
 
@@ -253,12 +261,19 @@ impl Machine {
         }
     }
 
-    /// The CIP-0153 value builtins and native `Value` constants only exist for
-    /// Plutus V3 from protocol version 11 (Van Rossem) onwards. Availability is
-    /// a whole-program well-formedness rule: occurrences in latent code (under
-    /// lambdas, delays or untaken branches) are rejected too, so the entire
-    /// term is validated up-front before evaluation starts.
-    fn assert_no_values(term: &Term<NamedDeBruijn>) -> Result<(), Error> {
+    /// Builtins become available per ledger language and protocol version
+    /// (see `DefaultFunction::introduced_in`), and native `Value` and array
+    /// constants only exist from protocol version 11 (Van Rossem) onwards, from
+    /// which everything this machine knows about is available in every ledger
+    /// language. Availability is a whole-program well-formedness rule:
+    /// occurrences in latent code (under lambdas, delays or untaken branches)
+    /// are rejected too, so the entire term is validated up-front before
+    /// evaluation starts.
+    fn check_term(&self, term: &Term<NamedDeBruijn>) -> Result<(), Error> {
+        if self.protocol_major_version >= VAN_ROSSEM_PROTOCOL_VERSION {
+            return Ok(());
+        }
+
         let mut stack = vec![term];
 
         while let Some(term) = stack.pop() {
@@ -274,9 +289,12 @@ impl Machine {
                     if Constant::contains_value(constant) {
                         return Err(Error::ValueConstantNotAvailable);
                     }
+                    if Constant::contains_array(constant) {
+                        return Err(Error::ArrayConstantNotAvailable);
+                    }
                 }
                 Term::Builtin(fun) => {
-                    if fun.is_value_builtin() {
+                    if !fun.is_available_in(&self.language, self.protocol_major_version) {
                         return Err(Error::BuiltinNotAvailable(*fun));
                     }
                 }
@@ -458,7 +476,7 @@ impl Machine {
                 )),
             },
             Value::Con(constant) => {
-                if !matches!(self.semantics, BuiltinSemantics::E) {
+                if !self.semantics.is_van_rossem() {
                     return Err(Error::NonConstrScrutinized(Value::Con(constant)));
                 }
 
@@ -660,6 +678,7 @@ impl From<&Constant> for Type {
                 Type::Pair(Rc::new(t1.clone()), Rc::new(t2.clone()))
             }
             Constant::Data(_) => Type::Data,
+            Constant::ProtoArray(t, _) => Type::Array(Rc::new(t.clone())),
             Constant::Value(_) => Type::Value,
             Constant::Bls12_381G1Element(_) => Type::Bls12_381G1Element,
             Constant::Bls12_381G2Element(_) => Type::Bls12_381G2Element,
@@ -685,7 +704,7 @@ mod tests {
     use pallas_primitives::conway::Language;
 
     #[test]
-    fn value_builtins_unavailable_before_van_rossem_or_outside_v3() {
+    fn van_rossem_features_unavailable_before_van_rossem() {
         let program = |term: Term<NamedDeBruijn>| Program {
             version: (1, 1, 0),
             term,
@@ -707,6 +726,14 @@ mod tests {
         // Public AST callers can construct type-inconsistent constants even
         // though Flat decoding cannot. Inspect both declared types and actual
         // elements so this cannot bypass protocol availability checks.
+        let array_builtin = Term::Builtin(DefaultFunction::IndexArray);
+        let array_constant: Term<NamedDeBruijn> = Term::Constant(
+            Constant::ProtoArray(
+                crate::ast::Type::Integer,
+                vec![Rc::new(Constant::Integer(1.into()))].into(),
+            )
+            .into(),
+        );
         let inconsistent: Term<NamedDeBruijn> = Term::Constant(
             Constant::ProtoList(
                 crate::ast::Type::Integer,
@@ -717,9 +744,22 @@ mod tests {
 
         for (language, protocol) in [
             (Language::PlutusV3, 10),
-            (Language::PlutusV2, 11),
-            (Language::PlutusV1, 11),
+            (Language::PlutusV2, 10),
+            (Language::PlutusV1, 10),
         ] {
+            for term in [array_builtin.clone(), array_constant.clone()] {
+                let result = program(term)
+                    .eval_version_with_protocol(ExBudget::default(), &language, protocol)
+                    .result();
+                assert!(
+                    matches!(
+                        result,
+                        Err(Error::BuiltinNotAvailable(_) | Error::ArrayConstantNotAvailable)
+                    ),
+                    "expected arrays to be unavailable for {language:?} at protocol {protocol}, got {result:?}"
+                );
+            }
+
             let result = program(builtin.clone())
                 .eval_version_with_protocol(ExBudget::default(), &language, protocol)
                 .result();
@@ -768,11 +808,21 @@ mod tests {
             );
         }
 
-        for term in [builtin, constant, latent] {
-            let result = program(term)
-                .eval_version_with_protocol(ExBudget::default(), &Language::PlutusV3, 11)
-                .result();
-            assert!(result.is_ok(), "{result:?}");
+        // From Van Rossem onwards every builtin and constant type is available
+        // in every ledger language.
+        for language in [Language::PlutusV1, Language::PlutusV2, Language::PlutusV3] {
+            for term in [
+                builtin.clone(),
+                constant.clone(),
+                latent.clone(),
+                array_builtin.clone(),
+                array_constant.clone(),
+            ] {
+                let result = program(term)
+                    .eval_version_with_protocol(ExBudget::default(), &language, 11)
+                    .result();
+                assert!(result.is_ok(), "{language:?}: {result:?}");
+            }
         }
     }
 

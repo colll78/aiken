@@ -2738,6 +2738,30 @@ impl BuiltinCosts {
                     cpu: self.exp_mod_int.cpu.cost(x, y, z),
                 }
             }
+            DefaultFunction::LengthOfArray => ExBudget {
+                mem: self.length_of_array.mem.cost(args[0].to_ex_mem()),
+                cpu: self.length_of_array.cpu.cost(args[0].to_ex_mem()),
+            },
+            DefaultFunction::ListToArray => {
+                // Linear in the list's *length*, like Plutus' ExMemoryUsage
+                // for lists.
+                let len = list_len_or_value_ex_mem(&args[0]);
+
+                ExBudget {
+                    mem: self.list_to_array.mem.cost(len),
+                    cpu: self.list_to_array.cpu.cost(len),
+                }
+            }
+            DefaultFunction::IndexArray => ExBudget {
+                mem: self
+                    .index_array
+                    .mem
+                    .cost(args[0].to_ex_mem(), args[1].to_ex_mem()),
+                cpu: self
+                    .index_array
+                    .cpu
+                    .cost(args[0].to_ex_mem(), args[1].to_ex_mem()),
+            },
             DefaultFunction::InsertCoin => {
                 let value_size = value_max_depth(&args[3])?;
 

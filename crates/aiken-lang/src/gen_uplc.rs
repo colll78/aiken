@@ -2118,6 +2118,7 @@ impl<'a> CodeGenerator<'a> {
                 | UplcType::Bls12_381G2Element
                 | UplcType::Bls12_381MlResult
                 | UplcType::Value
+                | UplcType::Array(_)
                 | UplcType::Data,
             ) => then,
 
@@ -4573,6 +4574,7 @@ impl<'a> CodeGenerator<'a> {
                                     .apply(Term::mk_cons().apply(right).apply(Term::empty_map()));
                                 Term::equals_data()
                             }
+                            Some(UplcType::Array(_)) => unreachable!("Aiken has no array type"),
                             Some(UplcType::List(_) | UplcType::Value | UplcType::Data) | None => {
                                 left = builder::convert_type_to_data(
                                     left,
@@ -4890,7 +4892,8 @@ impl<'a> CodeGenerator<'a> {
                         | UplcType::Bls12_381G1Element
                         | UplcType::Bls12_381G2Element
                         | UplcType::Bls12_381MlResult
-                        | UplcType::Value,
+                        | UplcType::Value
+                        | UplcType::Array(_),
                     ) => subject,
 
                     Some(UplcType::Data) => subject,
@@ -4957,7 +4960,8 @@ impl<'a> CodeGenerator<'a> {
                             | UplcType::List(_)
                             | UplcType::Pair(_, _)
                             | UplcType::Bls12_381MlResult
-                            | UplcType::Value,
+                            | UplcType::Value
+                            | UplcType::Array(_),
                         ) => unreachable!("{:#?}", tipo),
                         Some(UplcType::Data) => unimplemented!(),
                         Some(UplcType::Integer) => Term::equals_integer()

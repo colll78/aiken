@@ -225,6 +225,16 @@ impl Value {
         Ok((t, list))
     }
 
+    pub(super) fn unwrap_array(&self) -> Result<(&Type, &ListSpine), Error> {
+        let inner = self.unwrap_constant()?;
+
+        let Constant::ProtoArray(t, items) = inner else {
+            return Err(Error::ArrayTypeMismatch(inner.into()));
+        };
+
+        Ok((t, items))
+    }
+
     pub(super) fn unwrap_data(&self) -> Result<&Data, Error> {
         let inner = self.unwrap_constant()?;
 
@@ -405,6 +415,8 @@ impl Value {
                 Constant::ProtoList(_, items) => {
                     stack.extend(items.iter().map(|item| item.as_ref()))
                 }
+                // Plutus sizes an array by its length alone.
+                Constant::ProtoArray(_, items) => total += items.len() as i64,
                 Constant::ProtoPair(_, _, l, r) => {
                     stack.push(l.as_ref());
                     stack.push(r.as_ref());

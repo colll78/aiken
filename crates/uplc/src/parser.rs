@@ -31,10 +31,11 @@ pub fn term(src: &str) -> Result<Term<Name>, ParseError<LineCol>> {
     Ok(term)
 }
 
-// Returns the inner type of a list, provided that the given type is a list.
+// Returns the inner type of a list or array, provided that the given type is
+// one; both are written as `[x, y, ...]`.
 fn list_sub_type(type_info: Option<&Type>) -> Option<&Type> {
     match type_info {
-        Some(Type::List(t)) => Some(t),
+        Some(Type::List(t)) | Some(Type::Array(t)) => Some(t),
         _ => None,
     }
 }
@@ -233,6 +234,7 @@ peg::parser! {
             / constant_g1_element()
             / constant_g2_element()
             / constant_list()
+            / constant_array()
             / constant_pair()
             ) _* ")" {
             Term::Constant(con.into())
@@ -310,6 +312,11 @@ peg::parser! {
         rule constant_list() -> Constant
           = "(" _* "list" _* t:type_info() _* ")" _+ ls:list(Some(&t)) {
             Constant::ProtoList(t, ls.into_iter().map(Rc::new).collect())
+          }
+
+        rule constant_array() -> Constant
+          = "(" _* "array" _* t:type_info() _* ")" _+ ls:list(Some(&t)) {
+            Constant::ProtoArray(t, ls.into_iter().map(Rc::new).collect())
           }
 
         rule constant_pair() -> Constant
@@ -478,6 +485,10 @@ peg::parser! {
                         t.as_ref().clone(),
                         ls.into_iter().map(Rc::new).collect(),
                     )),
+                    Some(Type::Array(t)) => Ok(Constant::ProtoArray(
+                        t.as_ref().clone(),
+                        ls.into_iter().map(Rc::new).collect(),
+                    )),
                     _ => Err("found 'List' instead of expected type")
                 }
             }
@@ -508,6 +519,9 @@ peg::parser! {
           / _* "bls12_381_G2_element" { Type::Bls12_381G2Element }
           / _* "(" _* "list" _+ t:type_info() _* ")" {
               Type::List(t.into())
+            }
+          / _* "(" _* "array" _+ t:type_info() _* ")" {
+              Type::Array(t.into())
             }
           / _* "(" _* "pair" _+ l:type_info() _+ r:type_info() _* ")" {
               Type::Pair(l.into(), r.into())

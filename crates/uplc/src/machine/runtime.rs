@@ -46,7 +46,11 @@ const BLST_P2_COMPRESSED_SIZE: usize = 96;
 
 pub const INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH: i64 = 8192;
 
+pub const ALONZO_PROTOCOL_VERSION: u16 = 5;
+pub const VASIL_PROTOCOL_VERSION: u16 = 7;
+pub const VALENTINE_PROTOCOL_VERSION: u16 = 8;
 pub const CHANG_PROTOCOL_VERSION: u16 = 9;
+pub const PLOMIN_PROTOCOL_VERSION: u16 = 10;
 pub const VAN_ROSSEM_PROTOCOL_VERSION: u16 = 11;
 
 /// Ledger builtin semantics variants.
@@ -95,10 +99,12 @@ impl BuiltinSemantics {
         matches!(self, BuiltinSemantics::C | BuiltinSemantics::E)
     }
 
-    /// The CIP-0153 value builtins and native `Value` constants only exist
-    /// for Plutus V3 from protocol version 11 (Van Rossem) onwards.
-    pub fn supports_values(self) -> bool {
-        matches!(self, BuiltinSemantics::E)
+    /// Whether these are the semantics of protocol version 11 (Van Rossem)
+    /// onwards, which brought batch 6 builtins (including the CIP-0153 value
+    /// builtins and arrays), `Value` and array constants, and `case` on
+    /// builtin values to every ledger language.
+    pub fn is_van_rossem(self) -> bool {
+        matches!(self, BuiltinSemantics::D | BuiltinSemantics::E)
     }
 }
 
@@ -260,6 +266,9 @@ impl DefaultFunction {
             | DefaultFunction::FindFirstSetBit
             | DefaultFunction::Ripemd_160
             | DefaultFunction::DropList
+            | DefaultFunction::LengthOfArray
+            | DefaultFunction::ListToArray
+            | DefaultFunction::IndexArray
             | DefaultFunction::Bls12_381_G1_MultiScalarMul
             | DefaultFunction::ExpModInteger
             | DefaultFunction::InsertCoin
@@ -367,6 +376,9 @@ impl DefaultFunction {
             DefaultFunction::Bls12_381_G1_MultiScalarMul => 2,
             DefaultFunction::ExpModInteger => 3,
             DefaultFunction::DropList => 2,
+            DefaultFunction::LengthOfArray => 1,
+            DefaultFunction::ListToArray => 1,
+            DefaultFunction::IndexArray => 2,
             DefaultFunction::InsertCoin => 4,
             DefaultFunction::LookupCoin => 3,
             DefaultFunction::UnionValue => 2,
@@ -470,6 +482,9 @@ impl DefaultFunction {
             DefaultFunction::Bls12_381_G1_MultiScalarMul => 0,
             DefaultFunction::ExpModInteger => 0,
             DefaultFunction::DropList => 1,
+            DefaultFunction::LengthOfArray => 1,
+            DefaultFunction::ListToArray => 1,
+            DefaultFunction::IndexArray => 1,
             DefaultFunction::InsertCoin
             | DefaultFunction::LookupCoin
             | DefaultFunction::UnionValue
@@ -486,7 +501,7 @@ impl DefaultFunction {
         args: &[Value],
         traces: &mut Vec<Trace>,
     ) -> Result<Value, Error> {
-        if self.is_value_builtin() && !semantics.supports_values() {
+        if self.is_van_rossem_builtin() && !semantics.is_van_rossem() {
             return Err(Error::BuiltinNotAvailable(*self));
         }
 
@@ -2006,6 +2021,29 @@ impl DefaultFunction {
 
                 Ok(value)
             }
+            DefaultFunction::LengthOfArray => {
+                let (_, items) = args[0].unwrap_array()?;
+
+                Ok(Value::integer(items.len().into()))
+            }
+            DefaultFunction::ListToArray => {
+                let (r#type, list) = args[0].unwrap_list()?;
+
+                // Arrays share the list's spine, so this is O(1).
+                let array = Constant::ProtoArray(r#type.clone(), list.clone());
+
+                Ok(Value::Con(array.into()))
+            }
+            DefaultFunction::IndexArray => {
+                let (_, items) = args[0].unwrap_array()?;
+                let index = args[1].unwrap_integer()?;
+                let index64 = int64_operand(DefaultFunction::IndexArray, index)?;
+
+                match usize::try_from(index64).ok().and_then(|i| items.get(i)) {
+                    Some(item) => Ok(Value::Con(item.clone())),
+                    None => Err(Error::IndexArrayOutOfBounds(index.clone(), items.len())),
+                }
+            }
             DefaultFunction::InsertCoin => {
                 let currency = args[0].unwrap_byte_string()?;
                 let token = args[1].unwrap_byte_string()?;
@@ -2402,7 +2440,11 @@ mod secp256k1 {
 #[cfg(test)]
 mod tests {
     use super::{BuiltinSemantics, Error, convert_constr_to_tag, convert_tag_to_constr};
-    use crate::{builtins::DefaultFunction, machine::value::Value};
+    use crate::{
+        ast::{Constant, Type},
+        builtins::DefaultFunction,
+        machine::value::Value,
+    };
     use num_bigint::BigInt;
     use pallas_primitives::conway::Language;
 
@@ -2616,6 +2658,50 @@ mod tests {
     }
 
     #[test]
+    fn index_array_rejects_operands_outside_int64() {
+        let array = || {
+            Value::Con(
+                Constant::ProtoArray(
+                    Type::Integer,
+                    vec![
+                        Constant::Integer(1.into()).into(),
+                        Constant::Integer(2.into()).into(),
+                    ]
+                    .into(),
+                )
+                .into(),
+            )
+        };
+        let index = |i: BigInt| {
+            DefaultFunction::IndexArray.call(
+                BuiltinSemantics::E,
+                &[array(), Value::integer(i)],
+                &mut vec![],
+            )
+        };
+
+        assert_eq!(index(1.into()).unwrap(), Value::integer(2.into()));
+
+        for i in [
+            BigInt::from(2),
+            BigInt::from(-1),
+            BigInt::from(u32::MAX) + 1,
+            BigInt::from(i64::MAX),
+            BigInt::from(i64::MIN),
+        ] {
+            assert!(matches!(index(i), Err(Error::IndexArrayOutOfBounds(_, _))));
+        }
+
+        for i in [
+            BigInt::from(i64::MAX) + 1,
+            BigInt::from(i64::MIN) - 1,
+            BigInt::from(1) << 200,
+        ] {
+            assert!(matches!(index(i), Err(Error::IntegerOutOfInt64Range(_, _))));
+        }
+    }
+
+    #[test]
     fn exp_mod_integer_handles_positive_and_negative_exponents() {
         let positive = [
             Value::integer(4.into()),
@@ -2625,7 +2711,7 @@ mod tests {
 
         assert_eq!(
             DefaultFunction::ExpModInteger
-                .call(BuiltinSemantics::C, &positive, &mut vec![])
+                .call(BuiltinSemantics::E, &positive, &mut vec![])
                 .unwrap(),
             Value::integer(445.into())
         );
@@ -2638,7 +2724,7 @@ mod tests {
 
         assert_eq!(
             DefaultFunction::ExpModInteger
-                .call(BuiltinSemantics::C, &inverse, &mut vec![])
+                .call(BuiltinSemantics::E, &inverse, &mut vec![])
                 .unwrap(),
             Value::integer(4.into())
         );
@@ -2653,7 +2739,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            DefaultFunction::ExpModInteger.call(BuiltinSemantics::C, &no_inverse, &mut vec![]),
+            DefaultFunction::ExpModInteger.call(BuiltinSemantics::E, &no_inverse, &mut vec![]),
             Err(Error::ExpModIntegerNoInverse(_, _))
         ));
 
@@ -2664,7 +2750,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            DefaultFunction::ExpModInteger.call(BuiltinSemantics::C, &zero_modulus, &mut vec![]),
+            DefaultFunction::ExpModInteger.call(BuiltinSemantics::E, &zero_modulus, &mut vec![]),
             Err(Error::OutsideNaturalBounds(_))
         ));
 
@@ -2677,7 +2763,7 @@ mod tests {
 
         assert!(matches!(
             DefaultFunction::ExpModInteger.call(
-                BuiltinSemantics::C,
+                BuiltinSemantics::E,
                 &out_of_bounds_modulus,
                 &mut vec![],
             ),
@@ -2693,7 +2779,7 @@ mod tests {
         assert_eq!(
             DefaultFunction::ExpModInteger
                 .call(
-                    BuiltinSemantics::C,
+                    BuiltinSemantics::E,
                     &modulus_one_short_circuits,
                     &mut vec![],
                 )

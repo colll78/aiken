@@ -275,6 +275,18 @@ impl Constant {
                 .append(RcDoc::text("0x"))
                 .append(RcDoc::text(hex::encode(p2.compress()))),
             Constant::Bls12_381MlResult(_) => panic!("cannot represent Bls12_381MlResult as text"),
+            Constant::ProtoArray(r#type, items) => RcDoc::text("(")
+                .append("array")
+                .append(RcDoc::space())
+                .append(r#type.to_doc())
+                .append(")")
+                .append(RcDoc::line())
+                .append(RcDoc::text("["))
+                .append(RcDoc::intersperse(
+                    items.iter().map(|c| c.to_doc_list()),
+                    RcDoc::text(", "),
+                ))
+                .append(RcDoc::text("]")),
             Constant::Value(value) => RcDoc::text("value")
                 .append(RcDoc::line())
                 .append(Self::to_doc_value(value)),
@@ -298,7 +310,7 @@ impl Constant {
                 .append(RcDoc::text("\"")),
             Constant::Unit => RcDoc::text("()"),
             Constant::Bool(b) => RcDoc::text(if *b { "True" } else { "False" }),
-            Constant::ProtoList(_, items) => RcDoc::text("[")
+            Constant::ProtoList(_, items) | Constant::ProtoArray(_, items) => RcDoc::text("[")
                 .append(RcDoc::intersperse(
                     items.iter().map(|c| c.to_doc_list()),
                     RcDoc::text(", "),
@@ -425,6 +437,11 @@ impl Type {
             Type::Bls12_381G1Element => RcDoc::text("bls12_381_G1_element"),
             Type::Bls12_381G2Element => RcDoc::text("bls12_381_G2_element"),
             Type::Bls12_381MlResult => RcDoc::text("bls12_381_mlresult"),
+            Type::Array(r#type) => RcDoc::text("(array")
+                .append(RcDoc::line())
+                .append(r#type.to_doc())
+                .append(RcDoc::line_())
+                .append(")"),
             Type::Value => RcDoc::text("value"),
         }
     }

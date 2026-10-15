@@ -575,6 +575,15 @@ impl Encode for Constant {
                     "BLS12-381 ML results are not supported for flat encoding".to_string(),
                 ));
             }
+            Constant::ProtoArray(typ, items) => {
+                let mut type_encode = vec![7, 12];
+
+                encode_type(typ, &mut type_encode);
+
+                encode_constant(&type_encode, e)?;
+
+                e.encode_list_with(items, |item, e| encode_constant_value(item, e))?;
+            }
             Constant::Value(value) => {
                 encode_constant(&[13], e)?;
                 encode_value(value, e)?;
@@ -609,7 +618,7 @@ fn encode_constant_value(x: &Constant, e: &mut Encoder) -> Result<(), en::Error>
         Constant::String(s) => s.encode(e),
         Constant::Unit => Ok(()),
         Constant::Bool(b) => b.encode(e),
-        Constant::ProtoList(_, list) => {
+        Constant::ProtoList(_, list) | Constant::ProtoArray(_, list) => {
             e.encode_list_with(list, |item, e| encode_constant_value(item, e))?;
             Ok(())
         }
@@ -658,6 +667,10 @@ fn encode_type(typ: &Type, bytes: &mut Vec<u8>) {
         Type::Bls12_381G1Element => bytes.push(9),
         Type::Bls12_381G2Element => bytes.push(10),
         Type::Bls12_381MlResult => bytes.push(11),
+        Type::Array(sub_typ) => {
+            bytes.extend(vec![7, 12]);
+            encode_type(sub_typ, bytes);
+        }
         Type::Value => bytes.push(13),
     }
 }
@@ -680,6 +693,17 @@ impl Decode<'_> for Constant {
                 })?;
 
                 Ok(Constant::ProtoList(typ, list.into()))
+            }
+            [7, 12, rest @ ..] => {
+                let mut rest = VecDeque::from(rest.to_vec());
+
+                let typ = decode_type(&mut rest)?;
+
+                let items: Vec<Rc<Constant>> = d.decode_list_with(|d| {
+                    decode_constant_value(typ.clone().into(), d).map(Rc::new)
+                })?;
+
+                Ok(Constant::ProtoArray(typ, items.into()))
             }
             [7, 7, 6, rest @ ..] => {
                 let mut rest = VecDeque::from(rest.to_vec());
@@ -760,6 +784,15 @@ fn decode_constant_value(typ: Rc<Type>, d: &mut Decoder) -> Result<Constant, de:
 
             Ok(Constant::ProtoList(sub_type.as_ref().clone(), list.into()))
         }
+        Type::Array(sub_type) => {
+            let items: Vec<Rc<Constant>> =
+                d.decode_list_with(|d| decode_constant_value(sub_type.clone(), d).map(Rc::new))?;
+
+            Ok(Constant::ProtoArray(
+                sub_type.as_ref().clone(),
+                items.into(),
+            ))
+        }
         Type::Pair(type1, type2) => {
             let a = decode_constant_value(type1.clone(), d)?;
             let b = decode_constant_value(type2.clone(), d)?;
@@ -820,6 +853,7 @@ fn decode_type(types: &mut VecDeque<u8>) -> Result<Type, de::Error> {
         Some(13) => Ok(Type::Value),
         Some(7) => match types.pop_front() {
             Some(5) => Ok(Type::List(decode_type(types)?.into())),
+            Some(12) => Ok(Type::Array(decode_type(types)?.into())),
             Some(7) => match types.pop_front() {
                 Some(6) => {
                     let type1 = decode_type(types)?;
@@ -1481,5 +1515,27 @@ mod tests {
         // Same program, but version 1.0.0.
         bytes[1] = 0;
         assert!(Program::<DeBruijn>::unflat(&bytes).is_err());
+    }
+
+    #[test]
+    fn array_constant_round_trips() {
+        let source = "(program 1.1.0 (con (array (list integer)) [[1, 2], [], [3]]))";
+        let program: Program<DeBruijn> = parser::program(source).unwrap().try_into().unwrap();
+
+        assert!(matches!(
+            program.term,
+            Term::Constant(ref c) if matches!(c.as_ref(), Constant::ProtoArray(Type::List(_), items) if items.len() == 3)
+        ));
+
+        let bytes = program.to_flat().unwrap();
+        let decoded = Program::<DeBruijn>::unflat(&bytes).unwrap();
+        assert_eq!(decoded, program);
+
+        let printed: Program<Name> = (&decoded).try_into().unwrap();
+        let reparsed: Program<DeBruijn> = parser::program(&printed.to_pretty())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(reparsed, program);
     }
 }

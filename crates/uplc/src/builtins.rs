@@ -1,5 +1,12 @@
-use crate::ast::Term;
+use crate::{
+    ast::Term,
+    machine::runtime::{
+        ALONZO_PROTOCOL_VERSION, CHANG_PROTOCOL_VERSION, PLOMIN_PROTOCOL_VERSION,
+        VALENTINE_PROTOCOL_VERSION, VAN_ROSSEM_PROTOCOL_VERSION, VASIL_PROTOCOL_VERSION,
+    },
+};
 use pallas_codec::flat::de;
+use pallas_primitives::conway::Language;
 use std::{fmt::Display, rc::Rc, str::FromStr};
 use strum::EnumIter;
 
@@ -133,6 +140,10 @@ pub enum DefaultFunction {
     Ripemd_160 = 86,
     ExpModInteger = 87,
     DropList = 88,
+    // Arrays
+    LengthOfArray = 89,
+    ListToArray = 90,
+    IndexArray = 91,
     // Match
     // CaseList = xx,
     // CaseData = xx,
@@ -342,6 +353,9 @@ impl TryFrom<u8> for DefaultFunction {
             v if v == DefaultFunction::Ripemd_160 as u8 => Ok(DefaultFunction::Ripemd_160),
             v if v == DefaultFunction::ExpModInteger as u8 => Ok(DefaultFunction::ExpModInteger),
             v if v == DefaultFunction::DropList as u8 => Ok(DefaultFunction::DropList),
+            v if v == DefaultFunction::LengthOfArray as u8 => Ok(DefaultFunction::LengthOfArray),
+            v if v == DefaultFunction::ListToArray as u8 => Ok(DefaultFunction::ListToArray),
+            v if v == DefaultFunction::IndexArray as u8 => Ok(DefaultFunction::IndexArray),
             v if v == DefaultFunction::Bls12_381_G1_MultiScalarMul as u8 => {
                 Ok(DefaultFunction::Bls12_381_G1_MultiScalarMul)
             }
@@ -455,6 +469,9 @@ impl FromStr for DefaultFunction {
             "findFirstSetBit" => Ok(FindFirstSetBit),
             "ripemd_160" => Ok(Ripemd_160),
             "dropList" => Ok(DropList),
+            "lengthOfArray" => Ok(LengthOfArray),
+            "listToArray" => Ok(ListToArray),
+            "indexArray" => Ok(IndexArray),
             "bls12_381_G1_multiScalarMul" => Ok(Bls12_381_G1_MultiScalarMul),
             "expModInteger" => Ok(ExpModInteger),
             "insertCoin" => Ok(InsertCoin),
@@ -565,6 +582,9 @@ impl Display for DefaultFunction {
             FindFirstSetBit => write!(f, "findFirstSetBit"),
             Ripemd_160 => write!(f, "ripemd_160"),
             DropList => write!(f, "dropList"),
+            LengthOfArray => write!(f, "lengthOfArray"),
+            ListToArray => write!(f, "listToArray"),
+            IndexArray => write!(f, "indexArray"),
             Bls12_381_G1_MultiScalarMul => write!(f, "bls12_381_G1_multiScalarMul"),
             ExpModInteger => write!(f, "expModInteger"),
             InsertCoin => write!(f, "insertCoin"),
@@ -581,8 +601,7 @@ impl Display for DefaultFunction {
 }
 
 impl DefaultFunction {
-    /// The CIP-0153 value builtins, only available from Plutus V3 /
-    /// protocol version 11 (Van Rossem) onwards.
+    /// The CIP-0153 value builtins.
     pub fn is_value_builtin(&self) -> bool {
         matches!(
             self,
@@ -594,6 +613,91 @@ impl DefaultFunction {
                 | DefaultFunction::UnValueData
                 | DefaultFunction::ScaleValue
         )
+    }
+
+    /// The builtins over builtin arrays.
+    pub fn is_array_builtin(&self) -> bool {
+        matches!(
+            self,
+            DefaultFunction::LengthOfArray
+                | DefaultFunction::ListToArray
+                | DefaultFunction::IndexArray
+        )
+    }
+
+    /// The protocol major version from which this builtin is available in the
+    /// given ledger language. Mirrors `builtinsIntroducedIn` in
+    /// plutus-ledger-api: from protocol version 11 (Van Rossem) onwards every
+    /// builtin is available in every ledger language.
+    pub fn introduced_in(&self, language: &Language) -> u16 {
+        use DefaultFunction::*;
+
+        let batch = match self {
+            SerialiseData => 2,
+            VerifyEcdsaSecp256k1Signature | VerifySchnorrSecp256k1Signature => 3,
+            Bls12_381_G1_Add
+            | Bls12_381_G1_Neg
+            | Bls12_381_G1_ScalarMul
+            | Bls12_381_G1_Equal
+            | Bls12_381_G1_HashToGroup
+            | Bls12_381_G1_Compress
+            | Bls12_381_G1_Uncompress
+            | Bls12_381_G2_Add
+            | Bls12_381_G2_Neg
+            | Bls12_381_G2_ScalarMul
+            | Bls12_381_G2_Equal
+            | Bls12_381_G2_HashToGroup
+            | Bls12_381_G2_Compress
+            | Bls12_381_G2_Uncompress
+            | Bls12_381_MillerLoop
+            | Bls12_381_MulMlResult
+            | Bls12_381_FinalVerify
+            | Keccak_256
+            | Blake2b_224 => 40,
+            IntegerToByteString | ByteStringToInteger => 41,
+            AndByteString | OrByteString | XorByteString | ComplementByteString | ReadBit
+            | WriteBits | ReplicateByte | ShiftByteString | RotateByteString | CountSetBits
+            | FindFirstSetBit | Ripemd_160 => 5,
+            ExpModInteger
+            | DropList
+            | LengthOfArray
+            | ListToArray
+            | IndexArray
+            | Bls12_381_G1_MultiScalarMul
+            | Bls12_381_G2_MultiScalarMul
+            | InsertCoin
+            | LookupCoin
+            | UnionValue
+            | ValueContains
+            | ValueData
+            | UnValueData
+            | ScaleValue => 6,
+            _ => 1,
+        };
+
+        // 40 / 41 are batches 4a and 4b, which PlutusV2 received separately.
+        match (language, batch) {
+            (Language::PlutusV1, 1) => ALONZO_PROTOCOL_VERSION,
+            (Language::PlutusV1, _) => VAN_ROSSEM_PROTOCOL_VERSION,
+            (Language::PlutusV2, 1 | 2) => VASIL_PROTOCOL_VERSION,
+            (Language::PlutusV2, 3) => VALENTINE_PROTOCOL_VERSION,
+            (Language::PlutusV2, 41) => PLOMIN_PROTOCOL_VERSION,
+            (Language::PlutusV2, _) => VAN_ROSSEM_PROTOCOL_VERSION,
+            (Language::PlutusV3, 5) => PLOMIN_PROTOCOL_VERSION,
+            (Language::PlutusV3, 6) => VAN_ROSSEM_PROTOCOL_VERSION,
+            (Language::PlutusV3, _) => CHANG_PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn is_available_in(&self, language: &Language, protocol_major_version: u16) -> bool {
+        protocol_major_version >= self.introduced_in(language)
+    }
+
+    /// Batch 6 (expModInteger, dropList, arrays, multi-scalar multiplication
+    /// and the CIP-0153 value builtins): introduced in every ledger language
+    /// at protocol version 11 (Van Rossem).
+    pub fn is_van_rossem_builtin(&self) -> bool {
+        self.introduced_in(&Language::PlutusV3) == VAN_ROSSEM_PROTOCOL_VERSION
     }
 
     pub fn aiken_name(&self) -> String {
@@ -689,6 +793,9 @@ impl DefaultFunction {
             FindFirstSetBit => "find_first_set_bit",
             Ripemd_160 => "ripemd_160",
             DropList => "drop_list",
+            LengthOfArray => "length_of_array",
+            ListToArray => "list_to_array",
+            IndexArray => "index_array",
             Bls12_381_G1_MultiScalarMul => "bls12_381_g1_multi_scalar_mul",
             ExpModInteger => "exp_mod_integer",
             InsertCoin => "insert_value",

@@ -495,6 +495,10 @@ pub enum Constant {
     Bls12_381G1Element(Box<blst::blst_p1>),
     Bls12_381G2Element(Box<blst::blst_p2>),
     Bls12_381MlResult(Box<blst::blst_fp12>),
+    // tag: 12
+    // Shares its representation with `ProtoList`, so `listToArray` is O(1)
+    // and `indexArray` is a slice lookup.
+    ProtoArray(Type, ListSpine),
     // tag: 13
     Value(Value),
 }
@@ -723,7 +727,7 @@ impl Constant {
     pub fn contains_value(constant: impl AsRef<Constant>) -> bool {
         match constant.as_ref() {
             Constant::Value(_) => true,
-            Constant::ProtoList(r#type, elements) => {
+            Constant::ProtoList(r#type, elements) | Constant::ProtoArray(r#type, elements) => {
                 r#type.contains_value() || elements.iter().any(Constant::contains_value)
             }
             Constant::ProtoPair(fst, snd, left, right) => {
@@ -731,6 +735,24 @@ impl Constant {
                     || snd.contains_value()
                     || Constant::contains_value(left)
                     || Constant::contains_value(right)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this constant contains a builtin array, which is only
+    /// available from protocol version 11 (Van Rossem) onwards.
+    pub fn contains_array(constant: impl AsRef<Constant>) -> bool {
+        match constant.as_ref() {
+            Constant::ProtoArray(..) => true,
+            Constant::ProtoList(r#type, elements) => {
+                r#type.contains_array() || elements.iter().any(Constant::contains_array)
+            }
+            Constant::ProtoPair(fst, snd, left, right) => {
+                fst.contains_array()
+                    || snd.contains_array()
+                    || Constant::contains_array(left)
+                    || Constant::contains_array(right)
             }
             _ => false,
         }
@@ -1248,6 +1270,7 @@ pub enum Type {
     Bls12_381G1Element,
     Bls12_381G2Element,
     Bls12_381MlResult,
+    Array(Rc<Type>),
     Value,
 }
 
@@ -1257,8 +1280,19 @@ impl Type {
     pub fn contains_value(&self) -> bool {
         match self {
             Type::Value => true,
-            Type::List(r#type) => r#type.contains_value(),
+            Type::List(r#type) | Type::Array(r#type) => r#type.contains_value(),
             Type::Pair(fst, snd) => fst.contains_value() || snd.contains_value(),
+            _ => false,
+        }
+    }
+
+    /// Whether this type mentions the builtin array type, which is only
+    /// available from protocol version 11 (Van Rossem) onwards.
+    pub fn contains_array(&self) -> bool {
+        match self {
+            Type::Array(_) => true,
+            Type::List(r#type) => r#type.contains_array(),
+            Type::Pair(fst, snd) => fst.contains_array() || snd.contains_array(),
             _ => false,
         }
     }
@@ -1274,6 +1308,13 @@ impl Constant {
     pub fn deep_clone(&self) -> Constant {
         match self {
             Constant::ProtoList(tipo, items) => Constant::ProtoList(
+                tipo.deep_clone(),
+                items
+                    .iter()
+                    .map(|item| Rc::new(item.deep_clone()))
+                    .collect(),
+            ),
+            Constant::ProtoArray(tipo, items) => Constant::ProtoArray(
                 tipo.deep_clone(),
                 items
                     .iter()
@@ -1299,6 +1340,7 @@ impl Type {
     pub fn deep_clone(&self) -> Type {
         match self {
             Type::List(inner) => Type::List(Rc::new(inner.deep_clone())),
+            Type::Array(inner) => Type::Array(Rc::new(inner.deep_clone())),
             Type::Pair(fst, snd) => {
                 Type::Pair(Rc::new(fst.deep_clone()), Rc::new(snd.deep_clone()))
             }
@@ -1316,6 +1358,7 @@ impl Display for Type {
             Type::ByteString => write!(f, "bytestring"),
             Type::Unit => write!(f, "unit"),
             Type::List(t) => write!(f, "list {t}"),
+            Type::Array(t) => write!(f, "array {t}"),
             Type::Pair(t1, t2) => write!(f, "pair {t1} {t2}"),
             Type::Data => write!(f, "data"),
             Type::Bls12_381G1Element => write!(f, "bls12_381_G1_element"),
