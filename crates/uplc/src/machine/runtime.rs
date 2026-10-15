@@ -2492,8 +2492,8 @@ impl DefaultFunction {
 fn check_output_length(builtin: DefaultFunction, size: &BigInt) -> Result<usize, Error> {
     let maximum = INTEGER_TO_BYTE_STRING_MAXIMUM_OUTPUT_LENGTH;
 
-    if let Some(size) = size.to_usize().filter(|size| *size as i64 <= maximum) {
-        return Ok(size);
+    if let Some(size) = size.to_i64().filter(|size| (0..=maximum).contains(size)) {
+        return Ok(size as usize);
     }
 
     Err(match builtin {

@@ -2232,6 +2232,34 @@ mod tests {
     }
 
     #[test]
+    fn output_lengths_beyond_the_signed_64_bit_range_rejected() {
+        // Sizes from 2^63 used to wrap to a negative length that passed the
+        // maximum, and then failed to allocate given a budget large enough
+        // for their cost.
+        for size in ["9223372036854775808", "18446744073709551615"] {
+            for source in [
+                format!(
+                    "[(builtin integerToByteString) (con bool True) (con integer {size}) (con integer 0)]"
+                ),
+                format!("[(builtin replicateByte) (con integer {size}) (con integer 0)]"),
+            ] {
+                let program: Program<NamedDeBruijn> =
+                    crate::parser::program(&format!("(program 1.1.0 {source})"))
+                        .unwrap()
+                        .try_into()
+                        .unwrap();
+
+                let budget = ExBudget {
+                    mem: i64::MAX,
+                    cpu: i64::MAX,
+                };
+
+                assert!(program.eval(budget).result().is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
     fn constant_types_limited_as_the_ledger_does() {
         let lists = |depth: usize, element: &str| {
             (0..depth).fold(element.to_string(), |t, _| format!("(list {t})"))
