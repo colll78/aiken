@@ -1,7 +1,7 @@
 //! Plutus Data whose children are shared between copies.
 
 use crate::{
-    ast::{Constant, ListSpine, Type},
+    ast::{Constant, DebugDepth, ListSpine, Type},
     machine::{
         runtime::{ANY_TAG, convert_constr_to_tag},
         value::to_pallas_bigint,
@@ -37,7 +37,7 @@ use std::{cmp::Ordering, fmt, rc::Rc};
 ///
 /// assert_eq!(Data::from(pallas), data);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Data {
     Constr(Constr),
     Map(Map),
@@ -642,6 +642,24 @@ impl PartialEq for Map {
 impl Eq for Map {}
 
 // ---------------- Debug, in the same shape as PlutusData's
+
+// Data nests as deep as a script or its evaluation makes it, so formatting it
+// (in an error message, say) stops past the limits of `DebugDepth`.
+impl fmt::Debug for Data {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(_depth) = DebugDepth::enter() else {
+            return f.write_str("..");
+        };
+
+        match self {
+            Data::Constr(constr) => f.debug_tuple("Constr").field(constr).finish(),
+            Data::Map(map) => f.debug_tuple("Map").field(map).finish(),
+            Data::Array(array) => f.debug_tuple("Array").field(array).finish(),
+            Data::BigInt(int) => f.debug_tuple("BigInt").field(int).finish(),
+            Data::BoundedBytes(bytes) => f.debug_tuple("BoundedBytes").field(bytes).finish(),
+        }
+    }
+}
 
 impl fmt::Debug for Array {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

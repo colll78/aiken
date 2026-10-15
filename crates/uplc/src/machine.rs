@@ -30,7 +30,7 @@ use self::{
 enum MachineState {
     Return(Value),
     Compute(Env, TermRef),
-    Done(Term<NamedDeBruijn>),
+    Done(Value),
 }
 
 /// A pending continuation. The machine keeps them on a stack, with the next
@@ -267,21 +267,40 @@ impl Machine {
     /// The ledger only runs programs whose UPLC version the ledger language
     /// has at the protocol version (see
     /// [`protocol::is_uplc_version_available`]); this does not check that.
+    ///
+    /// The value the program returns is discharged into a term, which can be
+    /// exponentially larger; [`Program::eval`] and the like only discharge it
+    /// when asked to.
     pub fn run_program(
         &mut self,
         program: Program<NamedDeBruijn>,
     ) -> Result<Term<NamedDeBruijn>, Error> {
-        if self.protocol_major_version >= DIJKSTRA_PROTOCOL_VERSION && program.version >= (1, 2, 0)
-        {
-            self.caser = Caser::Builtins;
-        }
-
-        self.run(program.term)
+        self.evaluate_program(program)
+            .map(|value| discharge::value_as_term(&value))
     }
 
     /// Evaluates a term, as [`Machine::run_program`] evaluates the term of a
     /// program of UPLC version 1.1.0.
     pub fn run(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
+        self.evaluate_term(term)
+            .map(|value| discharge::value_as_term(&value))
+    }
+
+    /// Evaluates a program, as [`Machine::run_program`] does, to the value
+    /// it returns.
+    pub(crate) fn evaluate_program(
+        &mut self,
+        program: Program<NamedDeBruijn>,
+    ) -> Result<Value, Error> {
+        if self.protocol_major_version >= DIJKSTRA_PROTOCOL_VERSION && program.version >= (1, 2, 0)
+        {
+            self.caser = Caser::Builtins;
+        }
+
+        self.evaluate_term(program.term)
+    }
+
+    fn evaluate_term(&mut self, term: Term<NamedDeBruijn>) -> Result<Value, Error> {
         if self.protocol_major_version < protocol::language_introduced_in(&self.language) {
             return Err(Error::LanguageNotAvailable(self.language.clone()));
         }
@@ -301,7 +320,7 @@ impl Machine {
         result
     }
 
-    fn evaluate(&mut self, term: Term<NamedDeBruijn>) -> Result<Term<NamedDeBruijn>, Error> {
+    fn evaluate(&mut self, term: Term<NamedDeBruijn>) -> Result<Value, Error> {
         use MachineState::*;
 
         let mut state = Compute(Env::default(), Rc::new(term).into());
@@ -310,8 +329,8 @@ impl Machine {
             state = match state {
                 Compute(env, t) => self.compute(env, t)?,
                 Return(value) => self.return_compute(value)?,
-                Done(t) => {
-                    return Ok(t);
+                Done(value) => {
+                    return Ok(value);
                 }
             };
         }
@@ -461,7 +480,7 @@ impl Machine {
                     }
                     None => Ok(MachineState::Return(Value::Constr {
                         tag: *tag,
-                        fields: Rc::new(vec![]),
+                        fields: Rc::default(),
                     })),
                 }
             }
@@ -484,9 +503,7 @@ impl Machine {
                 self.spend_unbudgeted_steps()?;
             }
 
-            let term = discharge::value_as_term(value);
-
-            return Ok(MachineState::Done(term));
+            return Ok(MachineState::Done(value));
         };
 
         match frame {
@@ -518,7 +535,7 @@ impl Machine {
                     }
                     None => Ok(MachineState::Return(Value::Constr {
                         tag: *tag,
-                        fields: Rc::new(resolved_fields),
+                        fields: Rc::new(resolved_fields.into()),
                     })),
                 }
             }
@@ -545,7 +562,10 @@ impl Machine {
                 .filter(|&index| index < branches.len())
             {
                 Some(index) => {
-                    self.transfer_arg_stack(Rc::unwrap_or_clone(fields));
+                    match Rc::try_unwrap(fields) {
+                        Ok(fields) => self.transfer_arg_stack(fields.into_vec().into_iter()),
+                        Err(fields) => self.transfer_arg_stack(fields.iter().cloned()),
+                    }
 
                     Ok(MachineState::Compute(env, term.child(index)))
                 }
@@ -612,7 +632,7 @@ impl Machine {
 
                 match branches.get(tag) {
                     Some(_) => {
-                        self.transfer_arg_stack(fields);
+                        self.transfer_arg_stack(fields.into_iter());
 
                         Ok(MachineState::Compute(env, term.child(tag)))
                     }
@@ -642,9 +662,10 @@ impl Machine {
 
                     Ok(MachineState::Return(res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
-
-                    Err(Error::BuiltinTermArgumentExpected(term))
+                    Err(Error::BuiltinTermArgumentExpected(Value::Builtin {
+                        fun,
+                        runtime,
+                    }))
                 }
             }
             rest => Err(Error::NonPolymorphicInstantiation(rest)),
@@ -673,9 +694,10 @@ impl Machine {
 
                     Ok(MachineState::Return(res))
                 } else {
-                    let term = discharge::value_as_term(Value::Builtin { fun, runtime });
-
-                    Err(Error::UnexpectedBuiltinTermArgument(term))
+                    Err(Error::UnexpectedBuiltinTermArgument(Value::Builtin {
+                        fun,
+                        runtime,
+                    }))
                 }
             }
             rest => Err(Error::NonFunctionalApplication(rest, argument)),
@@ -707,9 +729,8 @@ impl Machine {
 
     /// Pushes the fields of a scrutinised constructor as pending arguments,
     /// the first field on top.
-    fn transfer_arg_stack(&mut self, args: Vec<Value>) {
-        self.frames
-            .extend(args.into_iter().rev().map(Frame::AwaitFunValue));
+    fn transfer_arg_stack(&mut self, args: impl DoubleEndedIterator<Item = Value>) {
+        self.frames.extend(args.rev().map(Frame::AwaitFunValue));
     }
 
     fn step_and_maybe_spend(&mut self, step: StepKind) -> Result<(), Error> {
@@ -2125,7 +2146,7 @@ mod tests {
         let source = "(program 1.1.0 (case (con bool True) (con integer 0) (con integer 1)))";
 
         assert!(matches!(
-            eval_at(Language::PlutusV3, PLOMIN_PROTOCOL_VERSION, source).result,
+            eval_at(Language::PlutusV3, PLOMIN_PROTOCOL_VERSION, source).result(),
             Err(Error::NonConstrScrutinized(_))
         ));
 
@@ -2193,7 +2214,7 @@ mod tests {
             let result = eval_at(Language::PlutusV3, protocol_major_version, &source);
 
             assert!(
-                result.result.is_err(),
+                result.result().is_err(),
                 "{source} at {protocol_major_version}"
             );
             assert_eq!(result.cost(), ExBudget { mem: 100, cpu: 100 });
@@ -2207,7 +2228,7 @@ mod tests {
 
         let result =
             constr(MAX_CONSTR_FIELDS).eval_version(ExBudget::default(), &Language::PlutusV3);
-        assert!(result.result.is_ok());
+        assert!(result.result().is_ok());
         assert_eq!(
             result.cost(),
             ExBudget {
@@ -2225,7 +2246,7 @@ mod tests {
             assert_eq!(
                 program
                     .eval_version(ExBudget::default(), &Language::PlutusV3)
-                    .result,
+                    .result(),
                 Err(Error::ConstrTooManyFields(MAX_CONSTR_FIELDS + 1))
             );
         }
@@ -2285,10 +2306,10 @@ mod tests {
             let result = eval_at(Language::PlutusV3, VAN_ROSSEM_PROTOCOL_VERSION, &source);
 
             if fits {
-                assert!(result.result.is_ok(), "{type}");
+                assert!(result.result().is_ok(), "{type}");
             } else {
                 assert!(
-                    matches!(result.result, Err(Error::ConstantTypeTooLarge(_))),
+                    matches!(result.result(), Err(Error::ConstantTypeTooLarge(_))),
                     "{type}"
                 );
             }
@@ -2302,10 +2323,189 @@ mod tests {
             let source = "(program 1.0.0 (con unit ()))";
 
             assert_eq!(
-                eval_at(language.clone(), introduced_in - 1, source).result,
+                eval_at(language.clone(), introduced_in - 1, source).result(),
                 Err(Error::LanguageNotAvailable(language.clone()))
             );
-            assert!(eval_at(language, introduced_in, source).result.is_ok());
+            assert!(eval_at(language, introduced_in, source).result().is_ok());
         }
+    }
+
+    fn var(index: usize) -> Term<NamedDeBruijn> {
+        Term::Var(
+            NamedDeBruijn {
+                text: "x".to_string(),
+                index: index.into(),
+            }
+            .into(),
+        )
+    }
+
+    fn lambda(body: Term<NamedDeBruijn>) -> Term<NamedDeBruijn> {
+        Term::Lambda {
+            parameter_name: NamedDeBruijn {
+                text: "x".to_string(),
+                index: 0.into(),
+            }
+            .into(),
+            body: body.into(),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn evaluates_deep_terms_in_bounded_stack() {
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 500;
+
+        let nest = |leaf: Term<NamedDeBruijn>,
+                    f: fn(Term<NamedDeBruijn>) -> Term<NamedDeBruijn>| {
+            (0..DEPTH).fold(leaf, |term, _| f(term))
+        };
+
+        // Far too little to evaluate or discharge the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                let evaluate = |term: Term<NamedDeBruijn>| {
+                    Program {
+                        version: (1, 1, 0),
+                        term,
+                    }
+                    .eval_version(ExBudget::max(), &Language::PlutusV3)
+                    .result()
+                };
+
+                // Values discharged back into the terms they came from.
+                let delays = nest(Term::Error, |term| term.delay());
+                assert_eq!(evaluate(delays.clone()), Ok(delays));
+
+                let lambdas = nest(var(1), lambda);
+                assert_eq!(evaluate(lambdas.clone()), Ok(lambdas));
+
+                let constrs = nest(Term::unit(), |term| Term::Constr {
+                    tag: 0,
+                    fields: vec![term],
+                });
+                assert_eq!(evaluate(constrs.clone()), Ok(constrs));
+
+                // Values discharged with the values their environments bind:
+                // the outermost `x` is the unit the lambda around it is applied
+                // to, while the others are bound inside the value.
+                let closure = |term| lambda(term).apply(var(1)).delay();
+                let closures = (1..DEPTH).fold(var(1), |term, _| closure(term));
+                assert_eq!(
+                    evaluate(lambda(closure(closures.clone())).apply(Term::unit())),
+                    Ok(lambda(closures).apply(Term::unit()).delay())
+                );
+
+                // Deep stacks of frames.
+                let forces = nest(Term::unit(), |term| term.delay().force());
+                assert_eq!(evaluate(forces), Ok(Term::unit()));
+
+                let arguments = nest(Term::unit(), |term| lambda(var(1)).apply(term));
+                assert_eq!(evaluate(arguments), Ok(Term::unit()));
+
+                let functions = (0..DEPTH).fold(nest(Term::unit(), lambda), |term, _| {
+                    term.apply(Term::Error.delay())
+                });
+                assert_eq!(evaluate(functions), Ok(Term::unit()));
+
+                let scrutinees = nest(
+                    Term::Constr {
+                        tag: 0,
+                        fields: vec![],
+                    },
+                    |term| Term::Case {
+                        constr: term.into(),
+                        branches: vec![Term::Constr {
+                            tag: 0,
+                            fields: vec![],
+                        }],
+                    },
+                );
+                assert_eq!(
+                    evaluate(scrutinees),
+                    Ok(Term::Constr {
+                        tag: 0,
+                        fields: vec![]
+                    })
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn formats_errors_holding_deep_data_in_bounded_stack() {
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 500;
+
+        // Far too little to format the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(|| {
+                let data =
+                    (0..DEPTH).fold(Data::integer(0.into()), |data, _| Data::list(vec![data]));
+
+                for builtin in [
+                    DefaultFunction::UnConstrData,
+                    DefaultFunction::UnMapData,
+                    DefaultFunction::UnIData,
+                    DefaultFunction::UnBData,
+                ] {
+                    let program = Program {
+                        version: (1, 1, 0),
+                        term: Term::<NamedDeBruijn>::Builtin(builtin)
+                            .apply(Term::Constant(Constant::Data(data.clone()).into())),
+                    };
+
+                    let result = program.eval_version(ExBudget::max(), &Language::PlutusV3);
+                    let error = result.error().unwrap();
+
+                    assert!(matches!(error, Error::DeserialisationError(..)));
+                    assert!(format!("{error}").len() < 1 << 16);
+                    assert!(format!("{error:?}").len() < 1 << 16);
+                    assert!(format!("{error:#?}").len() < 1 << 20);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn results_are_only_discharged_on_demand() {
+        // Each application of `double` returns a constr whose two fields share
+        // the value it got, so the value is evaluated in 64 steps and in a
+        // little memory, but discharges into a term with 2^64 constrs.
+        let double = lambda(Term::Constr {
+            tag: 0,
+            fields: vec![var(1), var(1)],
+        });
+
+        let program = Program {
+            version: (1, 1, 0),
+            term: lambda((0..64).fold(Term::unit(), |term, _| var(1).apply(term))).apply(double),
+        };
+
+        let result = program.eval_version(ExBudget::default(), &Language::PlutusV3);
+
+        assert!(!result.failed(false, &Language::PlutusV2));
+        assert!(result.failed(true, &Language::PlutusV3));
+        assert_eq!(result.error(), None);
+        assert_eq!(result.constant(), None);
+        assert!(format!("{result:?}").len() < 1 << 20);
     }
 }

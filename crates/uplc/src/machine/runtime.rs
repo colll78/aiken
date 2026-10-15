@@ -1,7 +1,7 @@
 use super::{
     Error, Trace, Value,
     cost_model::{BuiltinCosts, ExBudget},
-    value::{from_pallas_bigint, to_pallas_bigint},
+    value::{Values, from_pallas_bigint, to_pallas_bigint},
 };
 use crate::{
     ast::{Constant, Data, Type},
@@ -140,7 +140,7 @@ impl From<&Language> for BuiltinSemantics {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuiltinRuntime {
-    pub(super) args: Vec<Value>,
+    pub(super) args: Values,
     pub fun: DefaultFunction,
     pub(super) forces: u32,
 }
@@ -148,18 +148,23 @@ pub struct BuiltinRuntime {
 impl BuiltinRuntime {
     pub fn new(fun: DefaultFunction) -> BuiltinRuntime {
         Self {
-            args: vec![],
+            args: Values::default(),
             fun,
             forces: 0,
         }
     }
 
+    /// The arguments applied so far.
+    pub fn args(&self) -> &[Value] {
+        &self.args
+    }
+
     pub fn is_arrow(&self) -> bool {
-        self.args.len() != self.fun.arity()
+        self.args().len() != self.fun.arity()
     }
 
     pub fn is_ready(&self) -> bool {
-        self.args.len() == self.fun.arity()
+        self.args().len() == self.fun.arity()
     }
 
     pub fn needs_force(&self) -> bool {
@@ -175,7 +180,7 @@ impl BuiltinRuntime {
         semantics: BuiltinSemantics,
         traces: &mut Vec<Trace>,
     ) -> Result<Value, Error> {
-        self.fun.call(semantics, &self.args, traces)
+        self.fun.call(semantics, self.args(), traces)
     }
 
     pub fn push(&mut self, arg: Value) -> Result<(), Error> {
@@ -189,7 +194,7 @@ impl BuiltinRuntime {
     /// builtin is saturated, and fails an application whose arguments do not
     /// unlift before costing it.
     pub fn unlift_arguments(&self, semantics: BuiltinSemantics) -> Result<(), Error> {
-        self.args.iter().enumerate().try_for_each(|(index, arg)| {
+        self.args().iter().enumerate().try_for_each(|(index, arg)| {
             self.fun
                 .argument_unlifting(semantics, index)
                 .unlift(self.fun, arg)
@@ -201,7 +206,7 @@ impl BuiltinRuntime {
         costs: &BuiltinCosts,
         semantics: BuiltinSemantics,
     ) -> Result<ExBudget, Error> {
-        costs.to_ex_budget(self.fun, &self.args, semantics)
+        costs.to_ex_budget(self.fun, self.args(), semantics)
     }
 }
 

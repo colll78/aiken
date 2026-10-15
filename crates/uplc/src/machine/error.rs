@@ -65,14 +65,14 @@ pub enum Error {
         indent(redacted(format!("{:#?}", .0), 10)),
         "Hint"
     )]
-    UnexpectedBuiltinTermArgument(Term<NamedDeBruijn>),
+    UnexpectedBuiltinTermArgument(Value),
     #[error(
         "a builtin expected a term argument, but something else was received:\n{:>13} {}\n{:>13} You probably have an extra force wrapped around a builtin",
         "Term",
         indent(redacted(format!("{:#?}", .0), 10)),
         "Hint"
     )]
-    BuiltinTermArgumentExpected(Term<NamedDeBruijn>),
+    BuiltinTermArgumentExpected(Value),
     #[error(
         "Unable to unlift value because it is not a constant\n{:>13} {}",
         "Value",

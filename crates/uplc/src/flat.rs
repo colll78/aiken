@@ -193,23 +193,34 @@ where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        let mut state_log: Vec<String> = vec![];
         let version = (decode_usize(d)?, decode_usize(d)?, decode_usize(d)?);
-        let term_option = Term::decode_debug(d, &mut state_log);
+        let (pos, used_bits) = (d.pos, d.used_bits);
 
-        match term_option {
-            Ok(term) => {
-                let program = Program { version, term };
-                program
-                    .check_version_features()
-                    .map_err(de::Error::Message)?;
-                Ok(program)
+        let term = match decode_term(d, &mut Log(None)) {
+            Ok(term) => term,
+            Err(error) => {
+                // Decode the term again, logging what decodes, to explain where
+                // it failed.
+                d.pos = pos;
+                d.used_bits = used_bits;
+
+                let mut log = vec![];
+
+                let error = decode_term::<T>(d, &mut Log(Some(&mut log)))
+                    .err()
+                    .unwrap_or(error);
+
+                return Err(de::Error::Message(format!("{} {error}", log.join(""))));
             }
-            Err(error) => Err(de::Error::Message(format!(
-                "{} {error}",
-                state_log.join("")
-            ))),
-        }
+        };
+
+        let program = Program { version, term };
+
+        program
+            .check_version_features()
+            .map_err(de::Error::Message)?;
+
+        Ok(program)
     }
 }
 
@@ -218,60 +229,77 @@ where
     T: Binder<'b> + Debug,
 {
     fn encode(&self, e: &mut Encoder) -> Result<(), en::Error> {
-        match self {
-            Term::Var(name) => {
-                encode_term_tag(0, e)?;
-                name.encode(e)?;
-            }
-            Term::Delay(term) => {
-                encode_term_tag(1, e)?;
-                term.encode(e)?;
-            }
-            Term::Lambda {
-                parameter_name,
-                body,
-            } => {
-                encode_term_tag(2, e)?;
-                parameter_name.binder_encode(e)?;
-                body.encode(e)?;
-            }
-            Term::Apply { function, argument } => {
-                encode_term_tag(3, e)?;
-                function.encode(e)?;
-                argument.encode(e)?;
-            }
+        enum Pending<'a, T> {
+            Term(&'a Term<T>),
+            /// The rest of a list of terms: each is written after a 1 bit,
+            /// and the list ends with a 0 bit.
+            Terms(&'a [Term<T>]),
+        }
 
-            Term::Constant(constant) => {
-                encode_term_tag(4, e)?;
-                constant.encode(e)?;
-            }
+        // Terms can nest deeper than the stack would allow recursing.
+        let mut pending = vec![Pending::Term(self)];
 
-            Term::Force(term) => {
-                encode_term_tag(5, e)?;
-                term.encode(e)?;
-            }
+        while let Some(next) = pending.pop() {
+            let term = match next {
+                Pending::Term(term) => term,
+                Pending::Terms([]) => {
+                    e.bits(1, 0);
+                    continue;
+                }
+                Pending::Terms([term, rest @ ..]) => {
+                    e.bits(1, 1);
+                    pending.push(Pending::Terms(rest));
+                    term
+                }
+            };
 
-            Term::Error => {
-                encode_term_tag(6, e)?;
-            }
-            Term::Builtin(builtin) => {
-                encode_term_tag(7, e)?;
-
-                builtin.encode(e)?;
-            }
-            Term::Constr { tag, fields } => {
-                encode_term_tag(8, e)?;
-
-                encode_word64(*tag, e);
-
-                e.encode_list_with(fields, |term, e| (*term).encode(e))?;
-            }
-            Term::Case { constr, branches } => {
-                encode_term_tag(9, e)?;
-
-                constr.encode(e)?;
-
-                e.encode_list_with(branches, |term, e| (*term).encode(e))?;
+            match term {
+                Term::Var(name) => {
+                    encode_term_tag(0, e)?;
+                    name.encode(e)?;
+                }
+                Term::Delay(body) => {
+                    encode_term_tag(1, e)?;
+                    pending.push(Pending::Term(body));
+                }
+                Term::Lambda {
+                    parameter_name,
+                    body,
+                } => {
+                    encode_term_tag(2, e)?;
+                    parameter_name.binder_encode(e)?;
+                    pending.push(Pending::Term(body));
+                }
+                Term::Apply { function, argument } => {
+                    encode_term_tag(3, e)?;
+                    pending.push(Pending::Term(argument));
+                    pending.push(Pending::Term(function));
+                }
+                Term::Constant(constant) => {
+                    encode_term_tag(4, e)?;
+                    constant.encode(e)?;
+                }
+                Term::Force(body) => {
+                    encode_term_tag(5, e)?;
+                    pending.push(Pending::Term(body));
+                }
+                Term::Error => {
+                    encode_term_tag(6, e)?;
+                }
+                Term::Builtin(builtin) => {
+                    encode_term_tag(7, e)?;
+                    builtin.encode(e)?;
+                }
+                Term::Constr { tag, fields } => {
+                    encode_term_tag(8, e)?;
+                    encode_word64(*tag, e);
+                    pending.push(Pending::Terms(fields));
+                }
+                Term::Case { constr, branches } => {
+                    encode_term_tag(9, e)?;
+                    pending.push(Pending::Terms(branches));
+                    pending.push(Pending::Term(constr));
+                }
             }
         }
 
@@ -284,249 +312,280 @@ where
     T: Binder<'b>,
 {
     fn decode(d: &mut Decoder) -> Result<Self, de::Error> {
-        match decode_term_tag(d)? {
-            0 => Ok(Term::Var(T::decode(d)?.into())),
-            1 => Ok(Term::Delay(Rc::new(Term::decode(d)?))),
-            2 => Ok(Term::Lambda {
-                parameter_name: T::binder_decode(d)?.into(),
-                body: Rc::new(Term::decode(d)?),
-            }),
-            3 => Ok(Term::Apply {
-                function: Rc::new(Term::decode(d)?),
-                argument: Rc::new(Term::decode(d)?),
-            }),
-            // Need size limit for Constant
-            4 => Ok(Term::Constant(Constant::decode(d)?.into())),
-            5 => Ok(Term::Force(Rc::new(Term::decode(d)?))),
-            6 => Ok(Term::Error),
-            7 => Ok(Term::Builtin(DefaultFunction::decode(d)?)),
-            8 => {
-                let tag = decode_word64(d)?;
-                let fields = d.decode_list_with(Term::<T>::decode)?;
+        decode_term(d, &mut Log(None))
+    }
+}
 
-                Ok(Term::Constr { tag, fields })
-            }
-            9 => {
-                let constr = (Term::<T>::decode(d)?).into();
+/// Where decoding a term logs what it decodes, if anywhere.
+struct Log<'a>(Option<&'a mut Vec<String>>);
 
-                let branches = d.decode_list_with(Term::<T>::decode)?;
+impl Log<'_> {
+    fn text(&mut self, text: &str) {
+        if let Some(log) = &mut self.0 {
+            log.push(text.to_string());
+        }
+    }
 
-                Ok(Term::Case { constr, branches })
-            }
-            x => {
-                let buffer_slice: Vec<u8> = d
-                    .buffer
-                    .to_vec()
-                    .iter()
-                    .skip(d.pos.saturating_sub(5))
-                    .take(10)
-                    .cloned()
-                    .collect();
-
-                Err(de::Error::UnknownTermConstructor(
-                    x,
-                    if d.pos > 5 { 5 } else { d.pos },
-                    format!("{buffer_slice:02X?}"),
-                    d.pos,
-                    d.buffer.len(),
-                ))
-            }
+    fn entry(&mut self, entry: impl FnOnce() -> String) {
+        if let Some(log) = &mut self.0 {
+            log.push(entry());
         }
     }
 }
 
-impl<'b, T> Term<T>
+/// A term waiting on the subterm being decoded.
+enum Pending<T> {
+    Delay,
+    Force,
+    Lambda(T),
+    /// An application, whose function is being decoded.
+    Function,
+    /// An application of this function, whose argument is being decoded.
+    Argument(Term<T>),
+    Fields(u64, Vec<Term<T>>),
+    Scrutinee,
+    Branches(Term<T>, Vec<Term<T>>),
+}
+
+/// Decodes a term. Terms can nest deeper than the stack would allow
+/// recursing, so the terms waiting on a subterm are kept on the heap.
+fn decode_term<'b, T>(d: &mut Decoder, log: &mut Log) -> Result<Term<T>, de::Error>
 where
     T: Binder<'b>,
 {
-    fn decode_debug(d: &mut Decoder, state_log: &mut Vec<String>) -> Result<Term<T>, de::Error> {
-        match decode_term_tag(d)? {
+    let mut pending = Vec::new();
+
+    let result = decode_pending(d, log, &mut pending);
+
+    if result.is_err() {
+        for waiting in pending.iter().rev() {
+            log.text(match waiting {
+                Pending::Function => " not parsed]",
+                Pending::Argument(_) => "]",
+                _ => ")",
+            });
+        }
+    }
+
+    result
+}
+
+fn decode_pending<'b, T>(
+    d: &mut Decoder,
+    log: &mut Log,
+    pending: &mut Vec<Pending<T>>,
+) -> Result<Term<T>, de::Error>
+where
+    T: Binder<'b>,
+{
+    'term: loop {
+        let mut term = match decode_term_tag(d)? {
             0 => {
-                state_log.push("(var ".to_string());
-                let var_option = T::decode(d);
-                match var_option {
+                log.text("(var ");
+
+                match T::decode(d) {
                     Ok(var) => {
-                        state_log.push(format!("{})", var.text()));
-                        Ok(Term::Var(var.into()))
+                        log.entry(|| format!("{})", var.text()));
+                        Term::Var(var.into())
                     }
                     Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
+                        log.text("parse error)");
+                        return Err(error);
                     }
                 }
             }
-
             1 => {
-                state_log.push("(delay ".to_string());
-                let term_option = Term::decode_debug(d, state_log);
-                match term_option {
-                    Ok(term) => {
-                        state_log.push(")".to_string());
-                        Ok(Term::Delay(Rc::new(term)))
-                    }
-                    Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
-                    }
-                }
+                log.text("(delay ");
+                pending.push(Pending::Delay);
+                continue;
             }
             2 => {
-                state_log.push("(lam ".to_string());
+                log.text("(lam ");
 
-                let var_option = T::binder_decode(d);
-                match var_option {
+                match T::binder_decode(d) {
                     Ok(var) => {
-                        state_log.push(var.text());
-                        let term_option = Term::decode_debug(d, state_log);
-                        match term_option {
-                            Ok(term) => {
-                                state_log.push(")".to_string());
-                                Ok(Term::Lambda {
-                                    parameter_name: var.into(),
-                                    body: Rc::new(term),
-                                })
-                            }
-                            Err(error) => {
-                                state_log.push(")".to_string());
-                                Err(error)
-                            }
-                        }
+                        log.entry(|| var.text());
+                        pending.push(Pending::Lambda(var));
+                        continue;
                     }
                     Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
+                        log.text(")");
+                        return Err(error);
                     }
                 }
             }
             3 => {
-                state_log.push("[ ".to_string());
-
-                let function_term_option = Term::decode_debug(d, state_log);
-                match function_term_option {
-                    Ok(function) => {
-                        state_log.push(" ".to_string());
-                        let arg_term_option = Term::decode_debug(d, state_log);
-                        match arg_term_option {
-                            Ok(argument) => {
-                                state_log.push("]".to_string());
-                                Ok(Term::Apply {
-                                    function: Rc::new(function),
-                                    argument: Rc::new(argument),
-                                })
-                            }
-                            Err(error) => {
-                                state_log.push("]".to_string());
-                                Err(error)
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        state_log.push(" not parsed]".to_string());
-                        Err(error)
-                    }
-                }
+                log.text("[ ");
+                pending.push(Pending::Function);
+                continue;
             }
-            // Need size limit for Constant
             4 => {
-                state_log.push("(con ".to_string());
+                log.text("(con ");
 
-                let con_option = Constant::decode(d);
-                match con_option {
+                match Constant::decode(d) {
                     Ok(constant) => {
-                        let r#type = Type::from(&constant);
+                        log.entry(|| {
+                            let r#type = Type::from(&constant);
 
-                        // Printing Data recurses as deep as the Data nests, so
-                        // a constant holding some is logged by its type alone.
-                        if mentions_data(&r#type) {
-                            state_log.push(format!("{type} …)"));
-                        } else {
-                            state_log.push(format!("{})", constant.to_pretty()));
-                        }
+                            // Printing Data recurses as deep as the Data nests,
+                            // so a constant holding some is logged by its type
+                            // alone.
+                            if mentions_data(&r#type) {
+                                format!("{type} …)")
+                            } else {
+                                format!("{})", constant.to_pretty())
+                            }
+                        });
 
-                        Ok(Term::Constant(constant.into()))
+                        Term::Constant(constant.into())
                     }
                     Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
+                        log.text("parse error)");
+                        return Err(error);
                     }
                 }
             }
             5 => {
-                state_log.push("(force ".to_string());
-                let term_option = Term::decode_debug(d, state_log);
-                match term_option {
-                    Ok(term) => {
-                        state_log.push(")".to_string());
-                        Ok(Term::Force(Rc::new(term)))
-                    }
-                    Err(error) => {
-                        state_log.push(")".to_string());
-                        Err(error)
-                    }
-                }
+                log.text("(force ");
+                pending.push(Pending::Force);
+                continue;
             }
             6 => {
-                state_log.push("(error)".to_string());
-                Ok(Term::Error)
+                log.text("(error)");
+                Term::Error
             }
             7 => {
-                state_log.push("(builtin ".to_string());
+                log.text("(builtin ");
 
-                let builtin_option = DefaultFunction::decode(d);
-                match builtin_option {
+                match DefaultFunction::decode(d) {
                     Ok(builtin) => {
-                        state_log.push(format!("{builtin})"));
-                        Ok(Term::Builtin(builtin))
+                        log.entry(|| format!("{builtin})"));
+                        Term::Builtin(builtin)
                     }
                     Err(error) => {
-                        state_log.push("parse error)".to_string());
-                        Err(error)
+                        log.text("parse error)");
+                        return Err(error);
                     }
                 }
             }
             8 => {
-                state_log.push("(constr ".to_string());
+                log.text("(constr ");
 
                 let tag = decode_word64(d)?;
 
-                let fields = d.decode_list_with_debug(
-                    |d, state_log| Term::<T>::decode_debug(d, state_log),
-                    state_log,
-                )?;
+                if decode_bool(d)? {
+                    pending.push(Pending::Fields(tag, vec![]));
+                    continue;
+                }
 
-                Ok(Term::Constr { tag, fields })
+                log.text(")");
+                Term::Constr {
+                    tag,
+                    fields: vec![],
+                }
             }
             9 => {
-                state_log.push("(case ".to_string());
-                let constr = Term::<T>::decode_debug(d, state_log)?.into();
-
-                let branches = d.decode_list_with_debug(
-                    |d, state_log| Term::<T>::decode_debug(d, state_log),
-                    state_log,
-                )?;
-
-                Ok(Term::Case { constr, branches })
+                log.text("(case ");
+                pending.push(Pending::Scrutinee);
+                continue;
             }
             x => {
-                state_log.push("parse error".to_string());
+                log.text("parse error");
 
                 let buffer_slice: Vec<u8> = d
                     .buffer
-                    .to_vec()
                     .iter()
                     .skip(d.pos.saturating_sub(5))
                     .take(10)
                     .cloned()
                     .collect();
 
-                Err(de::Error::UnknownTermConstructor(
+                return Err(de::Error::UnknownTermConstructor(
                     x,
                     if d.pos > 5 { 5 } else { d.pos },
                     format!("{buffer_slice:02X?}"),
                     d.pos,
                     d.buffer.len(),
-                ))
+                ));
             }
+        };
+
+        // Complete the terms waiting on this one, until one waits on another.
+        loop {
+            let Some(waiting) = pending.pop() else {
+                return Ok(term);
+            };
+
+            term = match waiting {
+                Pending::Delay => Term::Delay(term.into()),
+                Pending::Force => Term::Force(term.into()),
+                Pending::Lambda(var) => Term::Lambda {
+                    parameter_name: var.into(),
+                    body: term.into(),
+                },
+                Pending::Function => {
+                    log.text(" ");
+                    pending.push(Pending::Argument(term));
+                    continue 'term;
+                }
+                Pending::Argument(function) => {
+                    log.text("]");
+                    term = Term::Apply {
+                        function: function.into(),
+                        argument: term.into(),
+                    };
+                    continue;
+                }
+                Pending::Fields(tag, mut fields) => {
+                    fields.push(term);
+                    pending.push(Pending::Fields(tag, fields));
+
+                    if decode_bool(d)? {
+                        continue 'term;
+                    }
+
+                    let Some(Pending::Fields(tag, fields)) = pending.pop() else {
+                        unreachable!("the fields were just pushed")
+                    };
+
+                    Term::Constr { tag, fields }
+                }
+                Pending::Scrutinee => {
+                    pending.push(Pending::Branches(term, vec![]));
+
+                    if decode_bool(d)? {
+                        continue 'term;
+                    }
+
+                    let Some(Pending::Branches(constr, branches)) = pending.pop() else {
+                        unreachable!("the branches were just pushed")
+                    };
+
+                    Term::Case {
+                        constr: constr.into(),
+                        branches,
+                    }
+                }
+                Pending::Branches(constr, mut branches) => {
+                    branches.push(term);
+                    pending.push(Pending::Branches(constr, branches));
+
+                    if decode_bool(d)? {
+                        continue 'term;
+                    }
+
+                    let Some(Pending::Branches(constr, branches)) = pending.pop() else {
+                        unreachable!("the branches were just pushed")
+                    };
+
+                    Term::Case {
+                        constr: constr.into(),
+                        branches,
+                    }
+                }
+            };
+
+            log.text(")");
         }
     }
 }
@@ -1697,6 +1756,79 @@ mod tests {
                     .encode(&mut e)
                     .unwrap();
                 assert!(Program::<DeBruijn>::unflat(&e.buffer).is_err());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn handles_deep_terms_in_bounded_stack() {
+        use crate::ast::{FakeNamedDeBruijn, NamedDeBruijn};
+
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 500;
+
+        type Nest = fn(Term<DeBruijn>) -> Term<DeBruijn>;
+
+        let nests: [Nest; 8] = [
+            |term| term.delay(),
+            |term| term.force(),
+            |term| Term::Lambda {
+                parameter_name: DeBruijn::new(0).into(),
+                body: term.into(),
+            },
+            |term| term.apply(Term::unit()),
+            |term| Term::unit().apply(term),
+            |term| Term::Constr {
+                tag: 0,
+                fields: vec![Term::unit(), term, Term::unit()],
+            },
+            |term| Term::Case {
+                constr: term.into(),
+                branches: vec![Term::unit()],
+            },
+            |term| Term::Case {
+                constr: Term::unit().into(),
+                branches: vec![Term::unit(), term],
+            },
+        ];
+
+        // Far too little to walk the nesting recursively.
+        std::thread::Builder::new()
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                for nest in nests {
+                    let program = Program::<DeBruijn> {
+                        version: (1, 1, 0),
+                        term: (0..DEPTH).fold(Term::Error, |term, _| nest(term)),
+                    };
+
+                    let bytes = program.to_flat().unwrap();
+                    let decoded = Program::<DeBruijn>::unflat(&bytes).unwrap();
+                    assert_eq!(decoded, program);
+                    assert_eq!(decoded.clone(), program);
+                    assert!(format!("{decoded:?}").len() < 1 << 20);
+
+                    let named: Program<NamedDeBruijn> = decoded.into();
+                    let fake: Program<FakeNamedDeBruijn> = named.clone().into();
+                    let name: Program<Name> = named.try_into().unwrap();
+                    assert_eq!(Program::<DeBruijn>::try_from(name).unwrap(), program);
+                    assert_eq!(
+                        Program::<DeBruijn>::from(Program::<NamedDeBruijn>::from(fake)),
+                        program
+                    );
+
+                    // Logged on the way to a failure: the bytes end inside the
+                    // nesting.
+                    assert!(Program::<DeBruijn>::unflat(&bytes[..bytes.len() / 2]).is_err());
+                }
             })
             .unwrap()
             .join()

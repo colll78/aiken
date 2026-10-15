@@ -243,7 +243,7 @@ impl UnitTest {
         };
 
         let mut logs = Vec::new();
-        if let Err(err) = eval_result.result()
+        if let Some(err) = eval_result.error()
             && tracing.trace_level(false) == TraceLevel::Verbose
         {
             logs.push(format!("{err}"))
@@ -583,12 +583,12 @@ impl Benchmark {
                 Ok(Some((new_prng, value))) => {
                     prng = new_prng;
                     let result = self.eval(&value, plutus_version);
-                    match result.result() {
-                        Ok(_) => measures.push((size, result.cost())),
-                        Err(uplc_error) => {
+                    match result.error() {
+                        None => measures.push((size, result.cost())),
+                        Some(uplc_error) => {
                             error = Some(BenchmarkError::BenchError {
                                 logs: result.logs(),
-                                uplc_error,
+                                uplc_error: uplc_error.clone(),
                             });
                         }
                     }

@@ -3,13 +3,18 @@ use super::{
     runtime::{BuiltinRuntime, BuiltinSemantics},
 };
 use crate::{
-    ast::{Constant, Data, ListSpine, NamedDeBruijn, Term, Type},
+    ast::{Constant, Data, DebugDepth, ListSpine, NamedDeBruijn, Term, Type},
     builtins::DefaultFunction,
 };
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use pallas_primitives::conway;
-use std::{mem::size_of, ops::Deref, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    mem::size_of,
+    ops::{Deref, DerefMut},
+    rc::Rc,
+};
 
 /// Number of bindings per environment chunk. Extending a shared environment
 /// copies at most one chunk, so applications cost O(ENV_CHUNK) instead of
@@ -29,6 +34,12 @@ pub struct Env(Option<Rc<EnvChunk>>);
 pub struct EnvChunk {
     values: Vec<Value>,
     parent: Env,
+}
+
+impl Drop for EnvChunk {
+    fn drop(&mut self) {
+        drop_nested(&mut self.values, std::mem::take(&mut self.parent));
+    }
 }
 
 impl Clone for EnvChunk {
@@ -81,6 +92,15 @@ impl Env {
         }
     }
 
+    /// Whether both environments are the very same bindings.
+    fn same(&self, other: &Env) -> bool {
+        match (&self.0, &other.0) {
+            (Some(left), Some(right)) => Rc::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     /// Bindings from the most recent to the oldest.
     pub fn iter(&self) -> impl Iterator<Item = &Value> {
         let mut chunk = self.0.as_deref();
@@ -100,7 +120,11 @@ impl PartialEq for Env {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Values can nest as deep as an evaluation makes them (closures capturing
+/// closures, constructors holding constructors), so cloning, comparing,
+/// formatting and dropping them do not recurse (see [`Values`] and
+/// [`EnvChunk`] for dropping).
+#[derive(Clone)]
 pub enum Value {
     Con(Rc<Constant>),
     Delay(Rc<Term<NamedDeBruijn>>, Env),
@@ -118,8 +142,249 @@ pub enum Value {
     /// whole structure.
     Constr {
         tag: u64,
-        fields: Rc<Vec<Value>>,
+        fields: Rc<Values>,
     },
+}
+
+/// The values a value holds: the fields of a constr, or the arguments of a
+/// builtin. It dereferences to a `Vec<Value>`.
+#[derive(Clone, Default, PartialEq)]
+pub struct Values(Vec<Value>);
+
+impl Values {
+    pub fn into_vec(mut self) -> Vec<Value> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl From<Vec<Value>> for Values {
+    fn from(values: Vec<Value>) -> Self {
+        Values(values)
+    }
+}
+
+impl FromIterator<Value> for Values {
+    fn from_iter<I: IntoIterator<Item = Value>>(values: I) -> Self {
+        Values(values.into_iter().collect())
+    }
+}
+
+impl Deref for Values {
+    type Target = Vec<Value>;
+
+    fn deref(&self) -> &Vec<Value> {
+        &self.0
+    }
+}
+
+impl DerefMut for Values {
+    fn deref_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.0
+    }
+}
+
+impl std::fmt::Debug for Values {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Drop for Values {
+    fn drop(&mut self) {
+        drop_nested(&mut self.0, Env::default());
+    }
+}
+
+/// How many collections of values (environment chunks, constr fields and
+/// builtin arguments) may be dropped inside one another before deeper ones
+/// are queued instead, so that dropping a deeply nested value or a long
+/// environment uses bounded stack while dropping a shallow one costs next to
+/// nothing more.
+const MAX_NESTED_VALUE_DROPS: usize = 512;
+
+std::thread_local! {
+    /// How many collections of values are being dropped inside one another on
+    /// this thread.
+    static VALUE_DROP_DEPTH: Cell<usize> = const { Cell::new(0) };
+
+    /// Whether `DEFERRED_VALUE_DROPS` may hold anything.
+    static VALUE_DROPS_DEFERRED: Cell<bool> = const { Cell::new(false) };
+
+    /// What collections dropped too deep held, left for the outermost drop.
+    static DEFERRED_VALUE_DROPS: RefCell<Vec<(Vec<Value>, Env)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Drops what a collection being dropped holds: its values and, for an
+/// environment chunk, the environment it extends.
+#[inline]
+fn drop_nested(values: &mut Vec<Value>, parent: Env) {
+    if values.is_empty() && parent.0.is_none() {
+        return;
+    }
+
+    let depth = VALUE_DROP_DEPTH.get();
+
+    if depth >= MAX_NESTED_VALUE_DROPS {
+        defer_drop(std::mem::take(values), parent);
+
+        return;
+    }
+
+    VALUE_DROP_DEPTH.set(depth + 1);
+    values.clear();
+    drop(parent);
+
+    if depth == 0 && VALUE_DROPS_DEFERRED.get() {
+        drop_deferred();
+    }
+
+    VALUE_DROP_DEPTH.set(depth);
+}
+
+#[cold]
+fn defer_drop(values: Vec<Value>, parent: Env) {
+    // Only fails while the thread is exiting, when its locals are being
+    // destroyed; what is left is then dropped right here.
+    let _ = DEFERRED_VALUE_DROPS.try_with(|deferred| {
+        deferred.borrow_mut().push((values, parent));
+    });
+
+    VALUE_DROPS_DEFERRED.set(true);
+}
+
+#[cold]
+fn drop_deferred() {
+    while let Some(nested) = DEFERRED_VALUE_DROPS
+        .try_with(|deferred| deferred.borrow_mut().pop())
+        .ok()
+        .flatten()
+    {
+        drop(nested);
+    }
+
+    VALUE_DROPS_DEFERRED.set(false);
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+
+        // Pairs up the values of two sequences to compare next, if their
+        // lengths match.
+        fn pair_up<'a>(
+            pending: &mut Vec<(&'a Value, &'a Value)>,
+            left: impl Iterator<Item = &'a Value>,
+            mut right: impl Iterator<Item = &'a Value>,
+        ) -> bool {
+            for left in left {
+                let Some(right) = right.next() else {
+                    return false;
+                };
+
+                pending.push((left, right));
+            }
+
+            right.next().is_none()
+        }
+
+        while let Some(pair) = pending.pop() {
+            let equal = match pair {
+                (Value::Con(left), Value::Con(right)) => left == right,
+                (Value::Delay(left_body, left_env), Value::Delay(right_body, right_env)) => {
+                    (Rc::ptr_eq(left_body, right_body) || left_body == right_body)
+                        && (left_env.same(right_env)
+                            || pair_up(&mut pending, left_env.iter(), right_env.iter()))
+                }
+                (
+                    Value::Lambda {
+                        parameter_name: left_name,
+                        body: left_body,
+                        env: left_env,
+                    },
+                    Value::Lambda {
+                        parameter_name: right_name,
+                        body: right_body,
+                        env: right_env,
+                    },
+                ) => {
+                    left_name == right_name
+                        && (Rc::ptr_eq(left_body, right_body) || left_body == right_body)
+                        && (left_env.same(right_env)
+                            || pair_up(&mut pending, left_env.iter(), right_env.iter()))
+                }
+                (
+                    Value::Builtin {
+                        fun: left_fun,
+                        runtime: left,
+                    },
+                    Value::Builtin {
+                        fun: right_fun,
+                        runtime: right,
+                    },
+                ) => {
+                    left_fun == right_fun
+                        && left.fun == right.fun
+                        && left.forces == right.forces
+                        && pair_up(&mut pending, left.args().iter(), right.args().iter())
+                }
+                (
+                    Value::Constr {
+                        tag: left_tag,
+                        fields: left,
+                    },
+                    Value::Constr {
+                        tag: right_tag,
+                        fields: right,
+                    },
+                ) => {
+                    left_tag == right_tag
+                        && (Rc::ptr_eq(left, right)
+                            || pair_up(&mut pending, left.iter(), right.iter()))
+                }
+                _ => false,
+            };
+
+            if !equal {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+impl std::fmt::Debug for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(_depth) = DebugDepth::enter() else {
+            return f.write_str("..");
+        };
+
+        match self {
+            Value::Con(constant) => f.debug_tuple("Con").field(constant).finish(),
+            Value::Delay(body, env) => f.debug_tuple("Delay").field(body).field(env).finish(),
+            Value::Lambda {
+                parameter_name,
+                body,
+                env,
+            } => f
+                .debug_struct("Lambda")
+                .field("parameter_name", parameter_name)
+                .field("body", body)
+                .field("env", env)
+                .finish(),
+            Value::Builtin { fun, runtime } => f
+                .debug_struct("Builtin")
+                .field("fun", fun)
+                .field("runtime", runtime)
+                .finish(),
+            Value::Constr { tag, fields } => f
+                .debug_struct("Constr")
+                .field("tag", tag)
+                .field("fields", fields)
+                .finish(),
+        }
+    }
 }
 
 impl Value {

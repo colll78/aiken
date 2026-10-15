@@ -10,6 +10,7 @@ use crate::{
         eval_result::EvalResult,
     },
     optimize::interner::CodeGenInterner,
+    rebuild::{Rebuild, rebuild},
     tx::script_context::PlutusScript,
 };
 use num_bigint::BigInt;
@@ -28,8 +29,8 @@ use serde::{
 use std::{
     cell::{Cell, UnsafeCell},
     collections::BTreeMap,
-    convert::AsRef,
-    fmt::{self, Display},
+    convert::{AsRef, Infallible},
+    fmt::{self, Debug, Display},
     hash::{self, Hash},
     mem::MaybeUninit,
     rc::Rc,
@@ -334,7 +335,9 @@ impl Program<DeBruijn> {
 /// Specifically, `Var` and `parameter_name` in `Lambda` can be a `Name`,
 /// `NamedDebruijn`, or `DeBruijn`. When encoded to flat for on chain usage
 /// we must encode using the `DeBruijn` form.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Terms can nest deeper than the stack would allow a recursive walk to go:
+/// cloning, comparing, formatting and dropping them do not recurse.
 pub enum Term<T> {
     // tag: 0
     Var(Rc<T>),
@@ -377,33 +380,460 @@ impl<T: Clone> Term<T> {
     /// from several threads on terms that share `Rc` nodes — which `Rc`'s
     /// non-atomic counts would otherwise forbid.
     pub fn deep_clone(&self) -> Term<T> {
+        struct DeepClone;
+
+        impl<T: Clone> Rebuild<T, T> for DeepClone {
+            type Error = Infallible;
+
+            fn var(&mut self, name: &Rc<T>) -> Result<Rc<T>, Infallible> {
+                Ok(Rc::new(name.as_ref().clone()))
+            }
+
+            fn enter_lambda(&mut self, parameter_name: &Rc<T>) -> Result<Rc<T>, Infallible> {
+                Ok(Rc::new(parameter_name.as_ref().clone()))
+            }
+
+            fn constant(&mut self, constant: &Rc<Constant>) -> Rc<Constant> {
+                Rc::new(constant.deep_clone())
+            }
+        }
+
+        match rebuild(self, &mut DeepClone) {
+            Ok(term) => term,
+            Err(never) => match never {},
+        }
+    }
+}
+
+impl<T> Clone for Term<T> {
+    fn clone(&self) -> Self {
         match self {
-            Term::Var(name) => Term::Var(Rc::new(name.as_ref().clone())),
-            Term::Delay(term) => Term::Delay(Rc::new(term.deep_clone())),
+            Term::Var(name) => Term::Var(name.clone()),
+            Term::Delay(body) => Term::Delay(body.clone()),
             Term::Lambda {
                 parameter_name,
                 body,
             } => Term::Lambda {
-                parameter_name: Rc::new(parameter_name.as_ref().clone()),
-                body: Rc::new(body.deep_clone()),
+                parameter_name: parameter_name.clone(),
+                body: body.clone(),
             },
             Term::Apply { function, argument } => Term::Apply {
-                function: Rc::new(function.deep_clone()),
-                argument: Rc::new(argument.deep_clone()),
+                function: function.clone(),
+                argument: argument.clone(),
             },
-            Term::Constant(constant) => Term::Constant(Rc::new(constant.deep_clone())),
-            Term::Force(term) => Term::Force(Rc::new(term.deep_clone())),
+            Term::Constant(constant) => Term::Constant(constant.clone()),
+            Term::Force(body) => Term::Force(body.clone()),
             Term::Error => Term::Error,
             Term::Builtin(fun) => Term::Builtin(*fun),
-            Term::Constr { tag, fields } => Term::Constr {
-                tag: *tag,
-                fields: fields.iter().map(|field| field.deep_clone()).collect(),
-            },
-            Term::Case { constr, branches } => Term::Case {
-                constr: Rc::new(constr.deep_clone()),
-                branches: branches.iter().map(|branch| branch.deep_clone()).collect(),
-            },
+            // These hold their subterms inline, so they are copied too, and may
+            // nest any depth of other constr and case terms.
+            Term::Constr { .. } | Term::Case { .. } => {
+                struct Clone;
+
+                impl<T> Rebuild<T, T> for Clone {
+                    type Error = Infallible;
+
+                    fn var(&mut self, name: &Rc<T>) -> Result<Rc<T>, Infallible> {
+                        Ok(name.clone())
+                    }
+
+                    fn enter_lambda(&mut self, name: &Rc<T>) -> Result<Rc<T>, Infallible> {
+                        Ok(name.clone())
+                    }
+
+                    fn shared(&mut self, term: &Rc<Term<T>>) -> Option<Rc<Term<T>>> {
+                        Some(term.clone())
+                    }
+                }
+
+                match rebuild(self, &mut Clone) {
+                    Ok(term) => term,
+                    Err(never) => match never {},
+                }
+            }
         }
+    }
+}
+
+impl<T: PartialEq> PartialEq for Term<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.eq_recursively(other, 0)
+    }
+}
+
+/// How deep comparing terms recurses before it carries on with the pending
+/// pairs on the heap. Recursing is quicker, and real scripts are rarely this
+/// deep.
+const MAX_RECURSIVE_EQ_DEPTH: usize = 512;
+
+impl<T: PartialEq> Term<T> {
+    fn eq_recursively(&self, other: &Self, depth: usize) -> bool {
+        if depth >= MAX_RECURSIVE_EQ_DEPTH {
+            return self.eq_iteratively(other);
+        }
+
+        let depth = depth + 1;
+
+        match (self, other) {
+            (Term::Var(left), Term::Var(right)) => left == right,
+            (Term::Delay(left), Term::Delay(right)) | (Term::Force(left), Term::Force(right)) => {
+                left.eq_recursively(right, depth)
+            }
+            (
+                Term::Lambda {
+                    parameter_name: left_name,
+                    body: left,
+                },
+                Term::Lambda {
+                    parameter_name: right_name,
+                    body: right,
+                },
+            ) => left_name == right_name && left.eq_recursively(right, depth),
+            (
+                Term::Apply {
+                    function: left_function,
+                    argument: left_argument,
+                },
+                Term::Apply {
+                    function: right_function,
+                    argument: right_argument,
+                },
+            ) => {
+                left_function.eq_recursively(right_function, depth)
+                    && left_argument.eq_recursively(right_argument, depth)
+            }
+            (Term::Constant(left), Term::Constant(right)) => left == right,
+            (Term::Error, Term::Error) => true,
+            (Term::Builtin(left), Term::Builtin(right)) => left == right,
+            (
+                Term::Constr {
+                    tag: left_tag,
+                    fields: left,
+                },
+                Term::Constr {
+                    tag: right_tag,
+                    fields: right,
+                },
+            ) => {
+                left_tag == right_tag
+                    && left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left.eq_recursively(right, depth))
+            }
+            (
+                Term::Case {
+                    constr: left_constr,
+                    branches: left,
+                },
+                Term::Case {
+                    constr: right_constr,
+                    branches: right,
+                },
+            ) => {
+                left.len() == right.len()
+                    && left_constr.eq_recursively(right_constr, depth)
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left.eq_recursively(right, depth))
+            }
+            _ => false,
+        }
+    }
+
+    fn eq_iteratively(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+
+        while let Some(pair) = pending.pop() {
+            match pair {
+                (Term::Var(left), Term::Var(right)) => {
+                    if left != right {
+                        return false;
+                    }
+                }
+                (Term::Delay(left), Term::Delay(right))
+                | (Term::Force(left), Term::Force(right)) => pending.push((left, right)),
+                (
+                    Term::Lambda {
+                        parameter_name: left_name,
+                        body: left,
+                    },
+                    Term::Lambda {
+                        parameter_name: right_name,
+                        body: right,
+                    },
+                ) => {
+                    if left_name != right_name {
+                        return false;
+                    }
+
+                    pending.push((left, right));
+                }
+                (
+                    Term::Apply {
+                        function: left_function,
+                        argument: left_argument,
+                    },
+                    Term::Apply {
+                        function: right_function,
+                        argument: right_argument,
+                    },
+                ) => {
+                    pending.push((left_argument, right_argument));
+                    pending.push((left_function, right_function));
+                }
+                (Term::Constant(left), Term::Constant(right)) => {
+                    if left != right {
+                        return false;
+                    }
+                }
+                (Term::Error, Term::Error) => {}
+                (Term::Builtin(left), Term::Builtin(right)) => {
+                    if left != right {
+                        return false;
+                    }
+                }
+                (
+                    Term::Constr {
+                        tag: left_tag,
+                        fields: left,
+                    },
+                    Term::Constr {
+                        tag: right_tag,
+                        fields: right,
+                    },
+                ) => {
+                    if left_tag != right_tag || left.len() != right.len() {
+                        return false;
+                    }
+
+                    pending.extend(left.iter().zip(right).rev());
+                }
+                (
+                    Term::Case {
+                        constr: left_constr,
+                        branches: left,
+                    },
+                    Term::Case {
+                        constr: right_constr,
+                        branches: right,
+                    },
+                ) => {
+                    if left.len() != right.len() {
+                        return false;
+                    }
+
+                    pending.extend(left.iter().zip(right).rev());
+                    pending.push((left_constr, right_constr));
+                }
+                _ => return false,
+            }
+        }
+
+        true
+    }
+}
+
+impl<T: Debug> Debug for Term<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Some(_depth) = DebugDepth::enter() else {
+            return f.write_str("..");
+        };
+
+        match self {
+            Term::Var(name) => f.debug_tuple("Var").field(name).finish(),
+            Term::Delay(body) => f.debug_tuple("Delay").field(body).finish(),
+            Term::Lambda {
+                parameter_name,
+                body,
+            } => f
+                .debug_struct("Lambda")
+                .field("parameter_name", parameter_name)
+                .field("body", body)
+                .finish(),
+            Term::Apply { function, argument } => f
+                .debug_struct("Apply")
+                .field("function", function)
+                .field("argument", argument)
+                .finish(),
+            Term::Constant(constant) => f.debug_tuple("Constant").field(constant).finish(),
+            Term::Force(body) => f.debug_tuple("Force").field(body).finish(),
+            Term::Error => f.write_str("Error"),
+            Term::Builtin(fun) => f.debug_tuple("Builtin").field(fun).finish(),
+            Term::Constr { tag, fields } => f
+                .debug_struct("Constr")
+                .field("tag", tag)
+                .field("fields", fields)
+                .finish(),
+            Term::Case { constr, branches } => f
+                .debug_struct("Case")
+                .field("constr", constr)
+                .field("branches", branches)
+                .finish(),
+        }
+    }
+}
+
+/// How many terms may be dropped inside one another before the subterms of
+/// deeper ones are dropped one after the other instead, so that dropping a
+/// deeply nested term uses bounded stack while dropping a shallow one costs
+/// next to nothing more.
+const MAX_NESTED_TERM_DROPS: usize = 512;
+
+std::thread_local! {
+    /// How many terms are being dropped inside one another on this thread.
+    static TERM_DROP_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+impl<T> Drop for Term<T> {
+    fn drop(&mut self) {
+        // Nothing but leaves would be dropped inside this term, which is most
+        // of the time, so it can be left to the drop glue.
+        let nests = match self {
+            Term::Var(_) | Term::Constant(_) | Term::Builtin(_) | Term::Error => false,
+            Term::Delay(body) | Term::Force(body) | Term::Lambda { body, .. } => owns_branch(body),
+            Term::Apply { function, argument } => owns_branch(function) || owns_branch(argument),
+            Term::Constr { .. } | Term::Case { .. } => true,
+        };
+
+        if !nests {
+            return;
+        }
+
+        let depth = TERM_DROP_DEPTH.get();
+
+        if depth >= MAX_NESTED_TERM_DROPS {
+            let mut owned = Vec::new();
+
+            self.take_owned_subterms(&mut owned);
+
+            // Each of these is dropped at this same depth, so it gives up
+            // its own subterms here rather than dropping them.
+            while let Some(mut term) = owned.pop() {
+                term.take_owned_subterms(&mut owned);
+            }
+
+            return;
+        }
+
+        TERM_DROP_DEPTH.set(depth + 1);
+
+        let term = std::mem::ManuallyDrop::new(std::mem::replace(self, Term::Error));
+
+        // SAFETY: `term` is never dropped, so each of its fields is read out
+        // of it and dropped exactly once, here.
+        unsafe {
+            use std::ptr::read;
+
+            match &*term {
+                Term::Var(name) => drop(read(name)),
+                Term::Delay(body) | Term::Force(body) => drop(read(body)),
+                Term::Lambda {
+                    parameter_name,
+                    body,
+                } => {
+                    drop(read(parameter_name));
+                    drop(read(body));
+                }
+                Term::Apply { function, argument } => {
+                    drop(read(function));
+                    drop(read(argument));
+                }
+                Term::Constant(constant) => drop(read(constant)),
+                Term::Constr { fields, .. } => drop(read(fields)),
+                Term::Case { constr, branches } => {
+                    drop(read(constr));
+                    drop(read(branches));
+                }
+                Term::Builtin(_) | Term::Error => {}
+            }
+        }
+
+        TERM_DROP_DEPTH.set(depth);
+    }
+}
+
+/// Whether dropping `term` here would drop a term that has subterms.
+fn owns_branch<T>(term: &Rc<Term<T>>) -> bool {
+    Rc::strong_count(term) == 1
+        && !matches!(
+            term.as_ref(),
+            Term::Var(_) | Term::Constant(_) | Term::Builtin(_) | Term::Error
+        )
+}
+
+impl<T> Term<T> {
+    /// Moves into `owned` the subterms that only this term holds, and that
+    /// would otherwise be dropped recursively along with it.
+    fn take_owned_subterms(&mut self, owned: &mut Vec<Term<T>>) {
+        fn take<T>(term: &mut Rc<Term<T>>, owned: &mut Vec<Term<T>>) {
+            if let Some(term) = Rc::get_mut(term) {
+                owned.push(std::mem::replace(term, Term::Error));
+            }
+        }
+
+        match self {
+            Term::Delay(body) | Term::Force(body) | Term::Lambda { body, .. } => take(body, owned),
+            Term::Apply { function, argument } => {
+                take(function, owned);
+                take(argument, owned);
+            }
+            Term::Constr { fields, .. } => owned.append(fields),
+            Term::Case { constr, branches } => {
+                take(constr, owned);
+                owned.append(branches);
+            }
+            Term::Var(_) | Term::Constant(_) | Term::Builtin(_) | Term::Error => {}
+        }
+    }
+}
+
+/// How many terms or values a `Debug` impl may format inside one another on
+/// this thread.
+const MAX_DEBUG_DEPTH: usize = 128;
+
+/// How many terms or values a single `Debug` output may format. Values share
+/// their parts, so one that is small in memory can unfold into exponentially
+/// many.
+const MAX_DEBUG_ENTRIES: usize = 4096;
+
+std::thread_local! {
+    static DEBUG_DEPTH: Cell<usize> = const { Cell::new(0) };
+    static DEBUG_ENTRIES: Cell<usize> = const { Cell::new(0) };
+}
+
+/// One level of nesting in `Debug` output, which is elided past
+/// `MAX_DEBUG_DEPTH` levels or `MAX_DEBUG_ENTRIES` entries so that formatting
+/// (in an error message, say) can neither overflow the stack nor run away.
+pub(crate) struct DebugDepth(());
+
+impl DebugDepth {
+    pub(crate) fn enter() -> Option<DebugDepth> {
+        let depth = DEBUG_DEPTH.get();
+
+        // A new output starts.
+        if depth == 0 {
+            DEBUG_ENTRIES.set(0);
+        }
+
+        let entries = DEBUG_ENTRIES.get();
+
+        if depth >= MAX_DEBUG_DEPTH || entries >= MAX_DEBUG_ENTRIES {
+            return None;
+        }
+
+        DEBUG_DEPTH.set(depth + 1);
+        DEBUG_ENTRIES.set(entries + 1);
+
+        Some(DebugDepth(()))
+    }
+}
+
+impl Drop for DebugDepth {
+    fn drop(&mut self) {
+        DEBUG_DEPTH.set(DEBUG_DEPTH.get() - 1);
     }
 }
 
@@ -447,8 +877,8 @@ impl<T> TryInto<PlutusData> for Term<T> {
     type Error = String;
 
     fn try_into(self) -> Result<PlutusData, String> {
-        match self {
-            Term::Constant(rc) => match &*rc {
+        match &self {
+            Term::Constant(rc) => match rc.as_ref() {
                 Constant::Data(data) => data
                     .try_into()
                     .map_err(|e: crate::data::ConstrIndexOutOfRange| e.to_string()),
@@ -1716,10 +2146,10 @@ impl Program<NamedDeBruijn> {
             200,
         );
 
-        let term = machine.run_program(self);
+        let value = machine.evaluate_program(self);
 
-        EvalResult::new(
-            term,
+        EvalResult::returning(
+            value,
             machine.ex_budget,
             initial_budget,
             machine.traces,
@@ -1731,10 +2161,10 @@ impl Program<NamedDeBruijn> {
     pub fn eval_version(self, initial_budget: ExBudget, version: &Language) -> EvalResult {
         let mut machine = Machine::new(version.clone(), CostModel::default(), initial_budget, 200);
 
-        let term = machine.run_program(self);
+        let value = machine.evaluate_program(self);
 
-        EvalResult::new(
-            term,
+        EvalResult::returning(
+            value,
             machine.ex_budget,
             initial_budget,
             machine.traces,
@@ -1759,10 +2189,10 @@ impl Program<NamedDeBruijn> {
             200,
         );
 
-        let term = machine.run_program(self);
+        let value = machine.evaluate_program(self);
 
-        EvalResult::new(
-            term,
+        EvalResult::returning(
+            value,
             machine.ex_budget,
             initial_budget,
             machine.traces,
@@ -1785,10 +2215,10 @@ impl Program<NamedDeBruijn> {
             200, //slippage
         );
 
-        let term = machine.run_program(self);
+        let value = machine.evaluate_program(self);
 
-        EvalResult::new(
-            term,
+        EvalResult::returning(
+            value,
             machine.ex_budget,
             budget,
             machine.traces,
@@ -1815,10 +2245,10 @@ impl Program<NamedDeBruijn> {
             200, //slippage
         );
 
-        let term = machine.run_program(self);
+        let value = machine.evaluate_program(self);
 
-        EvalResult::new(
-            term,
+        EvalResult::returning(
+            value,
             machine.ex_budget,
             budget,
             machine.traces,
@@ -1834,10 +2264,10 @@ impl Program<NamedDeBruijn> {
             200, //slippage
         );
 
-        let term = machine.run_program(self);
+        let value = machine.evaluate_program(self);
 
-        EvalResult::new(
-            term,
+        EvalResult::returning(
+            value,
             machine.ex_budget,
             initial_budget,
             machine.traces,
