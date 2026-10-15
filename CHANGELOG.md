@@ -23,7 +23,7 @@
 ### Fixed
 
 - **uplc**: Name Plutus V1, not V2, in the error reported when a V1 script is evaluated without a V1 cost model. @colll78
-- **uplc**: Drop deeply nested lists and `Data` without overflowing the stack. @colll78
+- **uplc**: Drop deeply nested lists and `Data`, and decode, compare (`equalsData`) and serialise (`serialiseData`) deeply nested `Data`, without overflowing the stack. @colll78
 - **uplc**: Reject a flat-encoded natural (constr tag, de Bruijn index or version number) that does not fit in 64 bits instead of truncating it: a constr tag of 2^64 used to decode as 0. Constr tags are now `u64` on every target, which changes `Term::Constr`, `Value::Constr` and `Term::constr`. @colll78
 - **uplc**: Reject `constr` and `case` in programs of a UPLC version before 1.1.0, when parsing and when decoding flat. @colll78
 - **uplc**: Decode scripts as the ledger does: reject bytes after a flat program or after a Plutus V3 script's CBOR, constants whose type takes more than 32 tags, `constr` terms with more than 1024 fields, and UPLC versions or ledger languages not yet available at the protocol version. @colll78
@@ -37,6 +37,7 @@
 - **uplc**: Check the arguments of the secp256k1 builtins as Plutus does on every target: a key, signature or hash of the wrong length, or an uncompressed ECDSA key, fails instead of panicking or verifying, and a signature with a zero component verifies as false on wasm. @colll78
 - **uplc**: Before protocol version 11, let `constrData` take any integer index, as Plutus does. `Data` now converts to `PlutusData` with `TryFrom`, failing on an index outside 64 bits, and `Constr::constr_index` returns a `ConstrIndex`. @colll78
 - **uplc**: Serialise `Data` canonically, as Plutus does, whatever encoding it was decoded from (`102([0, []])` serialises as `121([])`, and `2(h'01')` as `1`), and compare negative big integers by value in `equalsData`. @colll78
+- **uplc**: Decode `Data` as Plutus does, rejecting what pallas accepts but Plutus does not: byte strings and big integers with a chunk of more than 64 bytes, a big integer tag not written in a single byte (`d8 02 41 01`), and a tag 102 constructor that is not exactly a pair of an index and fields. @colll78
 
 ## v1.1.24 - 2026-09-26
 
