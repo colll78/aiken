@@ -1143,6 +1143,44 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn decodes_like_pallas_where_plutus_agrees(
+            pallas in arb_plutus_data(),
+            cut in any::<prop::sample::Index>(),
+            at in any::<prop::sample::Index>(),
+            byte in any::<u8>(),
+        ) {
+            let bytes = pallas.encode_fragment().unwrap();
+            let mut changed = bytes.clone();
+            changed[at.index(bytes.len())] = byte;
+
+            // What pallas encodes is Data to Plutus too.
+            prop_assert!(Data::decode_fragment(&bytes).is_ok());
+
+            for bytes in [&bytes[..], &bytes[..cut.index(bytes.len())], &changed[..]] {
+                match (Data::decode_fragment(bytes), PlutusData::decode_fragment(bytes)) {
+                    (Ok(data), Ok(expected)) => {
+                        prop_assert_eq!(data.to_cbor(), expected.encode_fragment().unwrap());
+                        prop_assert_eq!(data, Data::from(expected));
+                    }
+                    (Ok(data), Err(error)) => {
+                        prop_assert!(false, "{}: {error}, yet decoded {data:?}", hex::encode(bytes));
+                    }
+                    // Plutus only rejects an encoding pallas accepts, never
+                    // the Data it encodes: pallas' own encoding of that Data
+                    // decodes, as the same Data.
+                    (Err(_), Ok(expected)) => {
+                        let reencoded = expected.encode_fragment().unwrap();
+                        prop_assert_eq!(
+                            Data::decode_fragment(&reencoded).map_err(|e| e.to_string()),
+                            Ok(Data::from(expected))
+                        );
+                    }
+                    (Err(_), Err(_)) => {}
+                }
+            }
+        }
+
+        #[test]
         fn serialises_like_pallas(pallas in arb_plutus_data()) {
             let serialised = Data::from(&pallas).serialise();
 
@@ -1309,6 +1347,28 @@ pub(crate) mod tests {
             // Constructor fields that are not an array.
             "d879a0",
             "d87900",
+            "d866820000",
+            // A break in place of a map value.
+            "bf00ff",
+            "a100ff",
+            // Lengths far beyond the input.
+            "bbffffffffffffffff",
+            "9bffffffffffffffff",
+            "d8799bffffffffffffffff",
+            // More tags that are neither a constructor nor a big integer.
+            "d9010000",
+            "c000",
+            "c19f00ff",
+            // Truncated and malformed items inside containers.
+            "d8668201",
+            "9f9f00ff",
+            "a1a10000",
+            "d8799f5f4100ff",
+            "d8799f5f41ff",
+            "9f1cff",
+            "81",
+            "8200",
+            "bf",
         ] {
             let bytes = hex::decode(hex).unwrap();
 
@@ -1407,6 +1467,147 @@ pub(crate) mod tests {
             .join()
             .unwrap();
     }
+    /// Data nested `depth` levels deep in each shape and encoding, with the
+    /// CBOR `serialiseData` gives it. `leaf` is the innermost item.
+    fn deep_data(depth: usize, leaf: &str) -> Vec<(&'static str, Vec<u8>, Vec<u8>)> {
+        let nest = |open: &str, inner: &str, close: &str| {
+            hex::decode(open.repeat(depth) + inner + &close.repeat(depth)).unwrap()
+        };
+
+        [
+            ("constr", ("d87981", ""), ("d8799f", "ff")),
+            ("indefinite constr", ("d8799f", "ff"), ("d8799f", "ff")),
+            (
+                "general constr",
+                ("d86682188081", ""),
+                ("d8668218809f", "ff"),
+            ),
+            ("list", ("81", ""), ("9f", "ff")),
+            ("indefinite list", ("9f", "ff"), ("9f", "ff")),
+            ("map value", ("a100", ""), ("a100", "")),
+            ("indefinite map value", ("bf00", "ff"), ("a100", "")),
+            ("map key", ("a1", "00"), ("a1", "00")),
+            ("indefinite map key", ("bf", "00ff"), ("a1", "00")),
+        ]
+        .into_iter()
+        .map(
+            |(name, (open, close), (serialised_open, serialised_close))| {
+                (
+                    name,
+                    nest(open, leaf, close),
+                    nest(serialised_open, leaf, serialised_close),
+                )
+            },
+        )
+        .collect()
+    }
+
+    /// Runs `f` on a thread whose stack is far too small to walk the Data
+    /// `f` builds recursively.
+    fn in_small_stack(f: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn handles_every_deep_data_encoding_in_small_stack() {
+        #[cfg(not(miri))]
+        const DEPTH: usize = 100_000;
+        #[cfg(miri)]
+        const DEPTH: usize = 2_000;
+
+        in_small_stack(|| {
+            let zeros = deep_data(DEPTH, "00");
+            let ones = deep_data(DEPTH, "01");
+
+            for ((name, bytes, serialised), (_, other_bytes, _)) in zeros.iter().zip(&ones) {
+                let data = Data::decode_fragment(bytes).unwrap();
+                let again = Data::decode_fragment(bytes).unwrap();
+                let other = Data::decode_fragment(other_bytes).unwrap();
+
+                assert!(data.to_cbor() == *bytes, "{name}: encodes as decoded");
+                assert!(data.serialise() == *serialised, "{name}: serialises");
+                assert_eq!(data.cmp(&again), Ordering::Equal, "{name}");
+                assert_eq!(data.cmp(&other), Ordering::Less, "{name}");
+                assert_eq!(other.cmp(&data), Ordering::Greater, "{name}");
+            }
+
+            // Equal whatever the encoding, as at any depth.
+            for (left_name, left, left_serialised) in &zeros {
+                for (right_name, right, right_serialised) in &zeros {
+                    let left_data = Data::decode_fragment(left).unwrap();
+                    let right_data = Data::decode_fragment(right).unwrap();
+
+                    assert_eq!(
+                        left_data == right_data,
+                        left_serialised == right_serialised,
+                        "{left_name} and {right_name}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Compares its two arguments, then serialises the first: each walks the
+    /// whole Data.
+    fn compares_then_serialises() -> Program<NamedDeBruijn> {
+        crate::parser::program(
+            "(program 1.1.0
+              (lam a (lam b
+                (force [ [ [ (force (builtin ifThenElse))
+                             [ [ (builtin equalsData) a ] b ] ]
+                           (delay [ (builtin serialiseData) a ]) ]
+                         (delay (error)) ]))))",
+        )
+        .unwrap()
+        .try_into()
+        .unwrap()
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_family = "wasm",
+        ignore = "spawns a thread with a bounded stack"
+    )]
+    fn evaluates_deep_data_arguments_in_small_stack() {
+        // The result and cost of each evaluation, as they were when the Data
+        // was walked recursively, given enough stack.
+        for (name, cpu, mem) in [
+            ("list", 96_239_884_758, 802_312),
+            ("constr", 96_239_884_758, 802_312),
+            ("indefinite map value", 216_535_384_758, 1_802_312),
+        ] {
+            in_small_stack(move || {
+                let (_, bytes, serialised) = deep_data(100_000, "00")
+                    .into_iter()
+                    .find(|(shape, _, _)| *shape == name)
+                    .unwrap();
+                let argument = || Data::decode_fragment(&bytes).unwrap();
+                let result = compares_then_serialises()
+                    .apply_data(argument())
+                    .apply_data(argument())
+                    .eval(ExBudget::max());
+
+                assert_eq!(
+                    (name, result.result().unwrap(), result.cost()),
+                    (
+                        name,
+                        Term::Constant(Constant::ByteString(serialised).into()),
+                        ExBudget { mem, cpu },
+                    )
+                );
+            });
+        }
+    }
+
     #[test]
     fn equals_data_on_shared_and_unshared_trees() {
         let items = (0..50).map(|i| Data::integer(i.into())).collect::<Vec<_>>();
