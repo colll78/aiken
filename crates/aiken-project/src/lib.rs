@@ -58,6 +58,7 @@ use std::{
     io::BufReader,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::mpsc,
 };
 use telemetry::EventListener;
 use uplc::{
@@ -461,14 +462,15 @@ where
                 coverage_mode,
                 plain_numbers,
             } => {
-                let tests =
-                    self.collect_tests(verbose, match_tests, exact_match, options.tracing)?;
-
-                if !tests.is_empty() {
-                    self.event_listener.handle_event(Event::RunningTests);
-                }
-
-                let tests = self.run_runnables(tests, seed, property_max_success, options.tracing);
+                let tests = self.run_runnables(
+                    RunnableKind::Test,
+                    verbose,
+                    match_tests,
+                    exact_match,
+                    seed,
+                    property_max_success,
+                    options.tracing,
+                )?;
 
                 self.checks_count = if tests.is_empty() {
                     None
@@ -514,18 +516,15 @@ where
             } => {
                 let verbose = false;
 
-                let benchmarks = self.collect_benchmarks(
+                let benchmarks = self.run_runnables(
+                    RunnableKind::Bench,
                     verbose,
                     match_benchmarks,
                     exact_match,
+                    seed,
+                    max_size,
                     options.tracing,
                 )?;
-
-                if !benchmarks.is_empty() {
-                    self.event_listener.handle_event(Event::RunningBenchmarks);
-                }
-
-                let benchmarks = self.run_runnables(benchmarks, seed, max_size, options.tracing);
 
                 let errors: Vec<Error> = benchmarks
                     .iter()
@@ -949,15 +948,21 @@ where
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
-    fn collect_test_items(
+    /// Generate, optimize and run every selected test (or benchmark) of the
+    /// project, returning their results in collection order.
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    fn run_runnables(
         &mut self,
         kind: RunnableKind,
         verbose: bool,
         match_tests: Option<Vec<String>>,
         exact_match: bool,
+        seed: u32,
+        max_success: usize,
         tracing: Tracing,
-    ) -> Result<Vec<Test>, Error> {
+    ) -> Result<Vec<TestResult<UntypedExpr, UntypedExpr>>, Error> {
+        use rayon::prelude::*;
+
         let mut scripts = Vec::new();
 
         let match_tests = match_tests.map(|mt| {
@@ -1064,135 +1069,123 @@ where
             }
         }
 
-        let mut generator = self.new_generator(tracing);
-
-        let mut tests = Vec::new();
-
-        for (input_path, module_name, test) in scripts.into_iter() {
-            if verbose {
-                self.event_listener.handle_event(Event::GeneratingUPLCFor {
-                    name: test.name.clone(),
-                    path: input_path.clone(),
-                })
-            }
-
-            tests.push(Test::from_function_definition(
-                &mut generator,
-                test.to_owned(),
-                module_name,
-                input_path,
-                kind,
-            )?);
-        }
-
         // NOTE: The filtering syntax for tests isn't quite obvious. A common pitfall when willing
         // to match over a top-level module is to simple pass in `-m module_name`, which will be
         // treated as a match for a test name.
         //
         // In this case, we raise an additional warning to suggest a different match syntax, which
         // may be quite helpful in teaching users how to deal with module filtering.
-        match match_tests.as_deref() {
-            Some(&[(ref s, Some(ref names))]) if tests.is_empty() => {
-                if let [test] = names.as_slice() {
-                    self.warnings.push(Warning::SuspiciousTestMatch {
-                        test: if s.is_empty() {
-                            test.to_string()
-                        } else {
-                            s.to_string()
-                        },
-                    });
-                }
+        if scripts.is_empty() {
+            if let Some(&[(ref s, Some(ref names))]) = match_tests.as_deref()
+                && let [test] = names.as_slice()
+            {
+                self.warnings.push(Warning::SuspiciousTestMatch {
+                    test: if s.is_empty() {
+                        test.to_string()
+                    } else {
+                        s.to_string()
+                    },
+                });
             }
-            _ => (),
+
+            return Ok(Vec::new());
         }
 
-        Ok(tests)
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn collect_tests(
-        &mut self,
-        verbose: bool,
-        match_tests: Option<Vec<String>>,
-        exact_match: bool,
-        tracing: Tracing,
-    ) -> Result<Vec<Test>, Error> {
-        self.collect_test_items(
-            RunnableKind::Test,
-            verbose,
-            match_tests,
-            exact_match,
-            tracing,
-        )
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn collect_benchmarks(
-        &mut self,
-        verbose: bool,
-        match_tests: Option<Vec<String>>,
-        exact_match: bool,
-        tracing: Tracing,
-    ) -> Result<Vec<Test>, Error> {
-        self.collect_test_items(
-            RunnableKind::Bench,
-            verbose,
-            match_tests,
-            exact_match,
-            tracing,
-        )
-    }
-
-    fn run_runnables(
-        &self,
-        mut tests: Vec<Test>,
-        seed: u32,
-        max_success: usize,
-        tracing: Tracing,
-    ) -> Vec<TestResult<UntypedExpr, UntypedExpr>> {
-        use rayon::prelude::*;
-
-        let data_types = utils::indexmap::as_ref_values(&self.data_types);
+        self.event_listener.handle_event(match kind {
+            RunnableKind::Test => Event::RunningTests,
+            RunnableKind::Bench => Event::RunningBenchmarks,
+        });
 
         let plutus_version = &self.config.plutus;
+
+        let mut generator = self.new_generator(tracing);
 
         // The structural assertions hold typed expressions whose Rc-based
         // nodes are shared with the module ASTs; those reference counts are
         // not atomic, so keep the assertions on this thread rather than
-        // letting them cross into the parallel test runs below (indexed
-        // parallel iterators preserve order, so results line up with the
-        // assertions taken here).
-        let mut assertions = tests
-            .iter_mut()
-            .map(|test| match test {
-                Test::UnitTest(unit_test) => unit_test.assertion.take(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
+        // letting them cross into the parallel test runs below. They line up
+        // with the results by index.
+        let mut assertions = Vec::with_capacity(scripts.len());
 
-        let mut results = tests
-            .into_par_iter()
-            .map(|test| test.run(seed, max_success, plutus_version, tracing))
-            .collect::<Vec<TestResult<(Constant, Rc<Type>), PlutusData>>>();
+        // Tests are generated one at a time on this thread, which owns the
+        // code generator (it is not Send), and streamed to the thread pool
+        // through a bounded channel to be optimized and run. A test's programs
+        // are dropped once it has run (see `Test::run`), so only a few tests
+        // per thread are ever held in memory, however many are selected.
+        let mut results = std::thread::scope(|scope| -> Result<_, Error> {
+            let (sender, receiver) =
+                mpsc::sync_channel::<(usize, Test)>(rayon::current_num_threads());
+
+            let runner = scope.spawn(move || {
+                receiver
+                    .into_iter()
+                    .par_bridge()
+                    .map(|(index, test)| {
+                        (index, test.run(seed, max_success, plutus_version, tracing))
+                    })
+                    .collect::<Vec<(usize, TestResult<(Constant, Rc<Type>), PlutusData>)>>()
+            });
+
+            for (index, (input_path, module_name, test)) in scripts.into_iter().enumerate() {
+                if verbose {
+                    self.event_listener.handle_event(Event::GeneratingUPLCFor {
+                        name: test.name.clone(),
+                        path: input_path.clone(),
+                    })
+                }
+
+                let mut test = Test::from_function_definition(
+                    &mut generator,
+                    test.to_owned(),
+                    module_name,
+                    input_path,
+                    kind,
+                )?;
+
+                assertions.push(match &mut test {
+                    Test::UnitTest(unit_test) => unit_test.assertion.take(),
+                    _ => None,
+                });
+
+                // Only fails when the runner has stopped, i.e. panicked; the
+                // panic is resumed below.
+                if sender.send((index, test)).is_err() {
+                    break;
+                }
+            }
+
+            drop(sender);
+
+            Ok(runner
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+        })?;
+
+        drop(generator);
+
+        // The pool completes tests in any order.
+        results.sort_unstable_by_key(|(index, _)| *index);
 
         // Assertion operands are only displayed for failed unit tests, so
         // generating and evaluating them is deferred until here rather than
         // being paid for every unit test at collection time.
         let mut generator = self.new_generator(tracing);
 
-        for (result, assertion) in results.iter_mut().zip(assertions.iter_mut()) {
+        for ((_, result), assertion) in results.iter_mut().zip(assertions) {
             if let TestResult::UnitTestResult(unit) = result
                 && !unit.success
-                && let Some(assertion) = assertion.take()
+                && let Some(assertion) = assertion
             {
                 unit.assertion = Some(assertion.evaluate(&mut generator, &unit.test.module));
             }
         }
 
-        results
+        let data_types = utils::indexmap::as_ref_values(&self.data_types);
+
+        Ok(results
             .into_iter()
-            .map(|test| test.reify(&data_types))
-            .collect()
+            .map(|(_, test)| test.reify(&data_types))
+            .collect())
     }
 
     #[allow(clippy::result_large_err)]

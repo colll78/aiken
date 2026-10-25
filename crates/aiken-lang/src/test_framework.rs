@@ -187,7 +187,7 @@ impl Test {
         plutus_version: &PlutusVersion,
         tracing: Tracing,
     ) -> TestResult<(Constant, Rc<Type>), PlutusData> {
-        match self {
+        let mut result = match self {
             Test::UnitTest(unit_test) => {
                 TestResult::UnitTestResult(unit_test.run(plutus_version, tracing))
             }
@@ -197,7 +197,11 @@ impl Test {
             Test::Benchmark(benchmark) => {
                 TestResult::BenchmarkResult(benchmark.run(seed, max_success, plutus_version))
             }
-        }
+        };
+
+        result.release_programs();
+
+        result
     }
 }
 
@@ -1169,6 +1173,39 @@ impl<U, T> TestResult<U, T> {
                 OnTestFailure::SucceedImmediately => counterexample.is_some(),
             },
             TestResult::BenchmarkResult(BenchmarkResult { error, .. }) => error.is_none(),
+        }
+    }
+
+    /// Drop the programs a result no longer needs once its test has run, so
+    /// that results held until the end of a run do not keep every test's
+    /// programs alive. Fuzzer and sampler programs are never reported, and a
+    /// test's own program only appears in the report of a failure; a released
+    /// program is left as `(error)`.
+    fn release_programs(&mut self) {
+        fn release(program: &mut Program<Name>) {
+            program.term = Term::Error;
+        }
+
+        let success = self.is_success();
+
+        let (program, generator) = match self {
+            TestResult::UnitTestResult(result) => (&mut result.test.program, None),
+            TestResult::PropertyTestResult(result) => (
+                &mut result.test.program,
+                Some(&mut result.test.fuzzer.program),
+            ),
+            TestResult::BenchmarkResult(result) => (
+                &mut result.bench.program,
+                Some(&mut result.bench.sampler.program),
+            ),
+        };
+
+        if success {
+            release(program);
+        }
+
+        if let Some(generator) = generator {
+            release(generator);
         }
     }
 
